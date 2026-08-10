@@ -1,11 +1,11 @@
-/* Hermes Annotate — overlay styles (toolbar + canvas).
+/* Browserlink — overlay styles (toolbar + canvas + chip + inspector).
  *
  * Injected twice by design:
  *   1. into the page document via manifest content_scripts "css" (styles the
  *      shadow host element, which lives in the page DOM);
  *   2. into the closed ShadowRoot by content.js (styles all internal UI).
  * Nothing here ever targets page content; all selectors are namespaced to
- * the host / the shadow-internal toolbar, canvas, and status elements.
+ * the host / the shadow-internal toolbar, canvas, chip, and status elements.
  */
 
 /* ---- shadow host (page DOM side) ---- */
@@ -14,6 +14,22 @@
   inset: 0;
   z-index: 2147483646;
   pointer-events: none;
+}
+
+/* ---- theme variables (shadow-internal only; :host matches nothing in the
+ * page document, where the manifest-injected copy lives) ----
+ * Single source for all UI colors. Only the fixed annotation palette
+ * (#ff5252/#4a9eff/#ffd166/#35c759) is hardcoded in the shadow content. */
+:host {
+  --bl-bg: rgba(16, 18, 24, 0.92);
+  --bl-border: rgba(255, 255, 255, 0.16);
+  --bl-btn-bg: rgba(255, 255, 255, 0.06);
+  --bl-btn-hover: rgba(255, 255, 255, 0.14);
+  --bl-text: #e8eaed;
+  --bl-muted: #9aa0a6;
+  --bl-accent: #4a9eff;
+  --bl-ok: #35c759;
+  --bl-err: #ff5252;
 }
 
 /* ---- floating toolbar (shadow-internal) ---- */
@@ -257,4 +273,182 @@
   font-size: 12px;
   color: #9aa0a6;
   white-space: nowrap;
+}
+
+/* ---- toolbar power / collapse / exit ---- */
+.comet-power:hover {
+  background: var(--bl-ok, #35c759);
+  border-color: var(--bl-ok, #35c759);
+  color: #07130a;
+}
+.comet-exit:hover {
+  background: var(--bl-err, #ff5252);
+  border-color: var(--bl-err, #ff5252);
+  color: #ffffff;
+}
+
+/* ---- drag handle (⋮⋮) ---- */
+.comet-drag {
+  cursor: grab;
+  padding: 4px 6px;
+  border-radius: 6px;
+  color: var(--bl-muted, #9aa0a6);
+  font-weight: 600;
+  letter-spacing: 1px;
+  touch-action: none;
+}
+.comet-drag:hover {
+  background: var(--bl-btn-hover, rgba(255, 255, 255, 0.14));
+  color: var(--bl-text, #e8eaed);
+}
+.comet-drag.dragging,
+.comet-chip.dragging {
+  cursor: grabbing;
+}
+
+/* ---- collapsed floating chip (48px, same position as the toolbar) ---- */
+.comet-chip {
+  position: fixed;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bl-bg, rgba(16, 18, 24, 0.92));
+  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.14));
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  cursor: pointer;
+  pointer-events: auto;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+.comet-chip:hover {
+  border-color: var(--bl-accent, #4a9eff);
+}
+.comet-chip-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--bl-accent, #4a9eff);
+  box-shadow: 0 0 0 4px rgba(74, 158, 255, 0.25);
+}
+
+/* ---- element inspector panel (below the toolbar, max 320px) ---- */
+.comet-inspector {
+  position: fixed;
+  z-index: 2147483647;
+  width: 320px;
+  max-width: calc(100vw - 24px);
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: var(--bl-bg, rgba(16, 18, 24, 0.95));
+  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--bl-text, #e8eaed);
+  pointer-events: auto;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.comet-inspector[hidden] {
+  display: none;
+}
+.comet-insp-head {
+  font-size: 12px;
+  color: var(--bl-muted, #9aa0a6);
+  border-bottom: 1px solid var(--bl-border, rgba(255, 255, 255, 0.14));
+  padding-bottom: 6px;
+}
+.comet-insp-rows {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.comet-insp-row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr) minmax(0, 1fr) 20px;
+  gap: 6px;
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 6px;
+}
+.comet-insp-row.edited {
+  border-color: var(--bl-accent, #4a9eff);
+  background: rgba(74, 158, 255, 0.08);
+}
+.comet-insp-label {
+  font-size: 11px;
+  color: var(--bl-muted, #9aa0a6);
+  text-transform: capitalize;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.comet-insp-cur {
+  font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--bl-muted, #9aa0a6);
+  background: var(--bl-btn-bg, rgba(255, 255, 255, 0.05));
+  border-radius: 4px;
+  padding: 3px 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.comet-insp-input {
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bl-btn-bg, rgba(255, 255, 255, 0.06));
+  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
+  border-radius: 4px;
+  color: var(--bl-text, #e8eaed);
+  font: inherit;
+  padding: 3px 5px;
+  outline: none;
+}
+.comet-insp-input:focus,
+.comet-insp-row.edited .comet-insp-input {
+  border-color: var(--bl-accent, #4a9eff);
+}
+.comet-insp-clear {
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--bl-muted, #9aa0a6);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px;
+  border-radius: 4px;
+}
+.comet-insp-clear:hover {
+  color: var(--bl-err, #ff5252);
+  background: rgba(255, 82, 82, 0.12);
+}
+.comet-insp-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid var(--bl-border, rgba(255, 255, 255, 0.14));
+  padding-top: 8px;
+}
+.comet-insp-count {
+  font-size: 11px;
+  color: var(--bl-muted, #9aa0a6);
+}
+.comet-insp-send {
+  align-self: flex-end;
 }

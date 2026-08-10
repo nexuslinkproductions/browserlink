@@ -34,6 +34,41 @@
   }
   .status.ok { color: #35c759; border-color: rgba(53, 199, 89, 0.4); }
   .status.err { color: #ff5252; border-color: rgba(255, 82, 82, 0.4); }
+  .switch-row { justify-content: space-between; }
+  .switch-label {
+    margin: 0;
+    font-size: 13px;
+    text-transform: none;
+    letter-spacing: 0;
+    color: #e8eaed;
+    font-weight: 600;
+  }
+  input[type="checkbox"] {
+    flex: 0 0 auto;
+    width: 38px;
+    height: 22px;
+    margin: 0;
+    appearance: none;
+    position: relative;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 11px;
+    background: rgba(255, 255, 255, 0.14);
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  input[type="checkbox"]::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #e8eaed;
+    transition: left 0.15s ease;
+  }
+  input[type="checkbox"]:checked { background: #35c759; }
+  input[type="checkbox"]:checked::after { left: 18px; }
   .row {
     display: flex;
     align-items: center;
@@ -94,6 +129,11 @@
 <body>
   <h1>Browserlink — Browser Annotate &amp; Connect</h1>
   <p class="sub">Annotate any page &rarr; delivered to your hub</p>
+
+  <div class="row switch-row">
+    <label class="switch-label" for="toolToggle">Tool active</label>
+    <input id="toolToggle" type="checkbox" role="switch" checked>
+  </div>
 
   <div class="row">
     <span id="hubStatus" class="status">Hub: checking&hellip;</span>

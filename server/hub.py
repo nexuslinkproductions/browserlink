@@ -25,6 +25,13 @@ DEFAULT_PORT = 8787
 VERSION = "1.0.0"
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
+# Schema v1.1: allowed keys for elements[].edits (protocol, docs/protocol.md).
+ALLOWED_EDIT_KEYS = frozenset((
+    "width", "height", "fontFamily", "fontSize", "fontWeight", "lineHeight",
+    "color", "backgroundColor", "text", "href", "display", "margin",
+    "padding", "borderRadius",
+))
+
 
 def data_dir() -> Path:
     configured = os.environ.get("BROWSERLINK_DATA_DIR")
@@ -136,6 +143,15 @@ def validate_payload(payload: Any) -> Optional[str]:
                 return "elements[%d].index must be an integer" % element_index
             if len(element) < 2:
                 return "elements[%d] must include at least one key besides index" % element_index
+            edits = element.get("edits")
+            if edits is not None:
+                if not isinstance(edits, dict):
+                    return "elements[%d].edits must be an object" % element_index
+                for key, value in edits.items():
+                    if key not in ALLOWED_EDIT_KEYS:
+                        return "elements[%d].edits has unknown key '%s'" % (element_index, key)
+                    if not isinstance(value, str):
+                        return "elements[%d].edits.%s must be a string" % (element_index, key)
 
     label = payload.get("label")
     if label is not None:
