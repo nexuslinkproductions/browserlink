@@ -4,6 +4,17 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [2.0.1] - 2026-08-10
+
+### Fixed
+
+- **TS Hermes adapter delivery parity** - the TypeScript adapter now matches
+  the Python adapter's delivery behavior: resolves the target session's own
+  provider/model from the session record (any provider, any model, no
+  hardcoded pins), sends the screenshot as a real `image_url` attachment
+  part instead of a literal `@image:` text ref, and keeps `@file:` refs.
+  Verified end-to-end in production (TS hub on 8787).
+
 ## [1.6.1] - 2026-08-10
 
 ### Fixed
