@@ -3,19 +3,19 @@
 **Annotate in your browser. Deliver to any AI harness.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v1.4.0-4a9eff.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v2.1.0-4a9eff.svg)](CHANGELOG.md)
 [![CI](https://github.com/nexuslinkproductions/browserlink/actions/workflows/ci.yml/badge.svg)](https://github.com/nexuslinkproductions/browserlink/actions)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-35c759.svg)](server/hub.py)
 [![MCP](https://img.shields.io/badge/MCP-server-ffd166.svg)](docs/mcp.md)
 [![Chromium](https://img.shields.io/badge/Chromium-MV3-ff5252.svg)](extension/manifest.json)
 
 ![Browserlink social preview](assets/browserlink-social-preview.png)
 
-browserlink is a harness-agnostic annotation link between your browser and
-your AI coding tools. Draw on a page, pick elements DevTools-style, type your
-instructions, then send the whole annotated context straight to the harness
-you're working in. Your browser stays yours: logins, sessions, cookies,
-untouched. Built for [Perplexity Comet](https://www.perplexity.ai/comet)
+browserlink is a browser annotation bridge designed specifically for Hermes
+(and usable with any MCP-capable harness). Draw on a page, pick elements
+DevTools-style, type your instructions, then send the whole annotated context
+straight to the harness you're working in. Your browser stays yours: logins,
+sessions, cookies, untouched. The TypeScript hub (`npx browserlink-hub`) is
+the implementation. Built for [Perplexity Comet](https://www.perplexity.ai/comet)
 first, works in any Chromium browser (Chrome, Edge, Brave, Arc).
 
 ```
@@ -39,7 +39,8 @@ first, works in any Chromium browser (Chrome, Edge, Brave, Arc).
 
 ```bash
 # 1. Run the hub (localhost, port 8787)
-python3 server/hub.py
+#    from this repo:  cd ts && npm ci && npm run build && node dist/cli-hub.js
+#    or install globally:  npm install -g . && browserlink-hub
 
 # 2. Load the extension in your browser
 #    chrome://extensions → Developer mode → Load unpacked → extension/
@@ -47,7 +48,8 @@ python3 server/hub.py
 
 # 3. Connect a harness
 #    Any MCP client:
-pip install -e mcp/   # or: npx browserlink-mcp
+#    from this repo:  cd ts && npm ci && npm run build && node dist/cli-mcp.js
+#    or install globally:  npm install -g . && browserlink-mcp
 #    then add to your harness's MCP config:
 #    { "mcpServers": { "browserlink": { "command": "browserlink-mcp" } } }
 ```
@@ -62,7 +64,7 @@ delivered to your connected harness.
 From any MCP-capable harness chat you can point the extension at *this*
 session without manually wiring chat to tool:
 
-1. Install and run the hub (`python3 server/hub.py`).
+1. Install and run the hub (from this repo: `cd ts && npm ci && npm run build && node dist/cli-hub.js`).
 2. Load the extension and leave it open in your browser.
 3. Register the MCP server with your harness, then call:
 
@@ -84,27 +86,30 @@ See [MCP tools](docs/mcp.md) for Claude Code and Hermes setup examples.
 
 ## TypeScript quickstart (v2)
 
-The Node/TypeScript hub and MCP server ship as `browserlink-mcp` (Node 22+).
-They speak the same REST contract and MCP tool names as the Python path.
+The Node/TypeScript hub and MCP server live in `ts/` (Node 22+).
+They speak the same REST contract and MCP tool names as prior releases.
 
 ```bash
+# Build once (from the repo root)
+cd ts && npm ci && npm run build
+
 # Hub (localhost, port 8787 by default)
-npx browserlink-hub
-# or: npm install -g browserlink-mcp && browserlink-hub
+node dist/cli-hub.js
+# or, installed globally: browserlink-hub
 
 # MCP server (stdio) for any MCP client
-npx browserlink-mcp
-# or: npm install -g browserlink-mcp && browserlink-mcp
+node dist/cli-mcp.js
+# or, installed globally: browserlink-mcp
 ```
 
 Example MCP client config:
 
 ```json
-{ "mcpServers": { "browserlink": { "command": "npx", "args": ["browserlink-mcp"] } } }
+{ "mcpServers": { "browserlink": { "command": "browserlink-mcp" } } }
 ```
 
 Override the hub URL with `BROWSERLINK_HUB_URL` (default
-`http://127.0.0.1:8787`). Data dir resolution matches Python:
+`http://127.0.0.1:8787`). Data dir resolution:
 `BROWSERLINK_DATA_DIR`, else `HERMES_HOME/annotations`, else
 `~/.browserlink/annotations`.
 
@@ -163,9 +168,8 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
 ## Development
 
 ```bash
-python3 -m py_compile server/hub.py mcp/mcp_server.py
-pytest -q
 node --check extension/content.js extension/service-worker.js extension/popup.js
+cd ts && npm ci && npm test
 ```
 
 ## License

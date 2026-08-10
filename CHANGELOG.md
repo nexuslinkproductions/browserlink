@@ -4,6 +4,14 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [2.1.0] - 2026-08-10
+
+### Removed
+
+- **Python legacy removed** - the TypeScript hub and MCP server are now the
+  only implementation; `server/`, `mcp/`, and Python tests were deleted; CI
+  runs the Node suite only
+
 ## [1.6.2] - 2026-08-10
 
 ### Fixed
