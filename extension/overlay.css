@@ -1,0 +1,260 @@
+/* Hermes Annotate — overlay styles (toolbar + canvas).
+ *
+ * Injected twice by design:
+ *   1. into the page document via manifest content_scripts "css" (styles the
+ *      shadow host element, which lives in the page DOM);
+ *   2. into the closed ShadowRoot by content.js (styles all internal UI).
+ * Nothing here ever targets page content; all selectors are namespaced to
+ * the host / the shadow-internal toolbar, canvas, and status elements.
+ */
+
+/* ---- shadow host (page DOM side) ---- */
+#hermes-annotate-host {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  pointer-events: none;
+}
+
+/* ---- floating toolbar (shadow-internal) ---- */
+.comet-toolbar {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: rgba(16, 18, 24, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  font: 13px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: #e8eaed;
+  pointer-events: auto;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.comet-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  color: #e8eaed;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.comet-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+.comet-btn.active {
+  background: #4a9eff;
+  border-color: #4a9eff;
+  color: #ffffff;
+}
+.comet-btn.comet-send {
+  background: #35c759;
+  border-color: #35c759;
+  color: #07130a;
+  font-weight: 600;
+}
+.comet-btn.comet-send:hover {
+  background: #46d768;
+}
+
+/* ---- color swatch (cycles the 4 spec colors) ---- */
+.comet-swatch {
+  appearance: none;
+  -webkit-appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+.comet-swatch .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.4);
+}
+.comet-swatch .dot.active {
+  outline: 2px solid #ffffff;
+  outline-offset: 1px;
+}
+
+/* ---- stroke width select ---- */
+.comet-width {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  color: #e8eaed;
+  border-radius: 6px;
+  padding: 4px 6px;
+  font: inherit;
+  cursor: pointer;
+}
+.comet-width option {
+  background: #1a1c22;
+  color: #e8eaed;
+}
+
+/* ---- overlay canvas (shadow-internal) ---- */
+.comet-canvas {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  pointer-events: none; /* toggled to "all" by content.js while Annotate is on */
+  touch-action: none;
+}
+.comet-canvas.active {
+  cursor: crosshair;
+}
+
+/* ---- status text ---- */
+.status {
+  min-width: 90px;
+  text-align: right;
+  font-size: 12px;
+  color: #9aa0a6;
+}
+.status.ok {
+  color: #35c759;
+}
+.status.err {
+  color: #ff5252;
+}
+
+/* ---- element picker layer (shadow-internal, fixed viewport layer) ---- */
+.comet-sel-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  pointer-events: none;
+}
+
+/* ---- hover highlight + chip (absolutely positioned within the layer) ---- */
+.comet-hl {
+  position: absolute;
+  border: 2px solid #4a9eff;
+  background: rgba(74, 158, 255, 0.12);
+  pointer-events: none;
+  box-sizing: border-box;
+  display: none; /* shown by content.js while an element is hovered */
+}
+.comet-hl-chip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(0, -100%);
+  background: #4a9eff;
+  color: #ffffff;
+  font: 11px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: 2px 6px;
+  border-radius: 4px 4px 0 0;
+  white-space: nowrap;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- persistent selection: dashed outline + numbered badge ---- */
+.comet-el {
+  position: absolute;
+  border: 2px dashed #ff5252;
+  pointer-events: none;
+  box-sizing: border-box;
+}
+.comet-el-badge {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -100%);
+  min-width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #ff5252;
+  color: #ffffff;
+  font: bold 10px/16px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  text-align: center;
+  padding: 0 3px;
+  box-sizing: border-box;
+  white-space: nowrap;
+}
+
+/* ---- instruction chat card (bottom-right of viewport) ---- */
+.comet-chat {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 2147483647;
+  width: 280px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: rgba(16, 18, 24, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: #e8eaed;
+  pointer-events: auto;
+}
+.comet-chat[hidden] {
+  display: none;
+}
+.comet-chat-head {
+  font-size: 12px;
+  color: #9aa0a6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.comet-chat-input {
+  width: 100%;
+  min-height: 56px;
+  max-height: 140px;
+  resize: vertical;
+  box-sizing: border-box;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  color: #e8eaed;
+  font: inherit;
+  padding: 6px 8px;
+  outline: none;
+}
+.comet-chat-input:focus {
+  border-color: #4a9eff;
+}
+.comet-chat-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.comet-chat-add {
+  background: #4a9eff;
+  border-color: #4a9eff;
+  color: #ffffff;
+}
+
+/* ---- element count chip in toolbar ---- */
+.comet-count {
+  min-width: 64px;
+  text-align: center;
+  font-size: 12px;
+  color: #9aa0a6;
+  white-space: nowrap;
+}

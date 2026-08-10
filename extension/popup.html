@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Browserlink — Browser Annotate &amp; Connect</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    width: 280px;
+    margin: 0;
+    padding: 14px;
+    font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #16181e;
+    color: #e8eaed;
+  }
+  h1 {
+    margin: 0 0 4px;
+    font-size: 15px;
+    font-weight: 600;
+  }
+  .sub {
+    margin: 0 0 12px;
+    font-size: 11px;
+    color: #9aa0a6;
+  }
+  .status {
+    display: block;
+    padding: 7px 9px;
+    border-radius: 7px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.05);
+    font-size: 12px;
+  }
+  .status.ok { color: #35c759; border-color: rgba(53, 199, 89, 0.4); }
+  .status.err { color: #ff5252; border-color: rgba(255, 82, 82, 0.4); }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .row .status { flex: 1; }
+  label {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #9aa0a6;
+  }
+  input[type="text"] {
+    width: 100%;
+    padding: 7px 9px;
+    margin-bottom: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.05);
+    color: #e8eaed;
+    font: inherit;
+  }
+  input[type="text"]:focus {
+    outline: none;
+    border-color: #4a9eff;
+  }
+  button {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 7px;
+    background: #4a9eff;
+    color: #ffffff;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { background: #6ab0ff; }
+  button.mini {
+    flex: 0 0 auto;
+    width: auto;
+    background: rgba(255, 255, 255, 0.08);
+  }
+  button.mini:hover { background: rgba(255, 255, 255, 0.16); }
+  .result {
+    min-height: 18px;
+    margin-top: 10px;
+    font-size: 12px;
+    color: #9aa0a6;
+  }
+  .result.ok { color: #35c759; }
+  .result.err { color: #ff5252; }
+</style>
+</head>
+<body>
+  <h1>Browserlink — Browser Annotate &amp; Connect</h1>
+  <p class="sub">Annotate any page &rarr; delivered to your hub</p>
+
+  <div class="row">
+    <span id="hubStatus" class="status">Hub: checking&hellip;</span>
+    <button id="refreshStatus" type="button" class="mini"
+            title="Re-check hub connection">Check</button>
+  </div>
+
+  <label for="endpointInput">Hub endpoint</label>
+  <input id="endpointInput" type="text"
+         placeholder="http://127.0.0.1:8787" autocomplete="off" spellcheck="false">
+  <button id="saveEndpoint" type="button">Save</button>
+
+  <label for="contextLabel">Context label</label>
+  <input id="contextLabel" type="text" maxlength="200"
+         placeholder="e.g. SEO task #42" autocomplete="off">
+
+  <button id="sendTest" type="button">Send test annotation</button>
+  <div id="testResult" class="result"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

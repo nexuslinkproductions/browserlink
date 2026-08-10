@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Browserlink — Browser Annotate & Connect",
+  "version": "1.1.0",
+  "description": "Annotate any page with strokes and numbered element markers, delivered to any AI harness via your local hub.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Browserlink — Browser Annotate & Connect"
+  },
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": ["activeTab", "storage", "scripting"],
+  "host_permissions": ["http://127.0.0.1:8787/*", "http://localhost:8787/*"],
+  "web_accessible_resources": [
+    {
+      "resources": ["overlay.css"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

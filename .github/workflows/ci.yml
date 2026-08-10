@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install "mcp<2" pytest
+
+      - name: Python syntax
+        run: python -m py_compile server/hub.py server/adapters/base.py server/adapters/hermes.py server/adapters/webhook.py mcp/mcp_server.py
+
+      - name: Python tests
+        run: pytest -q
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Extension syntax
+        run: node --check extension/content.js extension/service-worker.js extension/popup.js
+
+      - name: Manifest validation
+        run: python -m json.tool extension/manifest.json

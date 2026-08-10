@@ -1,0 +1,9 @@
+[project]
+name = "browserlink-mcp"
+version = "1.0.0"
+description = "Read-only MCP server for Browserlink annotations"
+requires-python = ">=3.9"
+dependencies = ["mcp>=1.0,<2"]
+
+[project.scripts]
+browserlink-mcp = "mcp_server:main"
