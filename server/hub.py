@@ -47,8 +47,47 @@ def annotations_dir() -> str:
     return str(data_dir() / "annotations")
 
 
+def target_path() -> Path:
+    return data_dir() / "target.json"
+
+
 def is_safe_name(name: str) -> bool:
-    return bool(NAME_RE.match(name)) and "/" not in name and "\\\\" not in name and ".." not in name
+    return bool(NAME_RE.match(name)) and "/" not in name and "\\" not in name and ".." not in name
+
+
+def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    directory = path.parent
+    os.makedirs(directory, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(directory),
+                                     prefix=".target-", suffix=".tmp", delete=False) as temp_file:
+        temp_path = temp_file.name
+        json.dump(payload, temp_file, ensure_ascii=False, indent=2)
+        temp_file.write("\n")
+        temp_file.flush()
+        os.fsync(temp_file.fileno())
+    os.replace(temp_path, str(path))
+
+
+def read_target() -> Optional[Dict[str, Any]]:
+    path = target_path()
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    return value
+
+
+def clear_target() -> None:
+    path = target_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def store_annotation(payload: Dict[str, Any]) -> Path:
@@ -73,15 +112,30 @@ ADAPTERS = []
 def reload_adapters() -> None:
     global ADAPTERS
     ADAPTERS = []
-    if all(os.environ.get(key) for key in ("HERMES_API_URL", "HERMES_API_KEY", "HERMES_SESSION_ID")):
+    # Session may come from target.json; only API URL + key are required to load.
+    if all(os.environ.get(key) for key in ("HERMES_API_URL", "HERMES_API_KEY")):
         ADAPTERS.append(("hermes", hermes.register))
     if os.environ.get("BROWSERLINK_WEBHOOK_URL"):
         ADAPTERS.append(("webhook", webhook.register))
 
 
 def status_payload() -> Dict[str, Any]:
-    return {"ok": True, "version": VERSION, "dataDir": str(data_dir()),
-            "adapters": [name for name, _ in ADAPTERS]}
+    target = read_target()
+    target_summary = None
+    if target is not None:
+        session_id = target.get("sessionId")
+        if isinstance(session_id, str) and session_id:
+            target_summary = {
+                "sessionId": session_id,
+                "label": target.get("label", "") if isinstance(target.get("label"), str) else "",
+            }
+    return {
+        "ok": True,
+        "version": VERSION,
+        "dataDir": str(data_dir()),
+        "adapters": [name for name, _ in ADAPTERS],
+        "target": target_summary,
+    }
 
 
 reload_adapters()
@@ -162,8 +216,46 @@ def validate_payload(payload: Any) -> Optional[str]:
     return None
 
 
+def validate_target_body(payload: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Validate POST /target. Returns (error, mode) where mode is 'set' or 'clear'."""
+    if not isinstance(payload, dict):
+        return "payload must be a JSON object", None
+    session_id = payload.get("sessionId", "")
+    if session_id is None:
+        session_id = ""
+    if not isinstance(session_id, str):
+        return "sessionId must be a string", None
+    activate = payload.get("activate")
+    # Disconnect/clear: empty sessionId with activate explicitly false.
+    if session_id == "" and activate is False:
+        return None, "clear"
+    if session_id == "":
+        return "sessionId must be a non-empty string", None
+    if len(session_id) > 200:
+        return "sessionId must be at most 200 characters", None
+    label = payload.get("label", "")
+    if label is None:
+        label = ""
+    if not isinstance(label, str):
+        return "label must be a string", None
+    if len(label) > 200:
+        return "label must be at most 200 characters", None
+    if activate is not None and not isinstance(activate, bool):
+        return "activate must be a boolean", None
+    return None, "set"
+
+
 def json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _read_json_body(handler: BaseHTTPRequestHandler) -> Tuple[Optional[Any], Optional[str]]:
+    try:
+        length = int(handler.headers.get("Content-Length", "-1"))
+        raw = handler.rfile.read(length)
+        return json.loads(raw.decode("utf-8")), None
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, "invalid JSON"
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -196,18 +288,77 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         status = 500
+        path = urlsplit(self.path).path
         try:
-            if urlsplit(self.path).path != "/annotations":
+            if path == "/target":
+                payload, err = _read_json_body(self)
+                if err is not None:
+                    status = 400
+                    self.send_json(status, {"error": err})
+                    return
+                error, mode = validate_target_body(payload)
+                if error is not None:
+                    status = 400
+                    self.send_json(status, {"error": error})
+                    return
+                if mode == "clear":
+                    clear_target()
+                    status = 200
+                    self.send_json(status, {"ok": True})
+                    return
+                assert isinstance(payload, dict)
+                label = payload.get("label", "")
+                if label is None:
+                    label = ""
+                activate = payload.get("activate", False)
+                if activate is None:
+                    activate = False
+                record = {
+                    "sessionId": payload["sessionId"],
+                    "label": label,
+                    "ts": int(datetime.now().timestamp() * 1000),
+                    "activate": bool(activate),
+                }
+                atomic_write_json(target_path(), record)
+                status = 200
+                self.send_json(status, {"ok": True})
+                return
+
+            if path == "/activate":
+                payload, err = _read_json_body(self)
+                if err is not None:
+                    status = 400
+                    self.send_json(status, {"error": err})
+                    return
+                if not isinstance(payload, dict):
+                    status = 400
+                    self.send_json(status, {"error": "payload must be a JSON object"})
+                    return
+                active = payload.get("active")
+                if not isinstance(active, bool):
+                    status = 400
+                    self.send_json(status, {"error": "active must be a boolean"})
+                    return
+                existing = read_target() or {}
+                record = {
+                    "sessionId": existing.get("sessionId", "") if isinstance(existing.get("sessionId"), str) else "",
+                    "label": existing.get("label", "") if isinstance(existing.get("label"), str) else "",
+                    "ts": int(datetime.now().timestamp() * 1000),
+                    "activate": active,
+                }
+                atomic_write_json(target_path(), record)
+                status = 200
+                self.send_json(status, {"ok": True})
+                return
+
+            if path != "/annotations":
                 status = 404
                 self.send_json(status, {"error": "not found"})
                 return
-            try:
-                length = int(self.headers.get("Content-Length", "-1"))
-                raw = self.rfile.read(length)
-                payload = json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            payload, err = _read_json_body(self)
+            if err is not None:
                 status = 400
-                self.send_json(status, {"error": "invalid JSON"})
+                self.send_json(status, {"error": err})
                 return
             error = validate_payload(payload)
             if error is not None:
@@ -217,7 +368,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             directory = annotations_dir()
             os.makedirs(directory, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-            path = os.path.join(directory, timestamp + ".json")
+            path_out = os.path.join(directory, timestamp + ".json")
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
                                              prefix=".annotation-", suffix=".tmp", delete=False) as temp_file:
                 temp_path = temp_file.name
@@ -225,14 +376,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 temp_file.write("\n")
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
-            os.replace(temp_path, path)
+            os.replace(temp_path, path_out)
             for adapter_name, adapter_register in ADAPTERS:
                 try:
                     adapter_register(payload)
-                except Exception as error:
-                    LOGGER.warning("%s adapter failed: %s", adapter_name, error)
+                except Exception as adapter_error:
+                    LOGGER.warning("%s adapter failed: %s", adapter_name, adapter_error)
             status = 200
-            self.send_json(status, {"ok": True, "file": os.path.basename(path)})
+            self.send_json(status, {"ok": True, "file": os.path.basename(path_out)})
         finally:
             print("POST %s %d" % (urlsplit(self.path).path, status), flush=True)
 
@@ -243,6 +394,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         if path == "/health":
             self.send_json(200, {"ok": True, "version": VERSION})
+            return
+        if path == "/target":
+            target = read_target()
+            if target is None:
+                self.send_json(404, {"error": "no target"})
+                return
+            self.send_json(200, target)
             return
         if path == "/annotations":
             directory = annotations_dir()

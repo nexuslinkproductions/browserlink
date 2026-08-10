@@ -1,4 +1,4 @@
-# browserlink protocol — annotation schema v1.1
+# browserlink protocol - annotation schema v1.1
 
 The public contract between the extension, the hub, and any harness. Versioned;
 changes require a new minor or major version and a compatibility shim.
@@ -12,11 +12,11 @@ v1.0 payloads (no `edits`) remain valid; the hub accepts both.
 | Source of truth | Path |
 |---|---|
 | Default data dir | `~/.browserlink/` (override: `BROWSERLINK_DATA_DIR`, back-compat: `HERMES_HOME/annotations`) |
-| Inbox | `<data>/annotations/<ts>.json` — `ts = YYYYMMDD-HHMMSS-mmm` |
-| Session target | `<data>/session.json` |
+| Inbox | `<data>/annotations/<ts>.json` - `ts = YYYYMMDD-HHMMSS-mmm` |
+| Delivery target | `<data>/target.json` - active harness session for delivery |
 
 All writes are atomic (temp file + `os.replace`). Filenames are validated with
-`^[A-Za-z0-9._-]+$` — anything containing `/`, `\`, or `..` is rejected with
+`^[A-Za-z0-9._-]+$` - anything containing `/`, `\`, or `..` is rejected with
 HTTP 400.
 
 ## POST /annotations
@@ -83,6 +83,79 @@ Rules:
 - `404` → `{"error": "annotation not found"}`
 - `413` → `{"error": "payload too large"}`
 
+## GET /target and POST /target
+
+Delivery target for invoke-and-connect from any harness chat. Persisted as
+`<data>/target.json`.
+
+### GET /target
+
+- `200` → current target object
+- `404` → `{"error": "no target"}`
+
+Example `200` body:
+
+```json
+{
+  "sessionId": "20260810_120000_abcd12",
+  "label": "Claude Code SEO",
+  "ts": 1723300000000,
+  "activate": true
+}
+```
+
+### POST /target
+
+Body:
+
+```json
+{
+  "sessionId": "20260810_120000_abcd12",
+  "label": "Claude Code SEO",
+  "activate": true
+}
+```
+
+| Field | Type | Rules |
+|---|---|---|
+| `sessionId` | string | required; non-empty, ≤ 200 chars (empty alone → HTTP 400) |
+| `label` | string | optional; ≤ 200 chars; default `""` |
+| `activate` | bool | optional; default `false`. When `true`, the extension polls and injects once |
+
+Special case for disconnect: `{"sessionId": "", "activate": false}` clears the
+stored target and returns `{"ok": true}`.
+
+Responses:
+
+- `200` → `{"ok": true}`
+- `400` → `{"error": "<message>"}` (empty `sessionId` without disconnect, bad types)
+
+Stored record shape: `{"sessionId", "label", "ts", "activate"}`.
+
+## POST /activate
+
+Ack / merge endpoint used by the extension after it injects on connect, and by
+MCP `browserlink_connect` when `activate=true`.
+
+Body:
+
+```json
+{ "active": false }
+```
+
+| Field | Type | Rules |
+|---|---|---|
+| `active` | bool | required |
+
+Merges into existing `target.json`, keeping `sessionId` and `label`, updating
+`activate` (from `active`) and `ts`. If no target exists yet, writes a record
+with empty `sessionId`/`label`.
+
+Responses:
+
+- `200` → `{"ok": true}`
+- `400` → `{"error": "<message>"}`
+
 ## Reading annotations
 
 | Endpoint | Returns |
@@ -90,8 +163,10 @@ Rules:
 | `GET /annotations` | `{"files": [{"name","size","mtime"}]}` newest first |
 | `GET /annotations/<name>` | the stored JSON (same schema, plus `ts`, `savedAt`) |
 | `GET /health` | `{"ok": true, "version": "1.0.0"}` |
-| `GET /status` | `{"ok": true, "version", "dataDir", "adapters": [...]}` |
-| `GET/POST /session` | connection target: `{"url": "…", "ts": …}` |
+| `GET /status` | `{"ok": true, "version", "dataDir", "adapters": [...], "target": {"sessionId","label"} or null}` |
+| `GET /target` | current delivery target, or `404 {"error":"no target"}` |
+| `POST /target` | set or clear delivery target |
+| `POST /activate` | merge `activate` flag into `target.json` |
 
 ## Coordinates
 

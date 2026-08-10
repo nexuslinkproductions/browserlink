@@ -112,3 +112,90 @@ def test_elements_edits_must_be_an_object():
     p = payload()
     p["elements"] = [{"index": 1, "tag": "button", "edits": "48px"}]
     assert hub.validate_payload(p) == "elements[0].edits must be an object"
+
+
+# --- /target + /activate (v1.3) ---
+
+
+@pytest.fixture
+def hub_server(data_dir):
+    import threading
+    from http.server import ThreadingHTTPServer
+    from urllib.request import Request, urlopen
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), hub.BridgeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    base = "http://127.0.0.1:%d" % port
+
+    def request(method, path, body=None):
+        data = None
+        headers = {}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = Request(base + path, data=data, method=method, headers=headers)
+        try:
+            with urlopen(req, timeout=2) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except Exception as err:
+            from urllib.error import HTTPError
+            if isinstance(err, HTTPError):
+                return err.code, json.loads(err.read().decode("utf-8"))
+            raise
+
+    yield request
+    server.shutdown()
+    server.server_close()
+
+
+def test_target_post_get_round_trip(hub_server):
+    status, body = hub_server("POST", "/target", {
+        "sessionId": "sess-abc",
+        "label": "demo chat",
+        "activate": True,
+    })
+    assert status == 200
+    assert body == {"ok": True}
+
+    status, body = hub_server("GET", "/target")
+    assert status == 200
+    assert body["sessionId"] == "sess-abc"
+    assert body["label"] == "demo chat"
+    assert body["activate"] is True
+    assert isinstance(body["ts"], int)
+
+
+def test_activate_merge_preserves_session_id(hub_server):
+    hub_server("POST", "/target", {
+        "sessionId": "keep-me",
+        "label": "keep-label",
+        "activate": True,
+    })
+    status, body = hub_server("POST", "/activate", {"active": False})
+    assert status == 200
+    assert body == {"ok": True}
+
+    status, body = hub_server("GET", "/target")
+    assert status == 200
+    assert body["sessionId"] == "keep-me"
+    assert body["label"] == "keep-label"
+    assert body["activate"] is False
+
+
+def test_empty_session_id_rejected(hub_server):
+    status, body = hub_server("POST", "/target", {"sessionId": "", "label": "x"})
+    assert status == 400
+    assert "sessionId" in body["error"]
+
+
+def test_status_includes_target(hub_server):
+    status, body = hub_server("GET", "/status")
+    assert status == 200
+    assert body["target"] is None
+
+    hub_server("POST", "/target", {"sessionId": "s1", "label": "L"})
+    status, body = hub_server("GET", "/status")
+    assert status == 200
+    assert body["target"] == {"sessionId": "s1", "label": "L"}

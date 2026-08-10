@@ -56,3 +56,52 @@ def test_watch_returns_new_files(annotations):
     watched = mcp_server.annotations_watch(seconds=0.05)
     creator.join()
     assert watched == [new_file.name]
+
+
+@pytest.fixture
+def live_hub(tmp_path, monkeypatch):
+    """Start a real hub on an ephemeral port for MCP connect tools."""
+    monkeypatch.setenv("BROWSERLINK_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    server_root = ROOT / "server"
+    if str(server_root) not in sys.path:
+        sys.path.insert(0, str(server_root))
+    import hub  # noqa: E402
+
+    hub.reload_adapters()
+    from http.server import ThreadingHTTPServer
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), hub.BridgeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    monkeypatch.setenv("BROWSERLINK_HUB_URL", "http://127.0.0.1:%d" % port)
+    yield tmp_path
+    server.shutdown()
+    server.server_close()
+
+
+def test_browserlink_connect_disconnect_status(live_hub):
+    connected = mcp_server.browserlink_connect(
+        sessionId="mcp-sess-1",
+        label="mcp label",
+        activate=True,
+    )
+    assert connected["ok"] is True
+    assert connected["sessionId"] == "mcp-sess-1"
+    assert connected["label"] == "mcp label"
+    assert connected["activate"] is True
+
+    status = mcp_server.browserlink_status()
+    assert status["ok"] is True
+    assert status["target"]["sessionId"] == "mcp-sess-1"
+    assert status["target"]["label"] == "mcp label"
+    assert status["target"]["activate"] is True
+
+    disconnected = mcp_server.browserlink_disconnect()
+    assert disconnected == {"ok": True}
+
+    status = mcp_server.browserlink_status()
+    assert status["ok"] is True
+    assert status["target"] is None
