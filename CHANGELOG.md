@@ -4,6 +4,16 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [2.0.2] - 2026-08-10
+
+### Fixed
+
+- **Screenshot renders in chat** - the Hermes adapters (TS and Python) now
+  send the screenshot as BOTH an `image_url` part (feeds the agent's vision)
+  and an `@image:` ref (what the desktop lifts into a rendered attachment
+  thumbnail). Without the ref, the desktop showed the `[screenshot]`
+  placeholder as literal text and no image.
+
 ## [2.0.1] - 2026-08-10
 
 ### Fixed

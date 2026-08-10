@@ -247,9 +247,13 @@ export async function register(
   const pngPath = screenshotPngPath(annotation, annotationPath);
   const dataUrl = pngPath ? imageDataUrl(pngPath) : null;
   if (dataUrl) {
+    // Send BOTH the image part and the @image: ref: the part feeds the
+    // agent's vision, the ref is what the desktop lifts into a rendered
+    // attachment thumbnail (it drops the [screenshot] placeholder when a
+    // ref is present). Without the ref the desktop shows literal text.
     bodyDict.message = [
       { type: "image_url", image_url: { url: dataUrl } },
-      { type: "text", text: formatMessage(annotation, annotationPath, false) },
+      { type: "text", text: formatMessage(annotation, annotationPath) },
     ];
   }
 

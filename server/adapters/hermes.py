@@ -228,9 +228,13 @@ def register(annotation: Dict[str, Any], annotation_path: Optional[str] = None) 
     png_path = _screenshot_png_path(annotation, annotation_path)
     data_url = _image_data_url(png_path) if png_path else None
     if data_url:
+        # Send BOTH the image part and the @image: ref: the part feeds the
+        # agent's vision, the ref is what the desktop lifts into a rendered
+        # attachment thumbnail (it drops the [screenshot] placeholder when a
+        # ref is present). Without the ref the desktop shows literal text.
         body_dict["message"] = [
             {"type": "image_url", "image_url": {"url": data_url}},
-            {"type": "text", "text": _message(annotation, annotation_path, include_image_ref=False)},
+            {"type": "text", "text": _message(annotation, annotation_path)},
         ]
     body = json.dumps(body_dict).encode("utf-8")
     request = Request(endpoint, data=body, method="POST", headers={
