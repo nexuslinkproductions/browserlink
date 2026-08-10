@@ -12,7 +12,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-export const VERSION = "2.0.0";
+export const VERSION = "2.2.0";
 export const DEFAULT_HUB = "http://127.0.0.1:8787";
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
 
