@@ -100,6 +100,7 @@
     collapsed: false,    // toolbar minimized to the 48px chip
     position: null,      // {x, y} top-left of toolbar/chip (viewport px)
     activeIndex: -1,     // index in elements currently bound to the inspector
+    collapsedCats: {},   // { Text: true, Layout: false, ... } inspector category collapse
   };
 
   // Element inspector: {el, descriptor} — descriptor is the object that
@@ -132,6 +133,8 @@
   let selLayer = null;       // fixed inset-0 layer holding highlight + outlines
   let hlEl = null;
   let hlChip = null;
+  let hoverBoxEl = null;     // stronger element-mode hover box (v1.6; coexists with hlEl)
+  let hoverBoxRaf = 0;       // rAF throttle for scroll/resize box recompute
   let chatCard = null;
   let chatHead = null;
   let chatInput = null;
@@ -672,6 +675,45 @@
     hlEl.style.height = box.height + 'px';
   }
 
+  // Stronger, unambiguous hover box (element mode only). Coexists with the
+  // lerped hlEl; recomputed from live rect, invalidated on scroll/resize.
+  function applyHoverOutlineBox(box) {
+    if (!hoverBoxEl || !box) return;
+    hoverBoxEl.style.display = '';
+    hoverBoxEl.style.left = box.left + 'px';
+    hoverBoxEl.style.top = box.top + 'px';
+    hoverBoxEl.style.width = box.width + 'px';
+    hoverBoxEl.style.height = box.height + 'px';
+  }
+
+  function hideHoverOutlineBox() {
+    if (hoverBoxEl) hoverBoxEl.style.display = 'none';
+  }
+
+  function positionHoverOutlineBox() {
+    if (!hoverBoxEl) return;
+    if (!state.elementMode || !hoveredEl) {
+      hideHoverOutlineBox();
+      return;
+    }
+    let r = null;
+    try { r = hoveredEl.getBoundingClientRect(); } catch (_) { r = null; }
+    const box = rectBox(r);
+    if (!box) {
+      hideHoverOutlineBox();
+      return;
+    }
+    applyHoverOutlineBox(box);
+  }
+
+  function scheduleHoverOutlineBox() {
+    if (hoverBoxRaf) return;
+    hoverBoxRaf = requestAnimationFrame(() => {
+      hoverBoxRaf = 0;
+      positionHoverOutlineBox();
+    });
+  }
+
   function cancelHoverLerp() {
     if (hoverLerpRaf) {
       cancelAnimationFrame(hoverLerpRaf);
@@ -716,6 +758,7 @@
       hoverTargetRect = null;
       hoverVisualRect = null;
       hlEl.style.display = 'none';
+      hideHoverOutlineBox();
       return;
     }
     let r = null;
@@ -726,6 +769,7 @@
       hoverTargetRect = null;
       hoverVisualRect = null;
       hlEl.style.display = 'none';
+      hideHoverOutlineBox();
       return;
     }
     hoverTargetRect = target;
@@ -741,6 +785,8 @@
       startHoverLerp();
     }
     if (hlEl.style.display !== 'none') hlChip.textContent = chipFromEl(hoveredEl);
+    // Stronger unambiguous box (element mode only); tracks live rect.
+    applyHoverOutlineBox(target);
   }
 
   function positionSelections() {
@@ -761,6 +807,8 @@
   function repositionAll() {
     positionHover();
     positionSelections();
+    // rAF-throttled hover-box recompute on scroll/resize (element mode only).
+    scheduleHoverOutlineBox();
     if (hintProp) scheduleRedraw();
   }
 
@@ -808,10 +856,15 @@
       cancelAnimationFrame(hoverLoopRaf);
       hoverLoopRaf = 0;
     }
+    if (hoverBoxRaf) {
+      cancelAnimationFrame(hoverBoxRaf);
+      hoverBoxRaf = 0;
+    }
     cancelHoverLerp();
     hoverTargetRect = null;
     hoverVisualRect = null;
     if (hlEl) hlEl.style.display = 'none';
+    hideHoverOutlineBox();
   }
 
   /* ---------------- element mode: selection + instruction chat ---------------- */
@@ -1093,6 +1146,56 @@
   const DISPLAY_VALUES = ['block', 'inline', 'inline-block', 'flex', 'grid', 'none'];
   const TEXT_HINT_PROPS = new Set(['fontSize', 'fontWeight', 'fontFamily', 'lineHeight', 'color']);
   const UNDERLINE_HINT_PROPS = new Set(['text', 'href']);
+  const TEXT_ALIGN_VALUES = ['left', 'center', 'right', 'justify'];
+  const TEXT_TRANSFORM_CYCLE = ['uppercase', 'lowercase', 'capitalize', 'none'];
+  const INLINE_TAGS = new Set([
+    'SPAN', 'A', 'STRONG', 'EM', 'B', 'I', 'U', 'LABEL', 'CODE', 'SMALL', 'BIG',
+    'ABBR', 'CITE', 'DFN', 'KBD', 'SAMP', 'VAR', 'MARK', 'TIME', 'Q', 'SUB', 'SUP',
+    'BUTTON', 'S', 'STRIKE', 'DEL', 'INS',
+  ]);
+  // Inspector category grouping (v1.6). Each property maps to exactly one bucket.
+  const CAT_ORDER = ['Text', 'Layout', 'Appearance', 'Other'];
+  const CAT_TEXT = new Set([
+    'fontSize', 'fontFamily', 'fontWeight', 'lineHeight', 'color', 'textAlign',
+    'textTransform', 'letterSpacing', 'wordSpacing', 'whiteSpace', 'textDecoration',
+    'fontStyle', 'textShadow', 'verticalAlign',
+  ]);
+  const CAT_LAYOUT = new Set([
+    'display', 'position', 'width', 'height', 'margin', 'padding', 'flex',
+    'flexDirection', 'justifyContent', 'alignItems', 'gap', 'grid', 'zIndex',
+    'overflow', 'float', 'clear',
+  ]);
+  const CAT_APPEARANCE = new Set([
+    'background', 'backgroundColor', 'border', 'borderRadius', 'borderWidth',
+    'borderColor', 'boxShadow', 'opacity', 'transform', 'transition', 'cursor',
+  ]);
+
+  function propCategory(prop) {
+    if (CAT_TEXT.has(prop)) return 'Text';
+    if (CAT_LAYOUT.has(prop)) return 'Layout';
+    if (CAT_APPEARANCE.has(prop)) return 'Appearance';
+    return 'Other';
+  }
+
+  function isCatCollapsed(cat) {
+    return !!(state.collapsedCats && state.collapsedCats[cat]);
+  }
+
+  function toggleCatCollapse(cat) {
+    if (!state.collapsedCats) state.collapsedCats = {};
+    state.collapsedCats[cat] = !state.collapsedCats[cat];
+    saveTabState({ collapsedCats: Object.assign({}, state.collapsedCats) });
+    if (inspRows) {
+      const body = inspRows.querySelector('.comet-insp-cat-body[data-cat="' + cat + '"]');
+      const header = inspRows.querySelector('.comet-insp-cat-header[data-cat="' + cat + '"]');
+      const collapsed = isCatCollapsed(cat);
+      if (body) body.hidden = collapsed;
+      if (header) {
+        header.classList.toggle('is-collapsed', collapsed);
+        header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      }
+    }
+  }
 
   function parsePx(v) {
     const n = parseFloat(String(v));
@@ -1144,13 +1247,111 @@
     return nearest;
   }
 
+  function isInlineElement(el) {
+    if (!el) return false;
+    try {
+      if (INLINE_TAGS.has(String(el.tagName || '').toUpperCase())) return true;
+      const cs = getComputedStyle(el);
+      const d = cs && cs.display ? String(cs.display) : '';
+      return d === 'inline' || d === 'inline-block' || d === 'inline-flex' || d === 'inline-grid';
+    } catch (_) {
+      return INLINE_TAGS.has(String(el.tagName || '').toUpperCase());
+    }
+  }
+
+  // Preserve newlines for the multiline editor (unlike chip/label collapsing).
+  function readEditableText(el) {
+    if (!el) return '';
+    try {
+      // Prefer textContent; if the live DOM used <br> for newlines, serialize them.
+      let out = '';
+      const walk = (node) => {
+        if (!node) return;
+        if (node.nodeType === 3) { // TEXT_NODE
+          out += node.nodeValue || '';
+          return;
+        }
+        if (node.nodeType !== 1) return;
+        const tag = String(node.tagName || '').toUpperCase();
+        if (tag === 'BR') {
+          out += '\n';
+          return;
+        }
+        const kids = node.childNodes || [];
+        for (let i = 0; i < kids.length; i++) walk(kids[i]);
+      };
+      walk(el);
+      return out;
+    } catch (_) {
+      return el.textContent || '';
+    }
+  }
+
+  // Live text apply: Enter/newlines render via <br> for inline elements, or
+  // textContent + white-space:pre-line for block-level elements.
+  function applyLiveText(el, value) {
+    if (!el) return;
+    const text = value == null ? '' : String(value);
+    if (isInlineElement(el)) {
+      // Replace contents with text nodes + <br> for newlines.
+      while (el.firstChild) el.removeChild(el.firstChild);
+      const parts = text.split('\n');
+      for (let i = 0; i < parts.length; i++) {
+        if (i > 0) {
+          try { el.appendChild(document.createElement('br')); } catch (_) { /* ok */ }
+        }
+        if (parts[i]) {
+          try { el.appendChild(document.createTextNode(parts[i])); } catch (_) { /* ok */ }
+        }
+      }
+      return;
+    }
+    el.textContent = text;
+    try {
+      // Ensure \n is visible without forcing pre (which can break wrapping).
+      if (text.indexOf('\n') !== -1) el.style.whiteSpace = 'pre-line';
+      else if (el.style.whiteSpace === 'pre-line') el.style.whiteSpace = '';
+    } catch (_) { /* ok */ }
+  }
+
+  function mapTextAlign(v) {
+    const s = String(v || '').trim().toLowerCase();
+    if (TEXT_ALIGN_VALUES.indexOf(s) !== -1) return s;
+    if (s === 'start') return 'left';
+    if (s === 'end') return 'right';
+    return 'left';
+  }
+
+  function mapTextTransform(v) {
+    const s = String(v || '').trim().toLowerCase();
+    if (TEXT_TRANSFORM_CYCLE.indexOf(s) !== -1) return s;
+    return 'none';
+  }
+
+  function mapFontStyle(v) {
+    const s = String(v || '').trim().toLowerCase();
+    return s === 'italic' || s === 'oblique' ? 'italic' : 'normal';
+  }
+
+  function mapTextDecoration(v) {
+    const s = String(v || '').trim().toLowerCase();
+    if (!s || s === 'none') return 'none';
+    return s.indexOf('underline') !== -1 ? 'underline' : 'none';
+  }
+
+  function nextTextTransform(v) {
+    const cur = mapTextTransform(v);
+    const i = TEXT_TRANSFORM_CYCLE.indexOf(cur);
+    return TEXT_TRANSFORM_CYCLE[(i + 1) % TEXT_TRANSFORM_CYCLE.length];
+  }
+
   function stylePropName(prop) {
     return prop; // camelCase matches CSSStyleDeclaration
   }
 
   function readInlineStyle(el, prop) {
     try {
-      if (prop === 'text') return el.textContent || '';
+      if (prop === 'text') return readEditableText(el);
       if (prop === 'href') return el.getAttribute('href') || '';
       return el.style.getPropertyValue(
         prop.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase())
@@ -1222,9 +1423,9 @@
         numeric: Math.round(parsePx(cs.borderTopLeftRadius)), current: cs.borderRadius,
       });
     }
-    let text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    let text = readEditableText(el);
     if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT);
-    out.push({ prop: 'text', kind: 'text', current: text, value: text, max: MAX_TEXT });
+    out.push({ prop: 'text', kind: 'textarea', current: text, value: text, max: MAX_TEXT });
     try {
       if (el.tagName === 'A' || el.tagName === 'AREA') {
         const href = el.getAttribute('href') || el.href || '';
@@ -1265,7 +1466,7 @@
       const wasInline = !!(inline && String(inline).trim() !== '' && !inlineIsEdit);
       let value;
       if (p.prop === 'text') {
-        value = (editVal != null) ? String(p.value || '') : (el.textContent || '');
+        value = (editVal != null) ? String(p.value || '') : readEditableText(el);
       } else if (p.prop === 'href') {
         value = (editVal != null) ? String(p.value || '') : (el.getAttribute('href') || '');
       } else if (wasInline) {
@@ -1286,6 +1487,24 @@
       }
       inspectorOriginals.set(p.prop, { value, wasInline, kind: p.kind, unit: p.unit || '' });
     }
+    // Also capture formatting baselines used by the text toolbar so Reset all
+    // can restore fontStyle / textDecoration / textAlign / textTransform.
+    const fmtProps = ['fontStyle', 'textDecoration', 'textAlign', 'textTransform'];
+    for (const prop of fmtProps) {
+      if (inspectorOriginals.has(prop)) continue;
+      const inline = readInlineStyle(el, prop);
+      const editVal = edits[prop];
+      const inlineIsEdit = editVal != null
+        && String(inline).trim() !== ''
+        && String(inline).trim() === String(editVal).trim();
+      const wasInline = !!(inline && String(inline).trim() !== '' && !inlineIsEdit);
+      let value = wasInline ? inline : readFormatBaseline(prop);
+      if (prop === 'fontStyle') value = mapFontStyle(value);
+      else if (prop === 'textDecoration') value = mapTextDecoration(value);
+      else if (prop === 'textAlign') value = mapTextAlign(value);
+      else if (prop === 'textTransform') value = mapTextTransform(value);
+      inspectorOriginals.set(prop, { value, wasInline, kind: 'fmt', unit: '' });
+    }
     if (inspector.descriptor) originalsByDesc.set(inspector.descriptor, inspectorOriginals);
   }
 
@@ -1293,7 +1512,7 @@
     const el = inspector.el;
     if (!el) return;
     if (prop === 'text') {
-      el.textContent = value;
+      applyLiveText(el, value);
       return;
     }
     if (prop === 'href') {
@@ -1322,7 +1541,7 @@
     const orig = inspectorOriginals.get(prop);
     if (!el || !orig) return;
     if (prop === 'text') {
-      el.textContent = orig.value;
+      applyLiveText(el, orig.value);
     } else if (prop === 'href') {
       try { el.setAttribute('href', orig.value); } catch (_) { /* ok */ }
     } else if (orig.wasInline) {
@@ -1347,6 +1566,7 @@
     const display = orig.value || '';
     if (prop === 'text' || prop === 'href') {
       control.value = display;
+      if (prop === 'text') autoGrowTextarea(control);
     } else if (control.type === 'range') {
       let n;
       if (prop === 'lineHeight') n = parseFloat(String(display));
@@ -1361,6 +1581,10 @@
       control.value = firstFontFamily(display);
     } else {
       control.value = display;
+    }
+    if (prop === 'text') {
+      const bar = row.querySelector('.comet-insp-fmt');
+      if (bar) syncFormatToolbar(bar);
     }
   }
 
@@ -1480,16 +1704,218 @@
       return wrap;
     }
 
-    // text / href
-    const inp = document.createElement('input');
-    inp.type = 'text';
-    inp.className = 'comet-insp-input';
-    inp.dataset.inspControl = '1';
-    inp.setAttribute('aria-label', p.prop);
-    if (p.max) inp.maxLength = p.max;
-    inp.value = edited != null ? edited : (p.value || '');
-    wrap.appendChild(inp);
+    if (p.prop === 'href') {
+      const inp = document.createElement('input');
+      inp.type = 'text';
+      inp.className = 'comet-insp-input';
+      inp.dataset.inspControl = '1';
+      inp.setAttribute('aria-label', p.prop);
+      if (p.max) inp.maxLength = p.max;
+      inp.value = edited != null ? edited : (p.value || '');
+      wrap.appendChild(inp);
+      return wrap;
+    }
+
+    // Multiline text editor (v1.5): formatting toolbar + auto-grow textarea.
+    // Enter inserts newlines (default textarea behavior); applyLiveText renders
+    // them via <br> for inline elements or textContent + white-space:pre-line.
+    wrap.className = 'comet-insp-control comet-insp-text-editor';
+    const toolbar = buildTextFormatToolbar(edits);
+    wrap.appendChild(toolbar);
+
+    const ta = document.createElement('textarea');
+    ta.className = 'comet-insp-textarea';
+    ta.dataset.inspControl = '1';
+    ta.setAttribute('aria-label', 'text');
+    ta.rows = 3;
+    if (p.max) ta.maxLength = p.max;
+    ta.value = edited != null ? edited : (p.value || '');
+    ta.addEventListener('keydown', (e) => {
+      // Enter newline handling: allow default insert; stop bubbling so the
+      // Element-mode chat Enter shortcut never swallows editor newlines.
+      if (e.key === 'Enter') e.stopPropagation();
+    });
+    wrap.appendChild(ta);
+    // Auto-grow after attach (and once connected) within min/max height.
+    queueMicrotask(() => autoGrowTextarea(ta));
     return wrap;
+  }
+
+  function autoGrowTextarea(ta) {
+    if (!ta) return;
+    try {
+      ta.style.height = 'auto';
+      const next = Math.max(64, Math.min(200, ta.scrollHeight || 64));
+      ta.style.height = next + 'px';
+    } catch (_) { /* ok */ }
+  }
+
+  function fmtActive(edits, prop, onValue, offValue, computedFallback) {
+    const edited = edits && edits[prop] != null ? String(edits[prop]) : null;
+    if (edited != null && String(edited).trim() !== '') {
+      return String(edited).trim().toLowerCase() === String(onValue).toLowerCase();
+    }
+    return String(computedFallback || offValue).toLowerCase() === String(onValue).toLowerCase();
+  }
+
+  function readFormatBaseline(prop) {
+    const el = inspector.el;
+    if (!el) return '';
+    try {
+      const inline = readInlineStyle(el, prop);
+      if (inline && String(inline).trim() !== '') return inline;
+      const cs = getComputedStyle(el);
+      if (!cs) return '';
+      return cs[prop] || '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  // Formatting toolbar above the textarea: Bold / Italic / Underline,
+  // alignment segmented control, and textTransform cycle. All buttons write
+  // element.style live and record into the edits payload.
+  function buildTextFormatToolbar(edits) {
+    const bar = document.createElement('div');
+    bar.className = 'comet-insp-fmt';
+    bar.setAttribute('role', 'toolbar');
+    bar.setAttribute('aria-label', 'Text formatting');
+
+    const fwBase = mapFontWeight(edits.fontWeight != null ? edits.fontWeight : readFormatBaseline('fontWeight'));
+    const fsBase = mapFontStyle(edits.fontStyle != null ? edits.fontStyle : readFormatBaseline('fontStyle'));
+    const tdBase = mapTextDecoration(edits.textDecoration != null ? edits.textDecoration : readFormatBaseline('textDecoration'));
+    const taBase = mapTextAlign(edits.textAlign != null ? edits.textAlign : readFormatBaseline('textAlign'));
+    const ttBase = mapTextTransform(edits.textTransform != null ? edits.textTransform : readFormatBaseline('textTransform'));
+
+    function mkToggle(label, title, prop, onValue, offValue, isOn) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'comet-insp-fmt-btn' + (isOn ? ' active' : '');
+      b.dataset.inspFmt = prop;
+      b.dataset.onValue = onValue;
+      b.dataset.offValue = offValue;
+      b.setAttribute('aria-pressed', isOn ? 'true' : 'false');
+      b.title = title;
+      b.textContent = label;
+      return b;
+    }
+
+    bar.appendChild(mkToggle('B', 'Bold (fontWeight 700/400)', 'fontWeight', '700', '400',
+      fmtActive(edits, 'fontWeight', '700', '400', fwBase === '700' ? '700' : '400')));
+    bar.appendChild(mkToggle('I', 'Italic (fontStyle italic/normal)', 'fontStyle', 'italic', 'normal',
+      fmtActive(edits, 'fontStyle', 'italic', 'normal', fsBase)));
+    bar.appendChild(mkToggle('U', 'Underline (textDecoration underline/none)', 'textDecoration', 'underline', 'none',
+      fmtActive(edits, 'textDecoration', 'underline', 'none', tdBase)));
+
+    const align = document.createElement('div');
+    align.className = 'comet-insp-fmt-align';
+    align.setAttribute('role', 'group');
+    align.setAttribute('aria-label', 'Text alignment');
+    const alignLabels = { left: 'L', center: 'C', right: 'R', justify: 'J' };
+    const alignTitles = {
+      left: 'Align left',
+      center: 'Align center',
+      right: 'Align right',
+      justify: 'Justify',
+    };
+    TEXT_ALIGN_VALUES.forEach((v) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'comet-insp-fmt-btn comet-insp-fmt-align-btn' + (taBase === v ? ' active' : '');
+      b.dataset.inspFmt = 'textAlign';
+      b.dataset.alignValue = v;
+      b.setAttribute('aria-pressed', taBase === v ? 'true' : 'false');
+      b.title = alignTitles[v];
+      b.textContent = alignLabels[v];
+      align.appendChild(b);
+    });
+    bar.appendChild(align);
+
+    const cycle = document.createElement('button');
+    cycle.type = 'button';
+    cycle.className = 'comet-insp-fmt-btn comet-insp-fmt-transform';
+    cycle.dataset.inspFmt = 'textTransform';
+    cycle.dataset.transformValue = ttBase;
+    cycle.title = 'Cycle textTransform (uppercase / lowercase / capitalize / none)';
+    cycle.textContent = ttBase === 'uppercase' ? 'AA'
+      : ttBase === 'lowercase' ? 'aa'
+        : ttBase === 'capitalize' ? 'Aa'
+          : 'off';
+    bar.appendChild(cycle);
+    return bar;
+  }
+
+  function syncFormatToolbar(bar) {
+    if (!bar) return;
+    const edits = currentEdits();
+    const fw = mapFontWeight(edits.fontWeight != null ? edits.fontWeight : readFormatBaseline('fontWeight'));
+    const fs = mapFontStyle(edits.fontStyle != null ? edits.fontStyle : readFormatBaseline('fontStyle'));
+    const td = mapTextDecoration(edits.textDecoration != null ? edits.textDecoration : readFormatBaseline('textDecoration'));
+    const ta = mapTextAlign(edits.textAlign != null ? edits.textAlign : readFormatBaseline('textAlign'));
+    const tt = mapTextTransform(edits.textTransform != null ? edits.textTransform : readFormatBaseline('textTransform'));
+
+    bar.querySelectorAll('[data-insp-fmt="fontWeight"]').forEach((b) => {
+      const on = fw === '700' || parseInt(fw, 10) >= 600;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    bar.querySelectorAll('[data-insp-fmt="fontStyle"]').forEach((b) => {
+      const on = fs === 'italic';
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    bar.querySelectorAll('[data-insp-fmt="textDecoration"]').forEach((b) => {
+      const on = td === 'underline';
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    bar.querySelectorAll('[data-insp-fmt="textAlign"]').forEach((b) => {
+      const on = b.dataset.alignValue === ta;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    bar.querySelectorAll('[data-insp-fmt="textTransform"]').forEach((b) => {
+      b.dataset.transformValue = tt;
+      b.textContent = tt === 'uppercase' ? 'AA'
+        : tt === 'lowercase' ? 'aa'
+          : tt === 'capitalize' ? 'Aa'
+            : 'off';
+    });
+  }
+
+  function onInspectorFormatClick(e) {
+    const btn = e.target && e.target.closest ? e.target.closest('[data-insp-fmt]') : null;
+    if (!btn || !inspector.descriptor || !inspector.el) return;
+    // Don't treat format clicks as Reset.
+    e.preventDefault();
+    e.stopPropagation();
+    const prop = btn.dataset.inspFmt;
+    let value = '';
+    if (prop === 'fontWeight' || prop === 'fontStyle' || prop === 'textDecoration') {
+      const onValue = btn.dataset.onValue;
+      const offValue = btn.dataset.offValue;
+      const isOn = btn.classList.contains('active') || btn.getAttribute('aria-pressed') === 'true';
+      value = isOn ? offValue : onValue;
+    } else if (prop === 'textAlign') {
+      value = btn.dataset.alignValue || 'left';
+    } else if (prop === 'textTransform') {
+      const cur = btn.dataset.transformValue || readFormatBaseline('textTransform') || 'none';
+      value = nextTextTransform(cur);
+    } else {
+      return;
+    }
+    // Live style writes + edits payload (existing schema keys).
+    applyLive(prop, value);
+    recordEdit(prop, value);
+    // Keep the existing fontWeight select (if present) in sync when Bold toggles.
+    if (prop === 'fontWeight') {
+      const fwRow = inspRows && inspRows.querySelector('.comet-insp-row[data-prop="fontWeight"]');
+      const sel = fwRow && fwRow.querySelector('[data-insp-control]');
+      if (sel) sel.value = mapFontWeight(value);
+    }
+    const bar = btn.closest('.comet-insp-fmt');
+    syncFormatToolbar(bar);
+    if (hintProp === prop) scheduleRedraw();
   }
 
   function renderInspector() {
@@ -1502,37 +1928,89 @@
     clearPropertyHint();
     inspRows.innerHTML = '';
     const edits = currentEdits();
-    inspectorProps(el).forEach((p, i) => {
-      const row = document.createElement('div');
-      row.className = 'comet-insp-row';
-      row.dataset.prop = p.prop;
-      row.tabIndex = -1;
-      row.style.setProperty('--row-delay', Math.min(i * 30, 200) + 'ms');
-
-      const lab = document.createElement('span');
-      lab.className = 'comet-insp-label';
-      lab.textContent = p.prop;
-      lab.title = p.prop;
-
-      const control = buildControl(p, edits);
-
-      // Re-apply stored edits live when reopening the inspector.
-      if (edits[p.prop] !== undefined && edits[p.prop] !== null && String(edits[p.prop]).trim() !== '') {
-        applyLive(p.prop, String(edits[p.prop]));
-      }
-
-      const rst = document.createElement('button');
-      rst.type = 'button';
-      rst.className = 'comet-insp-reset';
-      rst.textContent = 'Reset';
-      rst.title = 'Reset ' + p.prop + ' to original';
-      rst.dataset.inspReset = '1';
-
-      row.appendChild(lab);
-      row.appendChild(control);
-      row.appendChild(rst);
-      inspRows.appendChild(row);
+    const props = inspectorProps(el);
+    const buckets = { Text: [], Layout: [], Appearance: [], Other: [] };
+    props.forEach((p) => {
+      const cat = propCategory(p.prop);
+      buckets[cat].push(p);
     });
+    let rowIndex = 0;
+    CAT_ORDER.forEach((cat) => {
+      const items = buckets[cat];
+      if (!items.length) return;
+      const collapsed = isCatCollapsed(cat);
+      const header = document.createElement('button');
+      header.type = 'button';
+      header.className = 'comet-insp-cat-header' + (collapsed ? ' is-collapsed' : '');
+      header.dataset.cat = cat;
+      header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      header.title = (collapsed ? 'Expand ' : 'Collapse ') + cat;
+      const chev = document.createElement('span');
+      chev.className = 'comet-insp-cat-chevron';
+      chev.setAttribute('aria-hidden', 'true');
+      chev.textContent = '▸';
+      const lab = document.createElement('span');
+      lab.className = 'comet-insp-cat-label';
+      lab.textContent = cat;
+      header.appendChild(chev);
+      header.appendChild(lab);
+      header.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleCatCollapse(cat);
+      });
+
+      const body = document.createElement('div');
+      body.className = 'comet-insp-cat-body';
+      body.dataset.cat = cat;
+      body.hidden = collapsed;
+
+      items.forEach((p) => {
+        const row = document.createElement('div');
+        row.className = 'comet-insp-row' + (p.prop === 'text' ? ' comet-insp-row-text' : '');
+        row.dataset.prop = p.prop;
+        row.tabIndex = -1;
+        row.style.setProperty('--row-delay', Math.min(rowIndex * 30, 200) + 'ms');
+        rowIndex++;
+
+        const propLab = document.createElement('span');
+        propLab.className = 'comet-insp-label';
+        propLab.textContent = p.prop;
+        propLab.title = p.prop;
+
+        const control = buildControl(p, edits);
+
+        // Re-apply stored edits live when reopening the inspector.
+        if (edits[p.prop] !== undefined && edits[p.prop] !== null && String(edits[p.prop]).trim() !== '') {
+          applyLive(p.prop, String(edits[p.prop]));
+        }
+
+        const rst = document.createElement('button');
+        rst.type = 'button';
+        rst.className = 'comet-insp-reset';
+        rst.textContent = 'Reset';
+        rst.title = 'Reset ' + p.prop + ' to original';
+        rst.dataset.inspReset = '1';
+
+        row.appendChild(propLab);
+        row.appendChild(control);
+        row.appendChild(rst);
+        body.appendChild(row);
+      });
+
+      inspRows.appendChild(header);
+      inspRows.appendChild(body);
+    });
+    // Re-apply formatting toolbar edits (fontStyle/textDecoration/textAlign/
+    // textTransform) that are not independent inspector rows.
+    ['fontStyle', 'textDecoration', 'textAlign', 'textTransform', 'fontWeight'].forEach((prop) => {
+      if (edits[prop] !== undefined && edits[prop] !== null && String(edits[prop]).trim() !== '') {
+        applyLive(prop, String(edits[prop]));
+      }
+    });
+    const textRow = inspRows.querySelector('.comet-insp-row[data-prop="text"]');
+    const bar = textRow && textRow.querySelector('.comet-insp-fmt');
+    if (bar) syncFormatToolbar(bar);
     updateInspectorState();
     updateSelectionUI();
   }
@@ -1542,14 +2020,32 @@
     if (!inspPanel) return;
     const edits = currentEdits();
     let n = 0;
+    const counted = new Set();
     inspRows.querySelectorAll('.comet-insp-row').forEach((row) => {
-      const v = edits[row.dataset.prop];
+      const prop = row.dataset.prop;
+      const v = edits[prop];
       const nonEmpty = v !== undefined && v !== null && String(v).trim() !== '';
       const wasEdited = row.classList.contains('edited');
       row.classList.toggle('edited', nonEmpty);
       if (nonEmpty && !wasEdited) playMotion(row, 'edited-pulse', 400);
-      if (nonEmpty) n++;
+      if (nonEmpty) {
+        n++;
+        counted.add(prop);
+      }
     });
+    // Formatting toolbar props (textAlign etc.) may lack their own row.
+    Object.keys(edits || {}).forEach((prop) => {
+      if (counted.has(prop)) return;
+      const v = edits[prop];
+      if (v !== undefined && v !== null && String(v).trim() !== '') n++;
+    });
+    // Mark the text row edited when any format toolbar prop is live-edited.
+    const textRow = inspRows.querySelector('.comet-insp-row[data-prop="text"]');
+    if (textRow) {
+      const fmtEdited = ['fontStyle', 'textDecoration', 'textAlign', 'textTransform']
+        .some((p) => edits[p] != null && String(edits[p]).trim() !== '');
+      if (fmtEdited) textRow.classList.add('edited');
+    }
     inspCountEl.textContent = n === 1 ? '1 edit' : n + ' edits';
   }
 
@@ -1608,13 +2104,21 @@
         playMotion(valEl, 'value-tick', 100);
       }
     }
+    if (prop === 'text' && control.tagName === 'TEXTAREA') autoGrowTextarea(control);
     applyLive(prop, v);
     recordEdit(prop, v);
+    // Keep Bold toolbar in sync when the fontWeight select changes.
+    if (prop === 'fontWeight') {
+      const textRow = inspRows && inspRows.querySelector('.comet-insp-row[data-prop="text"]');
+      const bar = textRow && textRow.querySelector('.comet-insp-fmt');
+      if (bar) syncFormatToolbar(bar);
+    }
     if (hintProp === prop) scheduleRedraw();
   }
 
   // Per-row Reset: restore original style/text and drop the stored edit.
   function onInspectorReset(e) {
+    if (e.target && e.target.closest && e.target.closest('[data-insp-fmt]')) return;
     const btn = e.target && e.target.closest ? e.target.closest('[data-insp-reset]') : null;
     if (!btn) return;
     const row = btn.closest('.comet-insp-row');
@@ -1635,6 +2139,9 @@
       syncRowControl(row, row.dataset.prop);
       playMotion(row, 'reset-flash', 200);
     });
+    const textRow = inspRows.querySelector('.comet-insp-row[data-prop="text"]');
+    const bar = textRow && textRow.querySelector('.comet-insp-fmt');
+    if (bar) syncFormatToolbar(bar);
     updateInspectorState();
     if (hintProp) scheduleRedraw();
   }
@@ -1713,9 +2220,45 @@
     }
   }
 
+  // True when a property-hint target is editor/extension UI (must never highlight).
+  function isEditorInternalTarget(el) {
+    if (!el || el.nodeType !== 1) return true;
+    if (host && (el === host || (host.contains && host.contains(el)))) return true;
+    // Shadow-root descendants may not report as contained by the host in all stubs.
+    try {
+      if (shadow && typeof shadow.contains === 'function' && shadow.contains(el)) return true;
+    } catch (_) { /* ok */ }
+    let cur = el;
+    for (let i = 0; i < 24 && cur && cur.nodeType === 1; i++) {
+      let cls = '';
+      try { cls = typeof cur.className === 'string' ? cur.className : (cur.getAttribute && cur.getAttribute('class')) || ''; } catch (_) { cls = ''; }
+      if (typeof cls === 'string' && cls) {
+        if (/\bcomet-insp-/.test(cls) || /\bcomet-toolbar\b/.test(cls) || /\bcomet-chat-/.test(cls) || /\bcomet-chip\b/.test(cls) || /\bcomet-inspector\b/.test(cls)) {
+          return true;
+        }
+      }
+      try { if (cur.id === 'hermes-annotate-host') return true; } catch (_) { /* ok */ }
+      cur = cur.parentElement || cur.parentNode;
+    }
+    // Belt-and-braces: rect fully inside the inspector panel.
+    if (inspPanel) {
+      try {
+        const pr = inspPanel.getBoundingClientRect();
+        const er = el.getBoundingClientRect();
+        if (pr && er && er.width > 0 && er.height > 0
+          && er.left >= pr.left && er.top >= pr.top
+          && er.right <= pr.right && er.bottom <= pr.bottom) {
+          return true;
+        }
+      } catch (_) { /* ok */ }
+    }
+    return false;
+  }
+
   function drawPropertyHint() {
     if (!ctx || !hintProp || !inspector.el) return;
     const el = inspector.el;
+    if (isEditorInternalTarget(el)) return;
     let box = null;
     try { box = el.getBoundingClientRect(); } catch (_) { box = null; }
     if (!box) return;
@@ -2099,6 +2642,11 @@
     selLayer = null;
     hlEl = null;
     hlChip = null;
+    hoverBoxEl = null;
+    if (hoverBoxRaf) {
+      cancelAnimationFrame(hoverBoxRaf);
+      hoverBoxRaf = 0;
+    }
     chatCard = null;
     chatHead = null;
     chatInput = null;
@@ -2134,6 +2682,7 @@
     // the collapsed/position state must be reset here).
     state.collapsed = false;
     state.position = null;
+    state.collapsedCats = {};
     window.__hermesAnnotateInjected = false;
     window.__browserlinkInjected = false;
   }
@@ -2184,6 +2733,9 @@
     window.removeEventListener('resize', onWindowResize);
     window.removeEventListener('orientationchange', onWindowResize);
     saveTabState({ enabled: false }); // deactivation persists per tab
+    try {
+      chrome.storage.local.set({ toolEnabled: false }); // master switch stays off across refreshes
+    } catch (_) { /* storage unavailable */ }
 
     if (host && host.parentNode && !isReducedMotion()) {
       host.classList.add('is-exiting');
@@ -2218,6 +2770,9 @@
         restoreTabState(null);
       });
       saveTabState({ enabled: true });
+      try {
+        chrome.storage.local.set({ toolEnabled: true }); // master switch reflects active tool
+      } catch (_) { /* storage unavailable */ }
       pingTabId();
     } catch (err) {
       try { if (host && host.parentNode) host.parentNode.removeChild(host); } catch (_) { /* ok */ }
@@ -2235,6 +2790,10 @@
       applyPosition(d.x, d.y);
     }
     setCollapsed(!!(st && st.collapsed));
+    // Inspector category collapse is per-tab view state (default: all expanded).
+    state.collapsedCats = (st && st.collapsedCats && typeof st.collapsedCats === 'object')
+      ? Object.assign({}, st.collapsedCats)
+      : {};
   }
 
   // Messages from the popup (forwarded by the service worker) / background.
@@ -2352,6 +2911,11 @@
     hlChip.className = 'comet-hl-chip';
     hlEl.appendChild(hlChip);
 
+    // Stronger element-mode hover box (v1.6); coexists with the lerped hlEl.
+    hoverBoxEl = document.createElement('div');
+    hoverBoxEl.className = 'comet-hover-box';
+    hoverBoxEl.style.display = 'none';
+
     // Instruction chat card (bottom-right of the viewport).
     chatCard = document.createElement('div');
     chatCard.className = 'comet-chat';
@@ -2394,6 +2958,7 @@
     shadow.appendChild(chipEl);
     shadow.appendChild(selLayer);
     selLayer.appendChild(hlEl);
+    selLayer.appendChild(hoverBoxEl);
     shadow.appendChild(canvas);
     shadow.appendChild(chatCard);
     shadow.appendChild(inspPanel);
@@ -2459,6 +3024,15 @@
         '.comet-hl-chip{position:absolute;left:0;top:0;transform:translate(0,-100%);background:#4a9eff;color:#fff;' +
         'font:11px/1.4 system-ui;padding:2px 6px;border-radius:4px 4px 0 0;white-space:nowrap;max-width:240px;' +
         'overflow:hidden;text-overflow:ellipsis;}' +
+        '.comet-hover-box{position:absolute;border:2px solid #ff6b6b;background:rgba(255,82,82,.08);' +
+        'pointer-events:none;box-sizing:border-box;display:none;z-index:1;}' +
+        '.comet-insp-cat-header{display:flex;align-items:center;gap:6px;width:100%;margin:0;padding:4px 6px;' +
+        'border:1px solid transparent;border-radius:6px;background:rgba(255,255,255,.04);color:#e8eaed;' +
+        'font:11px/1.3 system-ui;font-weight:600;text-transform:uppercase;cursor:pointer;text-align:left;}' +
+        '.comet-insp-cat-chevron{display:inline-block;width:10px;transform:rotate(90deg);transition:transform .15s ease;color:#9aa0a6;}' +
+        '.comet-insp-cat-header.is-collapsed .comet-insp-cat-chevron{transform:rotate(0deg);}' +
+        '.comet-insp-cat-body{display:flex;flex-direction:column;gap:6px;}' +
+        '.comet-insp-cat-body[hidden]{display:none;}' +
         '.comet-el{position:absolute;border:2px dashed #ff5252;pointer-events:none;box-sizing:border-box;}' +
         '.comet-el-badge{position:absolute;left:0;top:0;transform:translate(-50%,-100%);min-width:16px;height:16px;' +
         'border-radius:50%;background:#ff5252;color:#fff;font:bold 10px/16px system-ui;text-align:center;' +
@@ -2563,6 +3137,7 @@
     });
     inspRows.addEventListener('input', onInspectorInput);
     inspRows.addEventListener('change', onInspectorInput);
+    inspRows.addEventListener('click', onInspectorFormatClick);
     inspRows.addEventListener('click', onInspectorReset);
     inspRows.addEventListener('pointerover', onInspectorPointerOver);
     inspRows.addEventListener('focusin', onInspectorFocusIn);
@@ -2602,8 +3177,17 @@
         saved = await chrome.storage.session.get(tabStorageKey());
       } catch (_) { saved = null; }
       const st = saved && saved[tabStorageKey()] ? saved[tabStorageKey()] : null;
-      if (st && st.enabled === false) {
-        // Deactivation persists per tab: stay off until the popup re-enables.
+      // The popup master switch (storage.local) is the authoritative on/off
+      // flag: it survives refreshes without depending on the SW tab-id ping
+      // (which can race on a fresh page load). The per-tab session state is
+      // kept as a fallback for state saved before this check existed.
+      let masterEnabled = true;
+      try {
+        const got = await chrome.storage.local.get('toolEnabled');
+        if (got && typeof got.toolEnabled === 'boolean') masterEnabled = got.toolEnabled;
+      } catch (_) { /* storage unavailable */ }
+      if (masterEnabled === false || (st && st.enabled === false)) {
+        // Deactivation persists: stay off until the popup re-enables.
         saveTabState({ enabled: false });
         return;
       }
@@ -2627,8 +3211,12 @@
       closeInspector,
       renderInspector,
       applyLive,
+      applyLiveText,
       recordEdit,
       restoreProp,
+      onInspectorFormatClick,
+      onInspectorInput,
+      syncFormatToolbar,
       setPropertyHint,
       clearPropertyHint,
       drawPropertyHint,
@@ -2637,12 +3225,19 @@
       get originals() { return inspectorOriginals; },
       getRows: () => inspRows,
       getCtx: () => ctx,
+      toggleCatCollapse,
+      propCategory,
+      isEditorInternalTarget,
     };
     window.__BL_TEST_API__ = {
       get state() { return state; },
       get reducedMotion() { return reducedMotion; },
       get activeElement() { return inspector.el; },
+      get hoverBoxEl() { return hoverBoxEl; },
+      get hlEl() { return hlEl; },
       onPageClick,
+      onMouseMove,
+      positionHover,
       setElementMode,
       removeSelectionAt,
       computeCaptureRect,

@@ -184,6 +184,16 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Stronger element-mode hover box (v1.6): SEL_COLOR-adjacent accent + subtle fill */
+.comet-hover-box {
+  position: absolute;
+  border: 2px solid #ff6b6b;
+  background: rgba(255, 82, 82, 0.08);
+  pointer-events: none;
+  box-sizing: border-box;
+  display: none;
+  z-index: 1;
+}
 
 /* ---- persistent selection: dashed outline + numbered badge ---- */
 .comet-el {
@@ -376,6 +386,49 @@
   flex-direction: column;
   gap: 6px;
 }
+.comet-insp-cat-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin: 0;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--bl-text, #e8eaed);
+  font: 11px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  cursor: pointer;
+  text-align: left;
+}
+.comet-insp-cat-header:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.comet-insp-cat-chevron {
+  display: inline-block;
+  width: 10px;
+  transform: rotate(90deg);
+  transition: transform 0.15s ease;
+  color: var(--bl-muted, #9aa0a6);
+}
+.comet-insp-cat-header.is-collapsed .comet-insp-cat-chevron {
+  transform: rotate(0deg);
+}
+.comet-insp-cat-label {
+  flex: 1 1 auto;
+  color: var(--bl-muted, #9aa0a6);
+}
+.comet-insp-cat-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.comet-insp-cat-body[hidden] {
+  display: none;
+}
 .comet-insp-row {
   display: grid;
   grid-template-columns: 72px minmax(0, 1fr) auto;
@@ -422,7 +475,8 @@
   color: var(--bl-muted, #9aa0a6);
 }
 .comet-insp-input,
-.comet-insp-select {
+.comet-insp-select,
+.comet-insp-textarea {
   min-width: 0;
   width: 100%;
   box-sizing: border-box;
@@ -448,9 +502,101 @@
 }
 .comet-insp-input:focus,
 .comet-insp-select:focus,
+.comet-insp-textarea:focus,
 .comet-insp-row.edited .comet-insp-input,
-.comet-insp-row.edited .comet-insp-select {
+.comet-insp-row.edited .comet-insp-select,
+.comet-insp-row.edited .comet-insp-textarea {
   border-color: var(--bl-accent, #4a9eff);
+}
+
+/* ---- v1.5 multiline text editor + formatting toolbar ---- */
+.comet-insp-row-text {
+  align-items: start;
+}
+.comet-insp-row-text .comet-insp-label {
+  padding-top: 6px;
+}
+.comet-insp-row-text .comet-insp-reset {
+  margin-top: 4px;
+}
+.comet-insp-text-editor {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+.comet-insp-textarea {
+  min-height: 64px;
+  max-height: 200px;
+  resize: none;
+  overflow-y: auto;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.comet-insp-fmt {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.comet-insp-fmt-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
+  border-radius: 4px;
+  background: var(--bl-btn-bg, rgba(255, 255, 255, 0.06));
+  color: var(--bl-text, #e8eaed);
+  font: 11px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  cursor: pointer;
+}
+.comet-insp-fmt-btn[data-insp-fmt="fontWeight"] {
+  font-weight: 700;
+}
+.comet-insp-fmt-btn[data-insp-fmt="fontStyle"] {
+  font-style: italic;
+}
+.comet-insp-fmt-btn[data-insp-fmt="textDecoration"] {
+  text-decoration: underline;
+}
+.comet-insp-fmt-btn:hover {
+  border-color: var(--bl-accent, #4a9eff);
+}
+.comet-insp-fmt-btn.active {
+  background: var(--bl-accent, #4a9eff);
+  border-color: var(--bl-accent, #4a9eff);
+  color: #fff;
+}
+.comet-insp-fmt-align {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
+  border-radius: 4px;
+  overflow: hidden;
+}
+.comet-insp-fmt-align-btn {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 0;
+  border-right: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
+}
+.comet-insp-fmt-align-btn:last-child {
+  border-right: none;
+}
+.comet-insp-fmt-transform {
+  width: auto;
+  min-width: 22px;
+  padding: 0 5px;
+  letter-spacing: 0.02em;
 }
 .comet-insp-reset {
   appearance: none;
@@ -838,5 +984,8 @@
   .comet-insp-row,
   .comet-selection-row {
     animation: none !important;
+  }
+  .comet-insp-cat-chevron {
+    transition: none !important;
   }
 }

@@ -50,6 +50,13 @@ async function pollTargetAndMaybeActivate() {
   } catch (_) {
     return;
   }
+  // Respect the popup master switch: a connect request must not override an
+  // explicit user OFF. Without this gate, a stale activate:true target makes
+  // the tool re-appear (and flips toolEnabled back to true) every 30s poll.
+  try {
+    const got = await chrome.storage.local.get('toolEnabled');
+    if (got && got.toolEnabled === false) return;
+  } catch (_) { /* storage unavailable: proceed */ }
   let target = null;
   try {
     const res = await fetch(endpoint + '/target');

@@ -84,8 +84,8 @@ See [MCP tools](docs/mcp.md) for Claude Code and Hermes setup examples.
 
 ## Features
 
-- **Draw annotations** - circles, arrows, scribbles; normalized coordinates,
-  theme-aware colors, undo/clear.
+- **Draw annotations** - circles, arrows, scribbles; normalized coordinates
+  so annotations stay accurate across scroll and resize; undo/clear.
 - **Element picker** - DevTools-style hover highlight with `tag#id.class`
   chips; click to select; numbered markers; real element descriptors
   (tag, id, classes, text, href, cssPath, rect).
@@ -104,14 +104,22 @@ See [MCP tools](docs/mcp.md) for Claude Code and Hermes setup examples.
   pickers and selects that apply changes LIVE to the element; per-row Reset
   and Reset All; hovering a property row highlights what it affects on the
   page.
+- **Lightweight text editor** - multiline text editing with formatting
+  controls (bold, italic, underline, alignment, text transform) that write
+  live styles and ship as structured `edits` (`textAlign`, `textTransform`,
+  `letterSpacing`, `wordSpacing`, `whiteSpace`, `verticalAlign`,
+  `textDecoration`, `fontStyle`, `textShadow`, plus existing font/color keys).
 - **Multi-select** - Shift+click to select several elements at once; each
   keeps its own instruction and edits; Send ships them all in one payload.
 - **Element-crop screenshots** - sending captures the visible tab and crops
   it to the selected elements, so the chat receives a screenshot of exactly
   what you annotated (plus the annotation file as an attachment).
-- **Micro-animations** - hover/press feedback, sliding mode pill, staggered
-  inspector rows, lerped hover highlight, pulsing selection ring, send
-  success/error feedback; respects `prefers-reduced-motion`.
+- **Collapsible inspector categories** - inspector rows group under
+  Text / Layout / Appearance / Other headers; click a header to collapse or
+  expand the group; collapse state persists per tab.
+- **Element-mode hover boxes** - hovering in Element mode draws a clear
+  outline box around the element under the cursor (tracks scroll and resize),
+  so you can see exactly what you are about to select.
 - **Harness-neutral** - MCP server (works with every major harness), REST API,
   and pluggable adapters (Hermes chat injection, generic webhooks).
 - **Your sessions stay yours** - the extension never touches page DOM beyond a

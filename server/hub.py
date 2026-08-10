@@ -29,11 +29,13 @@ NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 SCREENSHOT_PREFIX = "data:image/png;base64,"
 MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024
 
-# Schema v1.1: allowed keys for elements[].edits (protocol, docs/protocol.md).
+# Schema v1.5: allowed keys for elements[].edits (protocol, docs/protocol.md).
 ALLOWED_EDIT_KEYS = frozenset((
     "width", "height", "fontFamily", "fontSize", "fontWeight", "lineHeight",
     "color", "backgroundColor", "text", "href", "display", "margin",
     "padding", "borderRadius",
+    "textAlign", "textTransform", "letterSpacing", "wordSpacing", "whiteSpace",
+    "verticalAlign", "textDecoration", "fontStyle", "textShadow",
 ))
 
 

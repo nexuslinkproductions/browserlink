@@ -4,6 +4,43 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [1.6.0] - 2026-08-10
+
+### Added
+
+- **Collapsible inspector categories** - inspector rows group under
+  Text / Layout / Appearance / Other headers; click a header to collapse or
+  expand the group; collapse state persists per tab
+- **Element-mode hover boxes** - hovering in Element mode draws a clear
+  outline box around the element under the cursor (tracks scroll and resize),
+  so you can see exactly what you are about to select
+- **Property-hint exclusion** - hovering a property row highlights what it
+  affects on the page, never the inspector/editor UI itself
+
+### Fixed
+
+- **Popup switch no longer flips back** - the service worker's connect poll
+  now respects the popup master switch; a stale connect target can no longer
+  re-inject the tool (or flip `toolEnabled` back to ON) after you deactivated
+  it
+- **Hermes delivery routing** - the adapter resolves the target session's
+  own provider/model from the session record (any provider, any model) and
+  sends the screenshot as a real image attachment (`image_url` part) instead
+  of a literal `@image:` text ref; env overrides remain available for
+  special cases
+
+## [1.5.0] - 2026-08-10
+
+### Added
+
+- **Text editor edits keys** - hub `elements[].edits` accepts text-formatting
+  properties for the inspector editor: `textAlign`, `textTransform`,
+  `letterSpacing`, `wordSpacing`, `whiteSpace`, `verticalAlign`,
+  `textDecoration`, `fontStyle`, `textShadow` (schema v1.5; unknown keys
+  still HTTP 400)
+- **Docs** - protocol schema v1.5 documents the new allowed `edits` keys;
+  README notes the lightweight text editor feature
+
 ## [1.4.0] - 2026-08-10
 
 ### Added

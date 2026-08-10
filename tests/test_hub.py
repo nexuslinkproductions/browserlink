@@ -70,6 +70,8 @@ ALL_EDIT_KEYS = [
     "width", "height", "fontFamily", "fontSize", "fontWeight", "lineHeight",
     "color", "backgroundColor", "text", "href", "display", "margin",
     "padding", "borderRadius",
+    "textAlign", "textTransform", "letterSpacing", "wordSpacing", "whiteSpace",
+    "verticalAlign", "textDecoration", "fontStyle", "textShadow",
 ]
 
 
@@ -94,6 +96,32 @@ def test_elements_edits_all_allowed_keys_round_trip(data_dir):
     assert hub.validate_payload(p) is None
     path = hub.store_annotation(p)
     assert json.loads(path.read_text())["elements"][0]["edits"] == p["elements"][0]["edits"]
+
+
+TEXT_EDITOR_EDIT_KEYS = [
+    "textAlign", "textTransform", "letterSpacing", "wordSpacing", "whiteSpace",
+    "verticalAlign", "textDecoration", "fontStyle", "textShadow",
+]
+
+
+def test_elements_edits_text_editor_keys_round_trip(data_dir):
+    p = payload()
+    edits = {
+        "textAlign": "center",
+        "textTransform": "uppercase",
+        "letterSpacing": "0.05em",
+        "wordSpacing": "0.2em",
+        "whiteSpace": "pre-wrap",
+        "verticalAlign": "middle",
+        "textDecoration": "underline",
+        "fontStyle": "italic",
+        "textShadow": "1px 1px 2px #000",
+    }
+    assert list(edits.keys()) == TEXT_EDITOR_EDIT_KEYS
+    p["elements"] = [{"index": 1, "tag": "p", "edits": edits}]
+    assert hub.validate_payload(p) is None
+    path = hub.store_annotation(p)
+    assert json.loads(path.read_text())["elements"][0]["edits"] == edits
 
 
 def test_elements_edits_unknown_key_rejected():

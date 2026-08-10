@@ -1,7 +1,13 @@
-# browserlink protocol - annotation schema v1.4
+# browserlink protocol - annotation schema v1.5
 
 The public contract between the extension, the hub, and any harness. Versioned;
 changes require a new minor or major version and a compatibility shim.
+
+**Schema v1.5** (backward compatible with v1.0 through v1.4): extends
+`elements[].edits` with text-formatting keys used by the inspector editor
+(`textAlign`, `textTransform`, `letterSpacing`, `wordSpacing`, `whiteSpace`,
+`verticalAlign`, `textDecoration`, `fontStyle`, `textShadow`). Unknown keys
+still return HTTP 400.
 
 **Schema v1.4** (backward compatible with v1.0 through v1.3): adds an optional
 `screenshot` field (PNG data URL). The hub stores a sibling PNG and replaces
@@ -91,14 +97,15 @@ Delivery (Hermes adapter):
   `@file:<abs path to annotation json>` as the last line
 - Both lines are omitted when the corresponding file is missing
 
-### elements[].edits (schema v1.1)
+### elements[].edits (schema v1.1, extended in v1.5)
 
 Optional object mapping a CSS/text property to the DESIRED new value. Every
 value must be a string; keys are restricted to:
 
 `width`, `height`, `fontFamily`, `fontSize`, `fontWeight`, `lineHeight`,
 `color`, `backgroundColor`, `text`, `href`, `display`, `margin`, `padding`,
-`borderRadius`
+`borderRadius`, `textAlign`, `textTransform`, `letterSpacing`, `wordSpacing`,
+`whiteSpace`, `verticalAlign`, `textDecoration`, `fontStyle`, `textShadow`
 
 Rules:
 
@@ -209,9 +216,9 @@ Consumers map them back by multiplying with their own viewport dimensions.
 
 ## Versioning
 
-This is **schema v1.4**: backward compatible with v1.0 through v1.3. The
-optional `screenshot` / `screenshotFile` fields are additive; older payloads
-validate and store unchanged. Schema v1.1 added optional `elements[].edits`.
-Breaking changes (new required fields, coordinate semantics, endpoint
-removal) bump to v2 with a deprecation window: the hub accepts both versions
-for one minor release.
+This is **schema v1.5**: backward compatible with v1.0 through v1.4. The
+v1.5 text-formatting `edits` keys are additive; older payloads validate and
+store unchanged. Schema v1.4 added optional `screenshot` / `screenshotFile`.
+Schema v1.1 added optional `elements[].edits`. Breaking changes (new required
+fields, coordinate semantics, endpoint removal) bump to v2 with a deprecation
+window: the hub accepts both versions for one minor release.
