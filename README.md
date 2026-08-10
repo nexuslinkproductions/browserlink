@@ -1,4 +1,4 @@
-# browserlink
+# Browserlink
 
 **Annotate in your browser. Deliver to any AI harness.**
 
