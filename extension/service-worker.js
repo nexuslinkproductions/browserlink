@@ -1,19 +1,21 @@
-/* Browserlink — Browser Annotate & Connect — service worker (MV3).
+/* Browserlink - Browser Annotate & Connect - service worker (MV3).
  *
  * Relays {type:"annotate", payload} messages from content script or popup to
  * the configured hub: POST <endpoint>/annotations (CORS-enabled). Answers
  * {type:"hubStatus"} with a GET <endpoint>/health probe. Forwards
  * {type:"browserlinkToggle", enabled} and {type:"browserlinkExit"} messages
- * from the popup to the active tab's content script. The hub endpoint is
- * read from chrome.storage.local key "endpoint", falling back to
- * DEFAULT_ENDPOINT. Responds to the sender with {ok:true} or
- * {ok:false,error}.
+ * from the popup to the active tab's content script. Polls GET /target via
+ * chrome.alarms ("browserlink-poll", every 0.5 min); when activate is true,
+ * injects the overlay on the active tab and POSTs /activate {active:false}
+ * as an ack (one inject per connect). The hub endpoint is read from
+ * chrome.storage.local key "endpoint", falling back to DEFAULT_ENDPOINT.
+ * Responds to the sender with {ok:true} or {ok:false,error}.
  */
 'use strict';
 
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787';
-
 const HUB_STATUS_TIMEOUT_MS = 2000;
+const POLL_ALARM = 'browserlink-poll';
 
 async function getEndpoint() {
   try {
@@ -24,6 +26,64 @@ async function getEndpoint() {
     return DEFAULT_ENDPOINT;
   }
 }
+
+function ensurePollAlarm() {
+  try {
+    chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
+  } catch (_) { /* alarms unavailable */ }
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  ensurePollAlarm();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  ensurePollAlarm();
+});
+
+ensurePollAlarm();
+
+async function pollTargetAndMaybeActivate() {
+  let endpoint;
+  try {
+    endpoint = await getEndpoint();
+  } catch (_) {
+    return;
+  }
+  let target = null;
+  try {
+    const res = await fetch(endpoint + '/target');
+    if (!res.ok) return;
+    target = await res.json();
+  } catch (_) {
+    return;
+  }
+  if (!target || target.activate !== true) return;
+
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = tabs && tabs[0];
+    if (tab && typeof tab.id === 'number') {
+      try {
+        await chrome.tabs.sendMessage(tab.id, { type: 'browserlinkToggle', enabled: true });
+      } catch (_) { /* content script may be absent on this tab */ }
+    }
+  } catch (_) { /* tabs query failed */ }
+
+  // activate ack: clear the one-shot flag so we only inject once per connect
+  try {
+    await fetch(endpoint + '/activate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active: false }),
+    });
+  } catch (_) { /* ack best-effort */ }
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (!alarm || alarm.name !== POLL_ALARM) return;
+  pollTargetAndMaybeActivate();
+});
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== 'object') return false;
@@ -91,6 +151,42 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
       });
     return true; // keep the message channel open for the async sendResponse
+  }
+
+  if (msg.type === 'deliveryTarget') {
+    getEndpoint()
+      .then((endpoint) =>
+        fetch(endpoint + '/target')
+          .then(async (res) => {
+            if (res.status === 404) {
+              sendResponse({ ok: true, connected: false });
+              return;
+            }
+            let body = null;
+            try { body = await res.json(); } catch (_) { /* non-JSON */ }
+            if (!res.ok) {
+              sendResponse({
+                ok: false,
+                error: body && body.error ? String(body.error) : 'HTTP ' + res.status,
+              });
+              return;
+            }
+            const sessionId = body && typeof body.sessionId === 'string' ? body.sessionId : '';
+            const label = body && typeof body.label === 'string' ? body.label : '';
+            if (!sessionId) {
+              sendResponse({ ok: true, connected: false });
+              return;
+            }
+            sendResponse({ ok: true, connected: true, sessionId: sessionId, label: label });
+          })
+          .catch((err) => {
+            sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
+          })
+      )
+      .catch((err) => {
+        sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
+      });
+    return true;
   }
 
   if (msg.type === 'browserlinkToggle' || msg.type === 'browserlinkExit') {

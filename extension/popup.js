@@ -1,11 +1,12 @@
-/* Browserlink — Browser Annotate & Connect — popup logic (MV3).
+/* Browserlink - Browser Annotate & Connect - popup logic (MV3).
  *
  *   - Hub endpoint: input persisted via chrome.storage.local key "endpoint"
  *     (display default http://127.0.0.1:8787). The service worker resolves
  *     and uses the stored endpoint for all requests.
  *   - Hub status: asks the service worker ({type:"hubStatus"} → GET
  *     <endpoint>/health); refreshed on open and on demand (Check button /
- *     after saving an endpoint).
+ *     after saving an endpoint). Also GETs /target to show
+ *     "Delivered to: <label|sessionId|not connected>".
  *   - Context label: persisted via chrome.storage.local ("contextLabel"),
  *     merged into payload.label at send time by content.js.
  *   - Master switch ("Tool active"): persisted via chrome.storage.local
@@ -26,16 +27,42 @@ function setHubStatus(text, cls) {
   el.className = 'status ' + cls;
 }
 
+function deliveredText(target) {
+  if (!target || typeof target !== 'object') return 'Delivered to: not connected';
+  const label = target.label ? String(target.label).trim() : '';
+  const sessionId = target.sessionId ? String(target.sessionId).trim() : '';
+  if (label) return 'Delivered to: ' + label;
+  if (sessionId) return 'Delivered to: ' + sessionId;
+  return 'Delivered to: not connected';
+}
+
 /* hub health via the service worker (endpoint is resolved there) */
 async function checkHub() {
   setHubStatus('Hub: checking…', '');
+  let hubLine = 'Hub: offline';
+  let hubCls = 'err';
   try {
     const resp = await chrome.runtime.sendMessage({ type: 'hubStatus' });
-    if (resp && resp.ok) setHubStatus('Hub: connected ✓', 'ok');
-    else setHubStatus('Hub: offline', 'err');
+    if (resp && resp.ok) {
+      hubLine = 'Hub: connected ✓';
+      hubCls = 'ok';
+    }
+  } catch (_) { /* offline */ }
+
+  let delivered = 'Delivered to: not connected';
+  try {
+    const endpoint = ($('endpointInput').value || '').trim() || DEFAULT_ENDPOINT;
+    const res = await fetch(endpoint + '/target');
+    if (res.ok) {
+      const body = await res.json();
+      delivered = deliveredText(body);
+    } else if (res.status === 404) {
+      delivered = 'Delivered to: not connected';
+    }
   } catch (_) {
-    setHubStatus('Hub: offline', 'err');
+    delivered = 'Delivered to: not connected';
   }
+  setHubStatus(hubLine + ' · ' + delivered, hubCls);
 }
 
 /* hub endpoint persistence */

@@ -48,6 +48,31 @@ highlight, click to select, type instructions in the chat card) → **Send**.
 The annotation lands in the hub inbox (`~/.browserlink/annotations/`) and is
 delivered to your connected harness.
 
+## Invoke from any chat
+
+From any MCP-capable harness chat you can point the extension at *this*
+session without manually wiring chat to tool:
+
+1. Install and run the hub (`python3 server/hub.py`).
+2. Load the extension and leave it open in your browser.
+3. Register the MCP server with your harness, then call:
+
+```
+browserlink_connect(sessionId="<this session id>", label="my chat", activate=true)
+```
+
+What happens next:
+
+- MCP posts the session to `POST /target` and sets `activate` via `/activate`.
+- The extension polls `GET /target` every 30s (`chrome.alarms`).
+- On `activate: true` it injects the overlay into the active tab, then acks
+  with `POST /activate {active:false}` so inject runs once per connect.
+- Later annotations go to the hub; the Hermes adapter prefers
+  `target.json` `sessionId` over `HERMES_SESSION_ID`.
+
+Disconnect with `browserlink_disconnect()`. Check with `browserlink_status()`.
+See [MCP tools](docs/mcp.md) for Claude Code and Hermes setup examples.
+
 ## Features
 
 - **Draw annotations** - circles, arrows, scribbles; normalized coordinates,

@@ -3,35 +3,116 @@
 import json
 import logging
 import os
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 LOGGER = logging.getLogger(__name__)
 
 
+def _data_dir() -> Path:
+    configured = os.environ.get("BROWSERLINK_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    hermes_home = os.environ.get("HERMES_HOME")
+    if hermes_home:
+        return Path(hermes_home).expanduser() / "annotations"
+    return Path.home() / ".browserlink" / "annotations"
+
+
+def _read_target_session_id() -> Optional[str]:
+    """Fresh read of target.json sessionId (target-over-env resolution)."""
+    path = _data_dir() / "target.json"
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    session_id = value.get("sessionId")
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    return None
+
+
+def _resolve_session_id() -> Optional[str]:
+    # target.json sessionId wins over HERMES_SESSION_ID env (target-over-env).
+    target_sid = _read_target_session_id()
+    if target_sid:
+        return target_sid
+    env_sid = os.environ.get("HERMES_SESSION_ID")
+    if isinstance(env_sid, str) and env_sid.strip():
+        return env_sid.strip()
+    return None
+
+
+def _element_tag_name(element: Dict[str, Any]) -> str:
+    tag = element.get("tag", "") or ""
+    element_id = element.get("id")
+    class_name = element.get("className") or element.get("class") or ""
+    parts = [str(tag)]
+    if element_id:
+        parts[0] = parts[0] + "#" + str(element_id)
+    if class_name:
+        classes = str(class_name).split()
+        for cls in classes:
+            if cls:
+                parts[0] = parts[0] + "." + cls
+    return parts[0]
+
+
+def _format_edits(edits: Any) -> str:
+    if not isinstance(edits, dict) or not edits:
+        return ""
+    bits = []
+    for key, value in edits.items():
+        bits.append("%s=%s" % (key, value))
+    return " ".join(bits)
+
+
 def _message(annotation: Dict[str, Any]) -> str:
-    url = annotation.get("url", "")
-    label = annotation.get("label", "")
-    parts: List[str] = []
-    for number, element in enumerate(annotation.get("elements", []), 1):
-        tag = element.get("tag", "")
-        element_id = element.get("id")
-        text = element.get("text", "")
-        tag_name = tag + ("#" + element_id if element_id else "")
-        part = "E%d: %s '%s'" % (number, tag_name, text)
-        instruction = element.get("instruction")
-        if instruction:
-            part += " — instruction: " + instruction
-        parts.append(part)
-    return " — ".join([url, label] + parts)
+    lines: List[str] = ["📎 browserlink annotation"]
+    lines.append("URL: %s" % (annotation.get("url", "") or ""))
+    lines.append("Title: %s" % (annotation.get("title", "") or ""))
+    lines.append("Label: %s" % (annotation.get("label", "") or ""))
+
+    elements = annotation.get("elements") or []
+    if isinstance(elements, list):
+        for number, element in enumerate(elements, 1):
+            if not isinstance(element, dict):
+                continue
+            tag_name = _element_tag_name(element)
+            text = element.get("text", "") or ""
+            part = "E%d: %s '%s'" % (number, tag_name, text)
+            instruction = element.get("instruction")
+            if instruction:
+                part += " - instruction: " + str(instruction)
+            edits = element.get("edits")
+            edits_str = _format_edits(edits)
+            if edits_str:
+                part += " - edits: " + edits_str
+            lines.append(part)
+
+    strokes = annotation.get("strokes") or []
+    stroke_count = len(strokes) if isinstance(strokes, list) else 0
+    lines.append("%d stroke(s)" % stroke_count)
+    return "\n".join(lines)
 
 
 def register(annotation: Dict[str, Any]) -> None:
     api_url = os.environ.get("HERMES_API_URL")
     api_key = os.environ.get("HERMES_API_KEY")
-    session_id = os.environ.get("HERMES_SESSION_ID")
-    if not (api_url and api_key and session_id):
+    if not (api_url and api_key):
+        return
+    session_id = _resolve_session_id()
+    if not session_id:
+        LOGGER.info(
+            "Hermes adapter: no sessionId in target.json or HERMES_SESSION_ID; skipping delivery"
+        )
         return
     endpoint = api_url.rstrip("/") + "/api/sessions/%s/chat" % session_id
     body = json.dumps({"message": _message(annotation)}).encode("utf-8")
@@ -40,7 +121,7 @@ def register(annotation: Dict[str, Any]) -> None:
         "Content-Type": "application/json",
     })
     try:
-        with urlopen(request, timeout=5):
+        with urlopen(request, timeout=300):
             pass
     except (HTTPError, URLError, OSError, ValueError) as error:
         LOGGER.warning("Hermes adapter failed: %s", error)
