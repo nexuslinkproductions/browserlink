@@ -1,1 +1,0 @@
-"""Optional Browserlink delivery adapters."""

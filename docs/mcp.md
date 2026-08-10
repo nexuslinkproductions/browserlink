@@ -47,7 +47,7 @@ Add to `.mcp.json` (project or user):
 }
 ```
 
-Install the package first (`pip install -e mcp/` from the repo, or an
+Install the package first (`npm install -g .` from the repo, or an
 equivalent install that puts `browserlink-mcp` on `PATH`).
 
 ### Hermes
