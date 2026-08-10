@@ -74,8 +74,20 @@ def _format_edits(edits: Any) -> str:
     return " ".join(bits)
 
 
-def _message(annotation: Dict[str, Any]) -> str:
-    lines: List[str] = ["📎 browserlink annotation"]
+def _message(annotation: Dict[str, Any], annotation_path: Optional[str] = None) -> str:
+    lines: List[str] = []
+
+    # Schema v1.4: @image first when the sibling PNG exists on disk.
+    screenshot_file = annotation.get("screenshotFile")
+    if isinstance(screenshot_file, str) and screenshot_file:
+        if annotation_path:
+            png_path = Path(annotation_path).resolve().parent / screenshot_file
+        else:
+            png_path = _data_dir() / "annotations" / screenshot_file
+        if png_path.is_file():
+            lines.append("@image:%s" % str(png_path.resolve()))
+
+    lines.append("📎 browserlink annotation")
     lines.append("URL: %s" % (annotation.get("url", "") or ""))
     lines.append("Title: %s" % (annotation.get("title", "") or ""))
     lines.append("Label: %s" % (annotation.get("label", "") or ""))
@@ -100,10 +112,17 @@ def _message(annotation: Dict[str, Any]) -> str:
     strokes = annotation.get("strokes") or []
     stroke_count = len(strokes) if isinstance(strokes, list) else 0
     lines.append("%d stroke(s)" % stroke_count)
+
+    # Always append @file last when the annotation JSON exists.
+    if annotation_path:
+        json_path = Path(annotation_path)
+        if json_path.is_file():
+            lines.append("@file:%s" % str(json_path.resolve()))
+
     return "\n".join(lines)
 
 
-def register(annotation: Dict[str, Any]) -> None:
+def register(annotation: Dict[str, Any], annotation_path: Optional[str] = None) -> None:
     api_url = os.environ.get("HERMES_API_URL")
     api_key = os.environ.get("HERMES_API_KEY")
     if not (api_url and api_key):
@@ -115,7 +134,7 @@ def register(annotation: Dict[str, Any]) -> None:
         )
         return
     endpoint = api_url.rstrip("/") + "/api/sessions/%s/chat" % session_id
-    body = json.dumps({"message": _message(annotation)}).encode("utf-8")
+    body = json.dumps({"message": _message(annotation, annotation_path)}).encode("utf-8")
     request = Request(endpoint, data=body, method="POST", headers={
         "Authorization": "Bearer " + api_key,
         "Content-Type": "application/json",

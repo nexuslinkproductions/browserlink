@@ -2,6 +2,15 @@
 
 **Annotate in your browser. Deliver to any AI harness.**
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-v1.4.0-4a9eff.svg)](CHANGELOG.md)
+[![CI](https://github.com/nexuslinkproductions/browserlink/actions/workflows/ci.yml/badge.svg)](https://github.com/nexuslinkproductions/browserlink/actions)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-35c759.svg)](server/hub.py)
+[![MCP](https://img.shields.io/badge/MCP-server-ffd166.svg)](docs/mcp.md)
+[![Chromium](https://img.shields.io/badge/Chromium-MV3-ff5252.svg)](extension/manifest.json)
+
+![browserlink social preview](docs/social-preview.png)
+
 browserlink is a harness-agnostic annotation link between your browser and
 your AI coding tools. Draw on a page, pick elements DevTools-style, type your
 instructions, then send the whole annotated context straight to the harness
@@ -91,6 +100,18 @@ See [MCP tools](docs/mcp.md) for Claude Code and Hermes setup examples.
 - **Element inspector with inline editing** - select an element in Element
   mode to see its current computed styles, type desired values inline, and
   ship them as structured `elements[].edits` in the annotation payload.
+- **Interactive inspector** - sliders, font dropdown (local fonts), color
+  pickers and selects that apply changes LIVE to the element; per-row Reset
+  and Reset All; hovering a property row highlights what it affects on the
+  page.
+- **Multi-select** - Shift+click to select several elements at once; each
+  keeps its own instruction and edits; Send ships them all in one payload.
+- **Element-crop screenshots** - sending captures the visible tab and crops
+  it to the selected elements, so the chat receives a screenshot of exactly
+  what you annotated (plus the annotation file as an attachment).
+- **Micro-animations** - hover/press feedback, sliding mode pill, staggered
+  inspector rows, lerped hover highlight, pulsing selection ring, send
+  success/error feedback; respects `prefers-reduced-motion`.
 - **Harness-neutral** - MCP server (works with every major harness), REST API,
   and pluggable adapters (Hermes chat injection, generic webhooks).
 - **Your sessions stay yours** - the extension never touches page DOM beyond a

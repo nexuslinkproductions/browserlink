@@ -99,6 +99,7 @@
     capturedPointerId: null, // active canvas pointer capture (released on exit)
     collapsed: false,    // toolbar minimized to the 48px chip
     position: null,      // {x, y} top-left of toolbar/chip (viewport px)
+    activeIndex: -1,     // index in elements currently bound to the inspector
   };
 
   // Element inspector: {el, descriptor} — descriptor is the object that
@@ -141,7 +142,26 @@
   let inspCountEl = null;
   let inspInput = null;
   let inspSend = null;
+  let inspSelectionCountEl = null;
+  let inspSelectionList = null;
+  let modeToggle = null;
+  let modePill = null;
+  let toastEl = null;
+  let toastTimer = 0;
   const rafPending = { v: false };
+
+  // Motion is deliberately centralized so reduced-motion also disables the
+  // JavaScript loops (not only the CSS transitions in overlay.css).
+  let reducedMotion = false;
+  let motionMedia = null;
+  let collapseTimer = 0;
+  let exitTimer = 0;
+  let hoverTargetRect = null;
+  let hoverVisualRect = null;
+  let hoverLerpRaf = 0;
+  let selectionPulseRaf = 0;
+  let selectionPulseStarted = 0;
+  let lastSelectionCount = -1;
 
   /* ---------------- drag + per-tab persistence ---------------- */
   let drag = null;             // {target, pointerId, startX, startY, baseX, baseY, moved}
@@ -176,12 +196,15 @@
   }
 
   function pingTabId() {
-    try {
-      chrome.runtime.sendMessage({ type: 'browserlinkGetTabId' }, (resp) => {
-        if (chrome.runtime.lastError) return; // background does not answer
-        if (resp && resp.ok && resp.tabId) rememberTabId(resp.tabId);
-      });
-    } catch (_) { /* no background */ }
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'browserlinkGetTabId' }, (resp) => {
+          if (chrome.runtime.lastError) { resolve(); return; }
+          if (resp && resp.ok && resp.tabId) rememberTabId(resp.tabId);
+          resolve();
+        });
+      } catch (_) { resolve(); }
+    });
   }
 
   /* ---------------- toolbar position / collapse ---------------- */
@@ -226,11 +249,51 @@
   }
 
   function setCollapsed(on) {
-    if (on === state.collapsed) return;
+    if (on === state.collapsed && !collapseTimer) return;
+    if (collapseTimer) {
+      clearTimeout(collapseTimer);
+      collapseTimer = 0;
+    }
     state.collapsed = on;
-    toolbar.style.display = on ? 'none' : '';
-    if (chipEl) chipEl.style.display = on ? '' : 'none';
-    if (on) closeInspector();
+    if (on) {
+      closeInspector();
+      if (isReducedMotion()) {
+        toolbar.style.display = 'none';
+        if (chipEl) chipEl.style.display = '';
+      } else {
+        toolbar.classList.add('is-collapsing');
+        toolbar.style.pointerEvents = 'none';
+        if (chipEl) {
+          chipEl.style.display = '';
+          chipEl.classList.remove('is-chip-enter');
+          void chipEl.offsetWidth;
+          chipEl.classList.add('is-chip-enter');
+        }
+        collapseTimer = setTimeout(() => {
+          toolbar.style.display = 'none';
+          toolbar.style.pointerEvents = '';
+          toolbar.classList.remove('is-collapsing');
+          if (chipEl) chipEl.classList.remove('is-chip-enter');
+          collapseTimer = 0;
+          if (state.position) applyPosition(state.position.x, state.position.y);
+        }, 200);
+      }
+    } else {
+      if (isReducedMotion()) {
+        toolbar.style.display = '';
+        if (chipEl) chipEl.style.display = 'none';
+      } else {
+        toolbar.style.display = '';
+        toolbar.classList.remove('is-restoring');
+        void toolbar.offsetWidth;
+        toolbar.classList.add('is-restoring');
+        if (chipEl) chipEl.style.display = 'none';
+        collapseTimer = setTimeout(() => {
+          toolbar.classList.remove('is-restoring');
+          collapseTimer = 0;
+        }, 200);
+      }
+    }
     if (state.position) applyPosition(state.position.x, state.position.y);
     else { const d = defaultPosition(); applyPosition(d.x, d.y); }
     saveTabState({ collapsed: on });
@@ -263,10 +326,91 @@
     statusEl.className = 'status' + (cls ? ' ' + cls : '');
   }
 
+  function updateMotionPreference() {
+    let next = false;
+    try {
+      motionMedia = window.matchMedia('(prefers-reduced-motion: reduce)');
+      next = !!(motionMedia && motionMedia.matches);
+      if (motionMedia && typeof motionMedia.addEventListener === 'function' && !motionMedia.__blBound) {
+        motionMedia.__blBound = true;
+        motionMedia.addEventListener('change', (e) => {
+          reducedMotion = !!(e && e.matches);
+          if (reducedMotion) {
+            stopHoverLoop();
+            stopSelectionPulse();
+            cancelHoverLerp();
+          } else if (state.elementMode) {
+            startHoverLoop();
+            updateSelectionPulse();
+          }
+        });
+      }
+    } catch (_) { /* matchMedia unavailable */ }
+    reducedMotion = next;
+    return reducedMotion;
+  }
+
+  function isReducedMotion() {
+    return reducedMotion;
+  }
+
+  // Restart a transform/opacity-only CSS effect without forcing layout
+  // changes. Reduced motion intentionally skips the class entirely.
+  function playMotion(el, className, duration) {
+    if (!el) return;
+    el.classList.remove(className);
+    if (isReducedMotion()) return;
+    void el.offsetWidth;
+    el.classList.add(className);
+    if (duration) {
+      setTimeout(() => el.classList.remove(className), duration + 40);
+    }
+  }
+
+  function showToast(text) {
+    if (!toastEl) return;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastEl.textContent = text || 'Sent';
+    toastEl.hidden = false;
+    toastEl.classList.remove('visible', 'leaving');
+    if (isReducedMotion()) {
+      toastEl.classList.add('visible');
+    } else {
+      void toastEl.offsetWidth;
+      toastEl.classList.add('visible');
+    }
+    toastTimer = setTimeout(() => {
+      toastEl.classList.remove('visible');
+      if (!isReducedMotion()) toastEl.classList.add('leaving');
+      setTimeout(() => {
+        if (!toastEl) return;
+        toastEl.hidden = true;
+        toastEl.classList.remove('leaving');
+      }, isReducedMotion() ? 0 : 150);
+      toastTimer = 0;
+    }, 1800);
+  }
+
+  function sendFeedback(button, ok) {
+    const buttons = button
+      ? [button]
+      : (toolbar && toolbar.querySelectorAll ? Array.from(toolbar.querySelectorAll('.comet-send')) : []);
+    for (const b of buttons) {
+      playMotion(b, ok ? 'send-success' : 'send-error', ok ? 400 : 300);
+      if (ok) {
+        const old = b.textContent;
+        b.textContent = '✓';
+        setTimeout(() => { if (b) b.textContent = old || 'Send'; }, isReducedMotion() ? 0 : 400);
+      }
+    }
+    if (ok) showToast('Sent');
+  }
+
   function updateCount() {
     if (!countEl) return;
     const n = state.elements.length;
     countEl.textContent = n === 1 ? '1 element' : n + ' elements';
+    updateSelectionUI();
   }
 
   /* ---------------- canvas ---------------- */
@@ -313,9 +457,61 @@
       ctx.stroke();
     }
     // Element selections are rendered as DOM outlines in the shadow root
-    // (positioned from getBoundingClientRect) — not on this canvas.
+    // (positioned from getBoundingClientRect). The soft selection pulse is
+    // the one selection effect drawn on this canvas.
+    drawSelectionPulse();
     // v1.2: property-affect hint overlays the strokes while a row is active.
     drawPropertyHint();
+  }
+
+  function nowMs() {
+    try {
+      if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+        return performance.now();
+      }
+    } catch (_) { /* fall back */ }
+    return Date.now();
+  }
+
+  function drawSelectionPulse() {
+    if (!ctx || isReducedMotion() || !state.elementMode || !state.elements.length) return;
+    const elapsed = Math.max(0, nowMs() - selectionPulseStarted);
+    const alpha = 0.4 + 0.4 * (0.5 + 0.5 * Math.sin((elapsed / 2000) * Math.PI * 2));
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255, 82, 82, ' + alpha.toFixed(3) + ')';
+    ctx.lineWidth = 3;
+    for (const en of state.elements) {
+      let r = null;
+      try { r = en.el.getBoundingClientRect(); } catch (_) { r = null; }
+      if (!r || r.width < 1 || r.height < 1) continue;
+      ctx.strokeRect(r.left - 3, r.top - 3, r.width + 6, r.height + 6);
+    }
+    ctx.restore();
+  }
+
+  function stopSelectionPulse() {
+    if (selectionPulseRaf) {
+      cancelAnimationFrame(selectionPulseRaf);
+      selectionPulseRaf = 0;
+    }
+  }
+
+  function startSelectionPulse() {
+    if (isReducedMotion() || !state.elementMode || !state.elements.length || selectionPulseRaf) return;
+    selectionPulseStarted = nowMs();
+    const tick = () => {
+      selectionPulseRaf = 0;
+      if (isReducedMotion() || !state.elementMode || !state.elements.length) return;
+      redraw();
+      selectionPulseRaf = requestAnimationFrame(tick);
+    };
+    selectionPulseRaf = requestAnimationFrame(tick);
+  }
+
+  function updateSelectionPulse() {
+    if (state.elementMode && state.elements.length && !isReducedMotion()) startSelectionPulse();
+    else stopSelectionPulse();
+    redraw();
   }
 
   /* ---------------- drawing (Annotate mode, v2, untouched) ---------------- */
@@ -462,15 +658,88 @@
     o.style.height = r.height + 'px';
   }
 
+  function rectBox(r) {
+    if (!r || r.width < 1 || r.height < 1) return null;
+    return { left: r.left, top: r.top, width: r.width, height: r.height };
+  }
+
+  function applyHoverBox(box) {
+    if (!hlEl || !box) return;
+    hlEl.style.display = '';
+    hlEl.style.left = box.left + 'px';
+    hlEl.style.top = box.top + 'px';
+    hlEl.style.width = box.width + 'px';
+    hlEl.style.height = box.height + 'px';
+  }
+
+  function cancelHoverLerp() {
+    if (hoverLerpRaf) {
+      cancelAnimationFrame(hoverLerpRaf);
+      hoverLerpRaf = 0;
+    }
+  }
+
+  function lerp(a, b, t) {
+    return a + (b - a) * t;
+  }
+
+  // The highlight is an overlay, so its visual box can ease without causing
+  // page layout. This is the one rAF-driven DOM effect requested by the spec.
+  function startHoverLerp() {
+    if (isReducedMotion() || hoverLerpRaf || !hoverTargetRect) return;
+    const from = hoverVisualRect || hoverTargetRect;
+    const started = nowMs();
+    const tick = () => {
+      hoverLerpRaf = 0;
+      if (isReducedMotion() || !state.elementMode || !hoverTargetRect) return;
+      const t = clamp01((nowMs() - started) / 100);
+      const eased = 1 - Math.pow(1 - t, 3); // ease-out
+      hoverVisualRect = {
+        left: lerp(from.left, hoverTargetRect.left, eased),
+        top: lerp(from.top, hoverTargetRect.top, eased),
+        width: lerp(from.width, hoverTargetRect.width, eased),
+        height: lerp(from.height, hoverTargetRect.height, eased),
+      };
+      applyHoverBox(hoverVisualRect);
+      if (t < 1) hoverLerpRaf = requestAnimationFrame(tick);
+      else if (hoverVisualRect !== hoverTargetRect) {
+        hoverVisualRect = Object.assign({}, hoverTargetRect);
+      }
+    };
+    hoverLerpRaf = requestAnimationFrame(tick);
+  }
+
   function positionHover() {
     if (!hlEl) return;
     if (!state.elementMode || !hoveredEl) {
+      cancelHoverLerp();
+      hoverTargetRect = null;
+      hoverVisualRect = null;
       hlEl.style.display = 'none';
       return;
     }
     let r = null;
     try { r = hoveredEl.getBoundingClientRect(); } catch (_) { r = null; }
-    placeRect(hlEl, r);
+    const target = rectBox(r);
+    if (!target) {
+      cancelHoverLerp();
+      hoverTargetRect = null;
+      hoverVisualRect = null;
+      hlEl.style.display = 'none';
+      return;
+    }
+    hoverTargetRect = target;
+    if (isReducedMotion()) {
+      cancelHoverLerp();
+      hoverVisualRect = Object.assign({}, target);
+      applyHoverBox(hoverVisualRect);
+    } else {
+      if (!hoverVisualRect) {
+        hoverVisualRect = Object.assign({}, target);
+        applyHoverBox(hoverVisualRect);
+      }
+      startHoverLerp();
+    }
     if (hlEl.style.display !== 'none') hlChip.textContent = chipFromEl(hoveredEl);
   }
 
@@ -503,6 +772,17 @@
       stopHoverLoop();
       return;
     }
+    if (isReducedMotion()) {
+      if (mouseDirty && mouse) {
+        mouseDirty = false;
+        let hit = null;
+        try { hit = document.elementFromPoint(mouse.x, mouse.y); } catch (_) { hit = null; }
+        hoveredEl = resolveMeaningful(hit);
+      }
+      positionHover();
+      positionSelections();
+      return;
+    }
     if (mouseDirty && mouse) {
       mouseDirty = false;
       let hit = null;
@@ -516,6 +796,10 @@
 
   function startHoverLoop() {
     if (hoverLoopRaf) return;
+    if (isReducedMotion()) {
+      hoverTick();
+      return;
+    }
     hoverLoopRaf = requestAnimationFrame(hoverTick);
   }
 
@@ -524,6 +808,9 @@
       cancelAnimationFrame(hoverLoopRaf);
       hoverLoopRaf = 0;
     }
+    cancelHoverLerp();
+    hoverTargetRect = null;
+    hoverVisualRect = null;
     if (hlEl) hlEl.style.display = 'none';
   }
 
@@ -536,7 +823,115 @@
     b.textContent = String(index);
     o.appendChild(b);
     selLayer.appendChild(o);
+    playMotion(b, 'marker-pop', 150);
     return o;
+  }
+
+  function selectionLabel(en) {
+    const d = en && en.descriptor ? en.descriptor : {};
+    let target = d.tag || 'element';
+    if (d.id) target += '#' + d.id;
+    let text = String(d.text || '').replace(/\s+/g, ' ').trim();
+    if (text.length > 42) text = text.slice(0, 42) + '…';
+    return 'E' + String(d.index || '') + ': ' + target + (text ? " '" + text + "'" : '');
+  }
+
+  function updateSelectionUI() {
+    if (!inspSelectionList || !inspSelectionCountEl) return;
+    const n = state.elements.length;
+    inspSelectionCountEl.textContent = n + ' selected';
+    if (lastSelectionCount !== -1 && lastSelectionCount !== n) {
+      playMotion(inspSelectionCountEl, 'selection-pop', 150);
+    }
+    lastSelectionCount = n;
+    inspSelectionList.innerHTML = '';
+    state.elements.forEach((en, i) => {
+      const row = document.createElement('div');
+      row.className = 'comet-selection-row' + (i === state.activeIndex ? ' active' : '');
+      row.dataset.selectionIndex = String(i);
+      row.style.setProperty('--row-delay', Math.min(i * 30, 200) + 'ms');
+      const main = document.createElement('button');
+      main.type = 'button';
+      main.className = 'comet-selection-main';
+      main.dataset.selectionAction = 'activate';
+      main.textContent = selectionLabel(en);
+      main.title = 'Edit ' + selectionLabel(en);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'comet-selection-remove';
+      remove.dataset.selectionAction = 'remove';
+      remove.textContent = '×';
+      remove.title = 'Remove ' + selectionLabel(en);
+      row.appendChild(main);
+      row.appendChild(remove);
+      inspSelectionList.appendChild(row);
+    });
+  }
+
+  function removeOutlineWithFade(outline) {
+    if (!outline || !outline.parentNode) return;
+    if (isReducedMotion()) {
+      outline.parentNode.removeChild(outline);
+      return;
+    }
+    outline.classList.add('is-removing');
+    setTimeout(() => {
+      if (outline && outline.parentNode) outline.parentNode.removeChild(outline);
+    }, 120);
+  }
+
+  function activateSelection(index) {
+    if (index < 0 || index >= state.elements.length) return;
+    state.activeIndex = index;
+    const en = state.elements[index];
+    openChat(en.descriptor, en.el, true, index);
+    updateSelectionUI();
+  }
+
+  function removeSelectionAt(index) {
+    if (index < 0 || index >= state.elements.length) return;
+    const removed = state.elements[index];
+    const wasActive = state.activeIndex === index || inspector.descriptor === removed.descriptor;
+    if (pending && pending.el === removed.el) pending = null;
+    state.elements.splice(index, 1);
+    removeOutlineWithFade(removed.outlineEl);
+    if (!state.elements.length) {
+      state.activeIndex = -1;
+      if (chatCard) chatCard.hidden = true;
+      closeInspector();
+    } else if (wasActive) {
+      state.activeIndex = Math.min(index, state.elements.length - 1);
+      activateSelection(state.activeIndex);
+    } else if (state.activeIndex > index) {
+      state.activeIndex -= 1;
+    }
+    updateCount();
+    updateSelectionPulse();
+  }
+
+  function clearCommittedSelections() {
+    const old = state.elements.slice();
+    state.elements = [];
+    state.activeIndex = -1;
+    old.forEach((en) => removeOutlineWithFade(en.outlineEl));
+    if (pending && !pending.isEdit) {
+      removeOutlineWithFade(pending.outlineEl);
+      pending = null;
+    }
+    if (chatCard) chatCard.hidden = true;
+    closeInspector();
+    updateCount();
+    updateSelectionPulse();
+  }
+
+  function selectOnly(index) {
+    if (index < 0 || index >= state.elements.length) return;
+    const keep = state.elements[index];
+    state.elements.forEach((en, i) => { if (i !== index) removeOutlineWithFade(en.outlineEl); });
+    state.elements = [keep];
+    state.activeIndex = 0;
+    updateCount();
+    updateSelectionPulse();
   }
 
   // Open the instruction card for a clicked element. New selection -> fresh
@@ -551,8 +946,10 @@
     let outlineEl;
     if (isEdit) {
       outlineEl = state.elements[editIndex].outlineEl;
+      state.activeIndex = editIndex;
     } else {
       outlineEl = createOutline(descriptor.index);
+      state.activeIndex = -1;
     }
     pending = { descriptor, el, isEdit, editIndex, outlineEl };
     chatHead.textContent = chipFromEl(el) + (isEdit ? ' — edit instruction' : '');
@@ -560,18 +957,21 @@
     chatCard.hidden = false;
     chatInput.focus();
     positionSelections();
-    // v1.1: inspector below the toolbar, bound to the committed descriptor
-    // (edit mode re-click keeps the stored entry so edits accumulate).
+    // v1.1: inspector is bound to the committed descriptor, so edits remain
+    // per element when a different selection becomes active.
     const inspDesc = isEdit ? state.elements[editIndex].descriptor : descriptor;
     openInspector(el, inspDesc);
     if (inspInput) inspInput.value = inspDesc.instruction || '';
+    updateSelectionUI();
   }
 
   function addChat() {
     if (!pending) return;
     const instr = chatInput.value.trim().slice(0, MAX_INSTR);
+    let committedIndex = pending.editIndex;
     if (pending.isEdit) {
       state.elements[pending.editIndex].descriptor.instruction = instr;
+      state.activeIndex = pending.editIndex;
     } else {
       pending.descriptor.instruction = instr;
       state.elements.push({
@@ -579,12 +979,15 @@
         el: pending.el,
         outlineEl: pending.outlineEl,
       });
+      committedIndex = state.elements.length - 1;
+      state.activeIndex = committedIndex;
     }
     pending = null;
     chatInput.value = '';
-    if (inspInput) inspInput.value = '';
+    if (inspInput) inspInput.value = state.elements[committedIndex].descriptor.instruction || '';
     chatInput.focus(); // stays open for the next element
     updateCount();
+    updateSelectionPulse();
   }
 
   function cancelChat() {
@@ -602,6 +1005,7 @@
     if (!state.elementMode) return;
     mouse = { x: e.clientX, y: e.clientY };
     mouseDirty = true;
+    if (isReducedMotion()) hoverTick();
   }
 
   function onPageClick(e) {
@@ -616,16 +1020,52 @@
     if (!el) return;
     const d = describeElement(el);
     const existingIdx = state.elements.findIndex((en) => en.descriptor.cssPath === d.cssPath);
+
+    // Shift+click is the additive toggle. Additions commit immediately so a
+    // second shift-click can toggle them out without a chat-card round trip.
+    if (e.shiftKey) {
+      if (existingIdx !== -1) {
+        removeSelectionAt(existingIdx);
+        return;
+      }
+      if (pending && !pending.isEdit) cancelChat();
+      d.index = state.nextIndex++;
+      const outlineEl = createOutline(d.index);
+      state.elements.push({ descriptor: d, el, outlineEl });
+      state.activeIndex = state.elements.length - 1;
+      updateCount();
+      updateSelectionPulse();
+      openChat(d, el, true, state.activeIndex);
+      return;
+    }
+
+    // Plain click always makes this the single active element. Clicking a
+    // selected element keeps its descriptor and enters edit mode.
     if (existingIdx !== -1) {
-      openChat(d, el, true, existingIdx); // edit mode, pre-filled
+      if (state.elements.length > 1) selectOnly(existingIdx);
+      const idx = state.elements.findIndex((en) => en.descriptor.cssPath === d.cssPath);
+      openChat(d, el, true, idx);
       return;
     }
     if (pending && pending.descriptor.cssPath === d.cssPath) {
       chatInput.focus(); // same pending element -> just refocus
       return;
     }
+    if (state.elements.length) clearCommittedSelections();
     d.index = state.nextIndex++;
     openChat(d, el, false, -1);
+  }
+
+  function onSelectionListClick(e) {
+    const target = e.target && e.target.closest ? e.target.closest('[data-selection-action]') : null;
+    if (!target || !inspSelectionList.contains(target)) return;
+    const row = target.closest('.comet-selection-row');
+    const index = row ? parseInt(row.dataset.selectionIndex, 10) : -1;
+    if (!Number.isFinite(index)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (target.dataset.selectionAction === 'remove') removeSelectionAt(index);
+    else activateSelection(index);
   }
 
   function onKeyDown(e) {
@@ -1062,11 +1502,12 @@
     clearPropertyHint();
     inspRows.innerHTML = '';
     const edits = currentEdits();
-    for (const p of inspectorProps(el)) {
+    inspectorProps(el).forEach((p, i) => {
       const row = document.createElement('div');
       row.className = 'comet-insp-row';
       row.dataset.prop = p.prop;
       row.tabIndex = -1;
+      row.style.setProperty('--row-delay', Math.min(i * 30, 200) + 'ms');
 
       const lab = document.createElement('span');
       lab.className = 'comet-insp-label';
@@ -1091,8 +1532,9 @@
       row.appendChild(control);
       row.appendChild(rst);
       inspRows.appendChild(row);
-    }
+    });
     updateInspectorState();
+    updateSelectionUI();
   }
 
   // Accent-marks edited rows and refreshes the "N edits" footer count.
@@ -1103,7 +1545,9 @@
     inspRows.querySelectorAll('.comet-insp-row').forEach((row) => {
       const v = edits[row.dataset.prop];
       const nonEmpty = v !== undefined && v !== null && String(v).trim() !== '';
+      const wasEdited = row.classList.contains('edited');
       row.classList.toggle('edited', nonEmpty);
+      if (nonEmpty && !wasEdited) playMotion(row, 'edited-pulse', 400);
       if (nonEmpty) n++;
     });
     inspCountEl.textContent = n === 1 ? '1 edit' : n + ' edits';
@@ -1113,10 +1557,18 @@
     clearPropertyHint();
     inspector.el = el;
     inspector.descriptor = descriptor;
+    const selectedIndex = state.elements.findIndex((en) => en.descriptor === descriptor);
+    if (selectedIndex !== -1) state.activeIndex = selectedIndex;
     captureOriginals(el);
     renderInspector();
     inspPanel.hidden = false;
+    inspPanel.classList.remove('is-open');
+    if (!isReducedMotion()) {
+      void inspPanel.offsetWidth;
+      inspPanel.classList.add('is-open');
+    }
     positionInspector();
+    updateSelectionUI();
   }
 
   function closeInspector() {
@@ -1124,7 +1576,10 @@
     inspector.el = null;
     inspector.descriptor = null;
     inspectorOriginals = new Map();
-    if (inspPanel) inspPanel.hidden = true;
+    if (inspPanel) {
+      inspPanel.classList.remove('is-open');
+      inspPanel.hidden = true;
+    }
   }
 
   function valueFromControl(control, prop) {
@@ -1148,7 +1603,10 @@
     const v = valueFromControl(control, prop);
     if (control.type === 'range') {
       const valEl = row.querySelector('.comet-insp-val');
-      if (valEl) valEl.textContent = v;
+      if (valEl) {
+        valEl.textContent = v;
+        playMotion(valEl, 'value-tick', 100);
+      }
     }
     applyLive(prop, v);
     recordEdit(prop, v);
@@ -1164,6 +1622,7 @@
     const prop = row.dataset.prop;
     restoreProp(prop);
     syncRowControl(row, prop);
+    playMotion(row, 'reset-flash', 200);
     updateInspectorState();
     if (hintProp === prop) scheduleRedraw();
   }
@@ -1174,6 +1633,7 @@
     for (const prop of props) restoreProp(prop);
     inspRows.querySelectorAll('.comet-insp-row').forEach((row) => {
       syncRowControl(row, row.dataset.prop);
+      playMotion(row, 'reset-flash', 200);
     });
     updateInspectorState();
     if (hintProp) scheduleRedraw();
@@ -1359,8 +1819,10 @@
   // Footer instruction textarea: same instruction field as the chat card.
   function onInspectorInstr(e) {
     if (!inspector.descriptor) return;
-    inspector.descriptor.instruction = e.target.value;
-    if (chatInput) chatInput.value = e.target.value;
+    const value = String(e.target.value || '').slice(0, MAX_INSTR);
+    inspector.descriptor.instruction = value;
+    e.target.value = value;
+    if (chatInput) chatInput.value = value;
   }
 
   /* ---------------- toolbar ---------------- */
@@ -1369,6 +1831,8 @@
     canvas.classList.toggle('active', state.annotateOn || state.elementMode);
     toolbar.querySelector('[data-act="annotate"]').classList.toggle('active', state.annotateOn);
     toolbar.querySelector('[data-act="element"]').classList.toggle('active', state.elementMode);
+    if (modePill) modePill.style.transform = state.elementMode ? 'translateX(100%)' : 'translateX(0)';
+    updateSelectionPulse();
   }
 
   function setAnnotate(on) {
@@ -1398,6 +1862,7 @@
       startHoverLoop();
     }
     applyMode();
+    updateSelectionPulse();
   }
 
   function toggleAnnotate() {
@@ -1423,17 +1888,79 @@
 
   function clearAll() {
     state.strokes = [];
+    const old = state.elements.slice();
     state.elements = [];
+    state.activeIndex = -1;
     state.nextIndex = 1;
-    while (selLayer.firstChild) selLayer.removeChild(selLayer.firstChild); // all markers
+    old.forEach((en) => removeOutlineWithFade(en.outlineEl));
+    if (pending && !pending.isEdit) removeOutlineWithFade(pending.outlineEl);
     pending = null;
     if (chatCard) chatCard.hidden = true;
     closeInspector();
     updateCount();
+    updateSelectionPulse();
     redraw();
   }
 
-  async function send() {
+  // Return the visible union in CSS pixels. The service worker applies dpr
+  // when it crops the captured bitmap, so this function never scales x/y/w/h.
+  function computeCaptureRect(entries) {
+    const selected = Array.isArray(entries) ? entries : [];
+    if (!selected.length) return null;
+    let left = Infinity;
+    let top = Infinity;
+    let right = -Infinity;
+    let bottom = -Infinity;
+    for (const en of selected) {
+      let r = null;
+      try { r = en && en.el && en.el.getBoundingClientRect(); } catch (_) { r = null; }
+      if (!r) continue;
+      const l = Number(r.left);
+      const t = Number(r.top);
+      const rr = Number(r.right != null ? r.right : r.left + r.width);
+      const b = Number(r.bottom != null ? r.bottom : r.top + r.height);
+      if (![l, t, rr, b].every(Number.isFinite) || rr <= l || b <= t) continue;
+      left = Math.min(left, l);
+      top = Math.min(top, t);
+      right = Math.max(right, rr);
+      bottom = Math.max(bottom, b);
+    }
+    const vw = Math.max(0, Number(window.innerWidth) || 0);
+    const vh = Math.max(0, Number(window.innerHeight) || 0);
+    if (![left, top, right, bottom].every(Number.isFinite) || !vw || !vh) return null;
+    const x = Math.max(0, Math.min(vw, left - 8));
+    const y = Math.max(0, Math.min(vh, top - 8));
+    const maxX = Math.max(x, Math.min(vw, right + 8));
+    const maxY = Math.max(y, Math.min(vh, bottom + 8));
+    const round = (n) => Math.round(n * 1000) / 1000;
+    return {
+      x: round(x),
+      y: round(y),
+      w: round(Math.max(0, maxX - x)),
+      h: round(Math.max(0, maxY - y)),
+      dpr: Number(window.devicePixelRatio) > 0 ? Number(window.devicePixelRatio) : 1,
+    };
+  }
+
+  function descriptorForPayload(en) {
+    const d = Object.assign({}, en.descriptor);
+    d.instruction = String(d.instruction || '').trim().slice(0, MAX_INSTR);
+    if (d.edits) {
+      const edits = {};
+      for (const k of Object.keys(d.edits)) {
+        const v = d.edits[k];
+        if (v !== undefined && v !== null && String(v).trim() !== '') {
+          edits[k] = String(v).trim();
+        }
+      }
+      if (Object.keys(edits).length) d.edits = edits;
+      else delete d.edits;
+    }
+    return d;
+  }
+
+  async function send(button) {
+    if (button) playMotion(button, 'send-press', 100);
     let label = '';
     try {
       const got = await chrome.storage.local.get('contextLabel');
@@ -1446,23 +1973,11 @@
       viewport: { w: window.innerWidth, h: window.innerHeight },
       label: label.slice(0, MAX_TEXT),
       strokes: state.strokes.map((s) => ({ color: s.color, width: s.width, points: s.points })),
-      // v1.1: elements carry "edits" ({property: desiredValue}, non-empty only).
-      elements: state.elements.map((en) => {
-        const d = Object.assign({}, en.descriptor);
-        if (d.edits) {
-          const edits = {};
-          for (const k of Object.keys(d.edits)) {
-            const v = d.edits[k];
-            if (v !== undefined && v !== null && String(v).trim() !== '') {
-              edits[k] = String(v).trim();
-            }
-          }
-          if (Object.keys(edits).length) d.edits = edits;
-          else delete d.edits;
-        }
-        return d;
-      }),
+      // v1.4: every selected descriptor carries its own instruction + edits.
+      elements: state.elements.map(descriptorForPayload),
     };
+    const captureRect = computeCaptureRect(state.elements);
+    if (captureRect) payload.captureRect = captureRect;
     setStatus('sending…', '');
     let ok = false;
     try {
@@ -1471,17 +1986,22 @@
     } catch (_) { ok = false; }
     if (ok) {
       setStatus(BRIDGE_OK, 'ok');
-      state.strokes = [];   // clear strokes, elements and all markers on success
+      sendFeedback(button, true);
+      state.strokes = [];
+      const old = state.elements.slice();
       state.elements = [];
+      state.activeIndex = -1;
       state.nextIndex = 1;
-      while (selLayer.firstChild) selLayer.removeChild(selLayer.firstChild);
+      old.forEach((en) => removeOutlineWithFade(en.outlineEl));
       pending = null;
       if (chatCard) chatCard.hidden = true;
       closeInspector();
       updateCount();
+      updateSelectionPulse();
       redraw();
     } else {
       setStatus(BRIDGE_OFFLINE, 'err');
+      sendFeedback(button, false);
     }
   }
 
@@ -1494,7 +2014,7 @@
       case 'color': cycleColor(); break;
       case 'undo': undo(); break;
       case 'clear': clearAll(); break;
-      case 'send': send(); break;
+      case 'send': send(btn); break;
       case 'power': fullExit(); break;
       case 'exit': fullExit(); break;
       case 'collapse':
@@ -1565,11 +2085,62 @@
     setCollapsed(false); // click restores the full toolbar
   }
 
-  /* ---------------- activation / deactivation ---------------- */
-  // Full exit: remove the shadow host + overlay from the DOM, close the chat
-  // card and inspector, cancel pointer capture, leave the page 100% clean,
-  // and persist per-tab {enabled:false}.
+  function teardownHost() {
+    if (host && host.parentNode) {
+      try { host.parentNode.removeChild(host); } catch (_) { /* ok */ }
+    }
+    host = null;
+    shadow = null;
+    toolbar = null;
+    canvas = null;
+    ctx = null;
+    statusEl = null;
+    countEl = null;
+    selLayer = null;
+    hlEl = null;
+    hlChip = null;
+    chatCard = null;
+    chatHead = null;
+    chatInput = null;
+    chipEl = null;
+    dragHandle = null;
+    inspPanel = null;
+    inspRows = null;
+    inspCountEl = null;
+    inspSelectionCountEl = null;
+    inspSelectionList = null;
+    inspResetAllBtn = null;
+    inspInput = null;
+    inspSend = null;
+    modeToggle = null;
+    modePill = null;
+    toastEl = null;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = 0;
+    if (collapseTimer) clearTimeout(collapseTimer);
+    collapseTimer = 0;
+    exitTimer = 0;
+    inspectorOriginals = new Map();
+    hintProp = null;
+    stopHintLoop();
+    stopSelectionPulse();
+    cancelHoverLerp();
+    state.strokes = [];
+    state.elements = [];
+    state.activeIndex = -1;
+    state.nextIndex = 1;
+    // UI state is gone with the DOM; rebuild from chrome.storage.session on
+    // reinject (setCollapsed early-returns when the value is unchanged, so
+    // the collapsed/position state must be reset here).
+    state.collapsed = false;
+    state.position = null;
+    window.__hermesAnnotateInjected = false;
+    window.__browserlinkInjected = false;
+  }
+
+  // Full exit: animate the host out, then remove it and all listeners.
   function fullExit() {
+    if (exitTimer) return;
     // Cancel any pending pointer capture (draw strokes + drag handles).
     if (state.capturedPointerId != null && canvas) {
       try {
@@ -1593,9 +2164,14 @@
     state.annotateOn = false;
     state.elementMode = false;
     state.currentStroke = null;
+    if (pending && !pending.isEdit) removeOutlineWithFade(pending.outlineEl);
     pending = null;
+    state.elements.forEach((en) => removeOutlineWithFade(en.outlineEl));
+    state.elements = [];
+    state.activeIndex = -1;
     closeInspector();
     stopHoverLoop();
+    stopSelectionPulse();
     mouse = null;
     mouseDirty = false;
     hoveredEl = null;
@@ -1607,53 +2183,29 @@
     document.removeEventListener('scroll', repositionAll, true);
     window.removeEventListener('resize', onWindowResize);
     window.removeEventListener('orientationchange', onWindowResize);
-
-    // Remove the shadow host from the DOM (removes toolbar, canvas, chat
-    // card, inspector, chip — every node we added).
-    if (host && host.parentNode) {
-      try { host.parentNode.removeChild(host); } catch (_) { /* ok */ }
-    }
-    host = null;
-    shadow = null;
-    toolbar = null;
-    canvas = null;
-    ctx = null;
-    statusEl = null;
-    countEl = null;
-    selLayer = null;
-    hlEl = null;
-    hlChip = null;
-    chatCard = null;
-    chatHead = null;
-    chatInput = null;
-    chipEl = null;
-    dragHandle = null;
-    inspPanel = null;
-    inspRows = null;
-    inspCountEl = null;
-    inspResetAllBtn = null;
-    inspInput = null;
-    inspSend = null;
-    inspectorOriginals = new Map();
-    hintProp = null;
-    stopHintLoop();
-    state.strokes = [];
-    state.elements = [];
-    state.nextIndex = 1;
-    // UI state is gone with the DOM; rebuild from chrome.storage.session on
-    // reinject (setCollapsed early-returns when the value is unchanged, so
-    // the collapsed/position state must be reset here).
-    state.collapsed = false;
-    state.position = null;
-    window.__hermesAnnotateInjected = false;
-    window.__browserlinkInjected = false;
     saveTabState({ enabled: false }); // deactivation persists per tab
+
+    if (host && host.parentNode && !isReducedMotion()) {
+      host.classList.add('is-exiting');
+      exitTimer = setTimeout(() => {
+        exitTimer = 0;
+        teardownHost();
+      }, 120);
+    } else {
+      teardownHost();
+    }
   }
 
   // Idempotent re-injection (popup master switch ON / browserlinkToggle true).
   function reinject() {
+    if (exitTimer) {
+      clearTimeout(exitTimer);
+      exitTimer = 0;
+      teardownHost();
+    }
     if (host && host.parentNode) return; // already active
     try {
+      updateMotionPreference();
       buildUI();
       bindEvents();
       injectShadowStyles();
@@ -1695,6 +2247,13 @@
       } catch (_) { /* ok */ }
       return false;
     }
+    if (msg.type === 'browserlinkGetState') {
+      // Popup asks whether the tool is currently active on this tab.
+      try {
+        sendResponse({ ok: true, enabled: !!(host && host.parentNode) });
+      } catch (_) { /* ok */ }
+      return false;
+    }
     if (msg.type === 'browserlinkToggle') {
       if (msg.enabled === true) reinject();
       else fullExit(); // off == exit
@@ -1708,6 +2267,21 @@
   }
 
   /* ---------------- UI construction ---------------- */
+  function animateEntrance() {
+    if (!host) return;
+    host.classList.add('is-entering');
+    if (isReducedMotion()) {
+      host.classList.add('is-entered');
+      return;
+    }
+    setTimeout(() => {
+      if (host) {
+        host.classList.remove('is-entering');
+        host.classList.add('is-entered');
+      }
+    }, 0);
+  }
+
   function buildUI() {
     host = document.createElement('div');
     host.id = 'hermes-annotate-host';
@@ -1724,8 +2298,11 @@
       '<button type="button" data-act="power" class="comet-btn comet-power" title="Deactivate Browserlink (removes everything from this page)">⏻</button>' +
       '<button type="button" data-act="collapse" class="comet-btn comet-collapse" title="Collapse to a floating chip">−</button>' +
       '<span class="comet-drag" data-act="drag" title="Drag to move">⋮⋮</span>' +
-      '<button type="button" data-act="annotate" class="comet-btn" title="Toggle drawing">Annotate</button>' +
-      '<button type="button" data-act="element" class="comet-btn" title="Element picker: hover to highlight, click to select + instruct">Element</button>' +
+      '<span class="comet-mode-toggle" role="group" aria-label="Mode">' +
+      '  <span class="comet-mode-pill" aria-hidden="true"></span>' +
+      '  <button type="button" data-act="annotate" class="comet-btn comet-mode-btn" title="Toggle drawing">Annotate</button>' +
+      '  <button type="button" data-act="element" class="comet-btn comet-mode-btn" title="Element picker: hover to highlight, click to select + instruct">Element</button>' +
+      '</span>' +
       '<button type="button" data-act="color" class="comet-swatch" title="Cycle color">' +
       '  <span class="dot" style="background:#ff5252"></span>' +
       '  <span class="dot" style="background:#4a9eff"></span>' +
@@ -1744,6 +2321,8 @@
       '<span class="status"></span>' +
       '<button type="button" data-act="exit" class="comet-btn comet-exit" title="Exit Browserlink (removes everything from this page)">✕</button>';
     dragHandle = toolbar.querySelector('.comet-drag');
+    modeToggle = toolbar.querySelector('.comet-mode-toggle');
+    modePill = toolbar.querySelector('.comet-mode-pill');
 
     // Collapsed 48px floating chip (same fixed position as the toolbar).
     chipEl = document.createElement('div');
@@ -1792,6 +2371,8 @@
     inspPanel.hidden = true;
     inspPanel.innerHTML =
       '<div class="comet-insp-head">Element inspector</div>' +
+      '<div class="comet-selection-head"><span class="comet-selection-count">0 selected</span></div>' +
+      '<div class="comet-selection-list"></div>' +
       '<div class="comet-insp-rows"></div>' +
       '<div class="comet-insp-foot">' +
       '  <div class="comet-insp-foot-meta">' +
@@ -1803,6 +2384,12 @@
       '  <button type="button" class="comet-btn comet-send comet-insp-send">Send</button>' +
       '</div>';
 
+    toastEl = document.createElement('div');
+    toastEl.className = 'comet-toast';
+    toastEl.setAttribute('role', 'status');
+    toastEl.hidden = true;
+    toastEl.textContent = 'Sent';
+
     shadow.appendChild(toolbar);
     shadow.appendChild(chipEl);
     shadow.appendChild(selLayer);
@@ -1810,6 +2397,7 @@
     shadow.appendChild(canvas);
     shadow.appendChild(chatCard);
     shadow.appendChild(inspPanel);
+    shadow.appendChild(toastEl);
     ctx = canvas.getContext('2d');
 
     // ONE shadow host on the page; nothing else touches the page DOM.
@@ -1821,10 +2409,13 @@
     chatInput = chatCard.querySelector('.comet-chat-input');
     inspRows = inspPanel.querySelector('.comet-insp-rows');
     inspCountEl = inspPanel.querySelector('.comet-insp-count');
+    inspSelectionCountEl = inspPanel.querySelector('.comet-selection-count');
+    inspSelectionList = inspPanel.querySelector('.comet-selection-list');
     inspResetAllBtn = inspPanel.querySelector('.comet-insp-reset-all');
     inspInput = inspPanel.querySelector('.comet-insp-instr');
     inspSend = inspPanel.querySelector('.comet-insp-send');
     toolbar.querySelector('.comet-swatch .dot').classList.add('active');
+    animateEntrance();
     updateCount();
     applyMode();
     resizeCanvas();
@@ -1978,8 +2569,9 @@
     inspRows.addEventListener('pointerout', onInspectorPointerLeave);
     inspRows.addEventListener('focusout', onInspectorFocusOut);
     if (inspResetAllBtn) inspResetAllBtn.addEventListener('click', onInspectorResetAll);
+    if (inspSelectionList) inspSelectionList.addEventListener('click', onSelectionListClick);
     inspInput.addEventListener('input', onInspectorInstr);
-    inspSend.addEventListener('click', send);
+    inspSend.addEventListener('click', () => send(inspSend));
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('click', onPageClick, true);
     window.addEventListener('keydown', onKeyDown, true);
@@ -1995,12 +2587,16 @@
   /* ---------------- init ---------------- */
   async function init() {
     try {
+      updateMotionPreference();
       // The message listener must survive exit so the popup can re-enable us.
       if (!messagesBound) {
         messagesBound = true;
         chrome.runtime.onMessage.addListener(onRuntimeMessage);
       }
-      pingTabId();
+      // Learn the real tab id BEFORE reading per-tab state: the storage key
+      // is browserlink:<tabId>, and fullExit saves under the real id. Without
+      // this, a refresh reads browserlink:unknown and reopens a closed tool.
+      await pingTabId();
       let saved = null;
       try {
         saved = await chrome.storage.session.get(tabStorageKey());
@@ -2041,6 +2637,17 @@
       get originals() { return inspectorOriginals; },
       getRows: () => inspRows,
       getCtx: () => ctx,
+    };
+    window.__BL_TEST_API__ = {
+      get state() { return state; },
+      get reducedMotion() { return reducedMotion; },
+      get activeElement() { return inspector.el; },
+      onPageClick,
+      setElementMode,
+      removeSelectionAt,
+      computeCaptureRect,
+      send,
+      updateMotionPreference,
     };
   }
 

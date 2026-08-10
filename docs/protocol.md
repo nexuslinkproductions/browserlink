@@ -1,7 +1,12 @@
-# browserlink protocol - annotation schema v1.1
+# browserlink protocol - annotation schema v1.4
 
 The public contract between the extension, the hub, and any harness. Versioned;
 changes require a new minor or major version and a compatibility shim.
+
+**Schema v1.4** (backward compatible with v1.0 through v1.3): adds an optional
+`screenshot` field (PNG data URL). The hub stores a sibling PNG and replaces
+the base64 blob with `screenshotFile` in the on-disk JSON. Payloads without
+`screenshot` remain valid.
 
 **Schema v1.1** (backward compatible with v1.0): adds an optional
 `elements[].edits` object carrying structured desired changes per element.
@@ -55,9 +60,36 @@ HTTP 400.
 | `label` | string | optional; user context label, ≤ 200 chars |
 | `strokes` | array | required; each: `color` string, `width` number > 0, `points` array of ≥ 2 `[x, y]` pairs, each coordinate in `[0, 1]` (normalized to the annotation viewport) |
 | `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below) |
+| `screenshot` | string | optional (schema v1.4); PNG data URL `data:image/png;base64,<data>`; max 10MB decoded; non-PNG or invalid base64 → HTTP 400 |
 
-The hub stores the payload verbatim and adds `ts` (epoch ms) and `savedAt`
-(ISO-8601 UTC).
+The hub stores the payload and may rewrite `screenshot` (see below). It may
+add `ts` (epoch ms) and `savedAt` (ISO-8601 UTC).
+
+### screenshot (schema v1.4)
+
+Optional PNG capture of the visible tab (or a cropped region) as a data URL.
+
+Wire format (POST body):
+
+- Must be a string starting with `data:image/png;base64,`
+- Decoded size must be ≤ 10MB; otherwise HTTP 400
+- Non-PNG data URLs (e.g. `data:image/jpeg;base64,...`) are rejected with HTTP 400
+
+On-disk format:
+
+- Hub decodes the PNG and writes `<timestamp>.png` next to the annotation JSON
+  using the same atomic temp+replace pattern
+- Stored JSON replaces `screenshot` with `"screenshotFile": "<timestamp>.png"`
+  (never stores megabytes of base64 in the JSON)
+- Payloads without `screenshot` are stored unchanged (backward compatible)
+
+Delivery (Hermes adapter):
+
+- When `screenshotFile` exists on disk, the delivery message prepends
+  `@image:<abs path to png>`
+- When the annotation JSON exists, the message appends
+  `@file:<abs path to annotation json>` as the last line
+- Both lines are omitted when the corresponding file is missing
 
 ### elements[].edits (schema v1.1)
 
@@ -177,8 +209,9 @@ Consumers map them back by multiplying with their own viewport dimensions.
 
 ## Versioning
 
-This is **schema v1.1**: backward compatible with v1.0 (the optional
-`elements[].edits` field is additive; v1.0 payloads validate unchanged).
+This is **schema v1.4**: backward compatible with v1.0 through v1.3. The
+optional `screenshot` / `screenshotFile` fields are additive; older payloads
+validate and store unchanged. Schema v1.1 added optional `elements[].edits`.
 Breaking changes (new required fields, coordinate semantics, endpoint
 removal) bump to v2 with a deprecation window: the hub accepts both versions
 for one minor release.

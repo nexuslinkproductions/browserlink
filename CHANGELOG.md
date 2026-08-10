@@ -4,6 +4,25 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [1.4.0] - 2026-08-10
+
+### Added
+
+- **Attachment delivery** - optional screenshot capture and file refs so
+  annotations land in Hermes chat as real attachments (`@image` / `@file`)
+- **Extension** - service worker captures the visible tab via
+  `chrome.tabs.captureVisibleTab` (PNG data URL) before POST; capture
+  failure never blocks the annotation
+- **Hub** - optional `screenshot` field (schema v1.4): must be
+  `data:image/png;base64,...`, max 10MB decoded; written as sibling
+  `<timestamp>.png` (atomic temp+replace); stored JSON carries
+  `screenshotFile` instead of base64; payloads without screenshot unchanged
+- **Hermes adapter** - prepends `@image:<abs png path>` when the PNG exists;
+  appends `@file:<abs annotation json path>` as the last line when the JSON
+  exists
+- **Docs** - protocol schema v1.4 documents the screenshot wire/on-disk/
+  delivery path; backward compatible with v1.0 through v1.3
+
 ## [1.2.0] - 2026-08-10
 
 ### Added
@@ -18,6 +37,29 @@ All notable changes to browserlink are documented here. Format follows
 - **Property hints** - hovering a row highlights what the property affects on
   the element (edge lines, text-area glow, margin/padding boxes, corner arcs,
   underlines)
+
+## [1.4.0] - 2026-08-10
+
+### Added
+
+- **Attachment delivery** - sending captures the visible tab; the hub stores
+  the screenshot as a PNG beside the annotation JSON and the Hermes adapter
+  delivers `@image:` and `@file:` refs, so annotations land in the chat as a
+  real attachment card (screenshot thumbnail + annotation file)
+- **Element-crop screenshots** - the capture is cropped to the union bounding
+  box of the selected elements (8px padding, viewport-clamped), so the
+  attachment shows exactly what was annotated
+- **Multi-select** - Shift+click toggles elements in/out of the selection;
+  each element keeps its own instruction and edits; Send ships all selected
+  elements in one payload
+- **Micro-animations** - hover/press feedback, sliding mode pill, collapse
+  bounce, staggered inspector rows, slider value ticks, edited-row glow,
+  lerped hover highlight, pulsing selection ring, send success/error feedback
+  and toast; all transform/opacity only and disabled under
+  `prefers-reduced-motion`
+- **Exit/re-invoke fix** - closing the tool persists per tab; a page refresh
+  no longer reopens it, and the popup switch reflects the real tab state and
+  re-launches the tool on demand
 
 ## [1.3.0] - 2026-08-10
 
