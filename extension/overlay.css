@@ -145,6 +145,11 @@
   font-size: 12px;
   color: #9aa0a6;
 }
+/* Collapse the status slot when empty so Send and the exit ✕ sit close
+ * together instead of leaving a dead 90px gap. */
+.status:empty {
+  min-width: 0;
+}
 .status.ok {
   color: #35c759;
 }

@@ -4,6 +4,17 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [1.6.1] - 2026-08-10
+
+### Fixed
+
+- **Toolbar gap** - the empty status slot no longer reserves 90px between
+  Send and the exit ✕; the buttons sit close together until a status message
+  appears
+- **Screenshot capture on any page** - host permission now covers all URLs,
+  so `captureVisibleTab` succeeds on any site (previously only the hub origin
+  was permitted and captures silently failed elsewhere)
+
 ## [2.0.0] - 2026-08-10
 
 ### Added
