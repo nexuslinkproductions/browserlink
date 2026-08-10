@@ -12,6 +12,15 @@ All notable changes to browserlink are documented here. Format follows
   only implementation; `server/`, `mcp/`, and Python tests were deleted; CI
   runs the Node suite only
 
+## [1.6.3] - 2026-08-10
+
+### Fixed
+
+- **Element picker blocks page navigation** - clicking a link or button in
+  Element mode no longer navigates; mousedown is suppressed DevTools-style
+  so the page cannot react to selection clicks
+
+## [1.6.2] - 2026-08-10
 ## [1.6.2] - 2026-08-10
 
 ### Fixed

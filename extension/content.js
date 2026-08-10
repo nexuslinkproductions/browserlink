@@ -1061,6 +1061,16 @@
     if (isReducedMotion()) hoverTick();
   }
 
+  // DevTools-style: suppress mousedown so SPA/custom buttons that navigate
+  // on mousedown (not click) cannot react while the picker is active.
+  // preventDefault on mousedown does NOT suppress the subsequent click event.
+  function onPageMouseDown(e) {
+    if (!state.elementMode) return;
+    if (e.composedPath().indexOf(host) !== -1) return; // interaction inside our UI
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
   function onPageClick(e) {
     if (!state.elementMode) return;
     if (e.composedPath().indexOf(host) !== -1) return; // click inside our UI
@@ -2741,6 +2751,7 @@
 
     // Unbind page-level listeners so nothing of ours remains active.
     window.removeEventListener('mousemove', onMouseMove);
+    window.removeEventListener('mousedown', onPageMouseDown, true);
     window.removeEventListener('click', onPageClick, true);
     window.removeEventListener('keydown', onKeyDown, true);
     document.removeEventListener('scroll', repositionAll, true);
@@ -3162,6 +3173,7 @@
     inspInput.addEventListener('input', onInspectorInstr);
     inspSend.addEventListener('click', () => send(inspSend));
     window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mousedown', onPageMouseDown, true);
     window.addEventListener('click', onPageClick, true);
     window.addEventListener('keydown', onKeyDown, true);
     document.addEventListener('scroll', repositionAll, true); // incl. inner scrollers
@@ -3250,6 +3262,7 @@
       get hoverBoxEl() { return hoverBoxEl; },
       get hlEl() { return hlEl; },
       onPageClick,
+      onPageMouseDown,
       onMouseMove,
       positionHover,
       setElementMode,
