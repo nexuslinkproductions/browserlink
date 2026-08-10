@@ -18,22 +18,7 @@ sessions, cookies, untouched. The TypeScript hub (`npx browserlink-hub`) is
 the implementation. Built for [Perplexity Comet](https://www.perplexity.ai/comet)
 first, works in any Chromium browser (Chrome, Edge, Brave, Arc).
 
-```
-┌─────────────────────────┐   POST /annotations    ┌──────────────────────────┐
-│  Your browser (Comet…)  │ ─────────────────────► │  browserlink hub (local) │
-│  • draw annotations     │  schema v1 (docs)      │  REST inbox, CORS, safe  │
-│  • element picker       │                        │  atomic writes           │
-│  • instruction chat     │                        └────┬─────┬───────┬───────┘
-└─────────────────────────┘                             │     │       │
-                         ┌──────────────────────────────┘     │       └──────────────┐
-                         ▼                                    ▼                      ▼
-                  ┌──────────────┐                    ┌──────────────┐      ┌──────────────────┐
-                  │  MCP server  │                    │  adapters    │      │   REST API       │
-                  │  (stdio)     │                    │ hermes/webhook│     │   curl-friendly  │
-                  └──────────────┘                    └──────────────┘      └──────────────────┘
-                         │
-          Claude Code · Hermes · Codex · Cursor · OpenCode · anything MCP
-```
+![Browserlink connection architecture](assets/infographics/browserlink-architecture-github.png)
 
 ## Quickstart (3 steps)
 
@@ -114,6 +99,8 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
 `~/.browserlink/annotations`.
 
 ## Features
+
+![Browserlink annotation and delivery capabilities](assets/infographics/browserlink-functions-github.png)
 
 - **Draw annotations** - circles, arrows, scribbles; normalized coordinates
   so annotations stay accurate across scroll and resize; undo/clear.
