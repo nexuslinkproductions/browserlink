@@ -1,6 +1,6 @@
 {
   "name": "browserlink-mcp",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "TypeScript MCP server and hub for Browserlink annotations",
   "type": "module",
   "main": "dist/mcp.js",
