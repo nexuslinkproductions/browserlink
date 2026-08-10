@@ -2523,10 +2523,24 @@
     if (captureRect) payload.captureRect = captureRect;
     setStatus('sending…', '');
     let ok = false;
+    // Hide the tool overlay (toolbar, inspector, canvas, markers) so the
+    // captured screenshot shows only the page element, never the tool UI.
+    // The SW captures before it responds, so restoring after the round-trip
+    // is safe.
+    let overlayHidden = false;
+    try {
+      if (host && host.parentNode) {
+        host.style.visibility = 'hidden';
+        overlayHidden = true;
+      }
+    } catch (_) { /* overlay stays visible */ }
     try {
       const resp = await chrome.runtime.sendMessage({ type: 'annotate', payload });
       ok = !!(resp && resp.ok);
     } catch (_) { ok = false; }
+    try {
+      if (overlayHidden && host) host.style.visibility = '';
+    } catch (_) { /* ok */ }
     if (ok) {
       setStatus(BRIDGE_OK, 'ok');
       sendFeedback(button, true);

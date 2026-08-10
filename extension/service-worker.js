@@ -92,6 +92,41 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   pollTargetAndMaybeActivate();
 });
 
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Crop a captured tab screenshot to the element capture rect (CSS px * dpr).
+// Falls back to the full image on any failure so annotation never blocks.
+async function cropDataUrl(dataUrl, rect) {
+  try {
+    if (!rect || typeof rect !== 'object') return dataUrl;
+    const dpr = Number(rect.dpr) > 0 ? Number(rect.dpr) : 1;
+    const sx = Math.max(0, Number(rect.x) || 0) * dpr;
+    const sy = Math.max(0, Number(rect.y) || 0) * dpr;
+    const sw = Math.max(1, Number(rect.w) || 0) * dpr;
+    const sh = Math.max(1, Number(rect.h) || 0) * dpr;
+    const blob = await (await fetch(dataUrl)).blob();
+    const bitmap = await createImageBitmap(blob);
+    const cw = Math.min(sw, Math.max(0, bitmap.width - sx));
+    const ch = Math.min(sh, Math.max(0, bitmap.height - sy));
+    if (cw < 1 || ch < 1) return dataUrl;
+    const canvas = new OffscreenCanvas(Math.round(cw), Math.round(ch));
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return dataUrl;
+    ctx.drawImage(bitmap, sx, sy, cw, ch, 0, 0, cw, ch);
+    const outBlob = await canvas.convertToBlob({ type: 'image/png' });
+    return await blobToDataUrl(outBlob);
+  } catch (_) {
+    return dataUrl;
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== 'object') return false;
 
@@ -103,7 +138,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
         if (typeof dataUrl === 'string' && dataUrl) {
-          payload.screenshot = dataUrl;
+          // v1.6.2: crop to the selected element(s) so the screenshot shows
+          // only the element, not the whole page (or the tool overlay).
+          payload.screenshot = await cropDataUrl(dataUrl, payload.captureRect);
         }
       } catch (_) { /* proceed without screenshot */ }
 
