@@ -57,6 +57,15 @@ delivered to your connected harness.
   (tag, id, classes, text, href, cssPath, rect).
 - **Instruction chat** - a chat card per element: type your thoughts, edit on
   re-click, batch them all into one send.
+- **Activation toggle** - a master switch in the popup (default ON, persisted
+  per profile): deactivates the tool on the current page with one click, and
+  re-activates it straight from the popup.
+- **Collapsible, movable toolbar** - drag the toolbar anywhere on the page,
+  collapse it to a small chip, or exit the tool entirely with the power or
+  close button.
+- **Element inspector with inline editing** - select an element in Element
+  mode to see its current computed styles, type desired values inline, and
+  ship them as structured `elements[].edits` in the annotation payload.
 - **Harness-neutral** - MCP server (works with every major harness), REST API,
   and pluggable adapters (Hermes chat injection, generic webhooks).
 - **Your sessions stay yours** - the extension never touches page DOM beyond a

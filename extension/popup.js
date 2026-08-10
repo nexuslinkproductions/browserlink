@@ -8,6 +8,10 @@
  *     after saving an endpoint).
  *   - Context label: persisted via chrome.storage.local ("contextLabel"),
  *     merged into payload.label at send time by content.js.
+ *   - Master switch ("Tool active"): persisted via chrome.storage.local
+ *     ("toolEnabled", default ON). Switching OFF asks the service worker to
+ *     deactivate the tool on the active tab ({type:"browserlinkExit"});
+ *     switching ON re-activates it ({type:"browserlinkToggle", enabled:true}).
  *   - "Send test annotation": sends a 1-stroke test payload through the
  *     service worker to verify the whole popup -> SW -> hub chain.
  */
@@ -63,6 +67,26 @@ function saveLabel() {
   chrome.storage.local.set({ contextLabel: v }).catch(() => {});
 }
 
+/* master switch ("Tool active"): default ON, persisted as "toolEnabled" */
+async function loadToolEnabled() {
+  let enabled = true; // default ON
+  try {
+    const got = await chrome.storage.local.get('toolEnabled');
+    if (got && typeof got.toolEnabled === 'boolean') enabled = got.toolEnabled;
+  } catch (_) { /* storage unavailable */ }
+  $('toolToggle').checked = enabled;
+}
+
+function onToolToggle() {
+  const enabled = $('toolToggle').checked;
+  chrome.storage.local.set({ toolEnabled: enabled }).catch(() => {});
+  const msg = enabled
+    ? { type: 'browserlinkToggle', enabled: true }
+    : { type: 'browserlinkExit' };
+  // The service worker forwards this to the active tab's content script.
+  chrome.runtime.sendMessage(msg).catch(() => { /* no receiver */ });
+}
+
 /* send test annotation */
 async function sendTest() {
   const label = $('contextLabel').value.trim().slice(0, 200);
@@ -106,6 +130,7 @@ async function sendTest() {
 }
 
 /* wiring */
+$('toolToggle').addEventListener('change', onToolToggle);
 $('saveEndpoint').addEventListener('click', saveEndpoint);
 $('refreshStatus').addEventListener('click', checkHub);
 $('contextLabel').addEventListener('input', saveLabel);
@@ -113,3 +138,4 @@ $('sendTest').addEventListener('click', sendTest);
 checkHub();
 loadEndpoint();
 loadLabel();
+loadToolEnabled();

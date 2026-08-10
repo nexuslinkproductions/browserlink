@@ -1,7 +1,11 @@
-# browserlink protocol — annotation schema v1
+# browserlink protocol — annotation schema v1.1
 
 The public contract between the extension, the hub, and any harness. Versioned;
-changes require a new major version and a compatibility shim.
+changes require a new minor or major version and a compatibility shim.
+
+**Schema v1.1** (backward compatible with v1.0): adds an optional
+`elements[].edits` object carrying structured desired changes per element.
+v1.0 payloads (no `edits`) remain valid; the hub accepts both.
 
 ## Data locations
 
@@ -33,7 +37,9 @@ HTTP 400.
       "text": "Log in", "href": null, "ariaLabel": null,
       "cssPath": "html body form button",
       "rect": { "x": 0.4, "y": 0.5, "w": 0.2, "h": 0.05 },
-      "instruction": "Make this blue and round" }
+      "instruction": "Make this blue and round",
+      "edits": { "width": "48px", "fontSize": "16px", "color": "#0af",
+                 "text": "Shop now" } }
   ]
 }
 ```
@@ -48,10 +54,27 @@ HTTP 400.
 | `viewport` | object | required; `w`, `h` positive integers |
 | `label` | string | optional; user context label, ≤ 200 chars |
 | `strokes` | array | required; each: `color` string, `width` number > 0, `points` array of ≥ 2 `[x, y]` pairs, each coordinate in `[0, 1]` (normalized to the annotation viewport) |
-| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500 |
+| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below) |
 
 The hub stores the payload verbatim and adds `ts` (epoch ms) and `savedAt`
 (ISO-8601 UTC).
+
+### elements[].edits (schema v1.1)
+
+Optional object mapping a CSS/text property to the DESIRED new value. Every
+value must be a string; keys are restricted to:
+
+`width`, `height`, `fontFamily`, `fontSize`, `fontWeight`, `lineHeight`,
+`color`, `backgroundColor`, `text`, `href`, `display`, `margin`, `padding`,
+`borderRadius`
+
+Rules:
+
+- `instruction` stays the free-text field; `edits` is the structured change list.
+- Unknown keys are rejected by hub validation with HTTP 400.
+- Non-string values are rejected by hub validation with HTTP 400.
+- Consumers apply the edits onto the captured element; values are applied as
+  given (CSS values for style properties, plain text for `text`/`href`).
 
 ### Responses
 
@@ -79,6 +102,8 @@ Consumers map them back by multiplying with their own viewport dimensions.
 
 ## Versioning
 
-This is **schema v1**. Breaking changes (new required fields, coordinate
-semantics, endpoint removal) bump to v2 with a deprecation window: the hub
-accepts both versions for one minor release.
+This is **schema v1.1**: backward compatible with v1.0 (the optional
+`elements[].edits` field is additive; v1.0 payloads validate unchanged).
+Breaking changes (new required fields, coordinate semantics, endpoint
+removal) bump to v2 with a deprecation window: the hub accepts both versions
+for one minor release.

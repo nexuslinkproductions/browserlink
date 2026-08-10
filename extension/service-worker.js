@@ -2,7 +2,9 @@
  *
  * Relays {type:"annotate", payload} messages from content script or popup to
  * the configured hub: POST <endpoint>/annotations (CORS-enabled). Answers
- * {type:"hubStatus"} with a GET <endpoint>/health probe. The hub endpoint is
+ * {type:"hubStatus"} with a GET <endpoint>/health probe. Forwards
+ * {type:"browserlinkToggle", enabled} and {type:"browserlinkExit"} messages
+ * from the popup to the active tab's content script. The hub endpoint is
  * read from chrome.storage.local key "endpoint", falling back to
  * DEFAULT_ENDPOINT. Responds to the sender with {ok:true} or
  * {ok:false,error}.
@@ -82,6 +84,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           })
           .catch((err) => {
             clearTimeout(timer);
+            sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
+          });
+      })
+      .catch((err) => {
+        sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
+      });
+    return true; // keep the message channel open for the async sendResponse
+  }
+
+  if (msg.type === 'browserlinkToggle' || msg.type === 'browserlinkExit') {
+    // Forward activation/deactivation from the popup to the active tab.
+    chrome.tabs.query({ active: true, currentWindow: true })
+      .then((tabs) => {
+        const tab = tabs && tabs[0];
+        if (!tab || typeof tab.id !== 'number') {
+          sendResponse({ ok: false, error: 'no active tab' });
+          return;
+        }
+        return chrome.tabs.sendMessage(tab.id, msg)
+          .then(() => sendResponse({ ok: true }))
+          .catch((err) => {
             sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
           });
       })

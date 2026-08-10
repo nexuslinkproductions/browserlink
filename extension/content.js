@@ -1,13 +1,35 @@
-/* Browserlink — Browser Annotate & Connect — content script (MV3). SPEC v2.1.
+/* Browserlink — Browser Annotate & Connect — content script (MV3). SPEC v1.1.
  *
  * Attaches ONE closed ShadowRoot to document.documentElement containing:
- *   - a floating top-right toolbar [Annotate | Element | color swatch |
- *     width 2/4/8 | N elements | Undo | Clear | Send | status]
+ *   - a floating top-right toolbar [⏻ power | − collapse | ⋮⋮ drag handle |
+ *     Annotate | Element | color swatch | width 2/4/8 | N elements | Undo |
+ *     Clear | Send | status | ✕ exit]. Power (⏻) and Exit (✕) fully
+ *     deactivate the tool: the shadow host is removed from the DOM, the
+ *     instruction chat card and inspector close, any pending pointer capture
+ *     is cancelled and per-tab {enabled:false} is persisted in
+ *     chrome.storage.session. Collapse (−) minimizes to a 48px floating chip
+ *     (click restores; state persisted per tab). The ⋮⋮ handle drags the
+ *     toolbar (and the collapsed chip identically) with live position
+ *     updates persisted per tab in chrome.storage.session (default top-right
+ *     12px, clamped to the viewport). Reactivation: the popup master switch
+ *     sends {type:"browserlinkToggle", enabled:true}, which re-injects
+ *     idempotently; {type:"browserlinkToggle", enabled:false} and
+ *     {type:"browserlinkExit"} both run the full exit path.
  *   - an overlay <canvas> (position fixed, inset 0, z-index 2147483646)
  *   - an element-picker layer (fixed inset 0, pointer-events none) holding
  *     the hover highlight + "tag#id.class" chip and the persistent selection
  *     outlines + numbered badges
  *   - an instruction chat card (bottom-right of the viewport)
+ *   - an element inspector panel (attached below the toolbar, Element mode):
+ *     one row per property with the CURRENT computed value
+ *     (width/height from getBoundingClientRect, px rounded; fontFamily,
+ *     fontSize, fontWeight, lineHeight, color, display, margin, padding,
+ *     borderRadius from getComputedStyle; text trimmed to 200 chars; href
+ *     for anchors) plus a labeled read-only current value and an editable
+ *     input per row. Edited rows get an accent marker; the footer shows
+ *     "N edits" + the instruction textarea + Send. Send payload elements
+ *     gain "edits": {property: desiredValue} (non-empty edits only). The
+ *     panel closes on deselection, mode switch to Annotate, and exit/power.
  *
  * Modes:
  *   Annotate -> canvas pointer-events: all; pointerdown/move/up with
@@ -24,19 +46,20 @@
  *               from getBoundingClientRect(). A rAF loop plus scroll/resize
  *               listeners keep the highlight (and selection outlines) glued to
  *               the element. Click selects: persistent 2px dashed #ff5252
- *               outline + numbered badge (1..N) and opens the instruction chat
- *               card. Add appends {index, tag, id, className, text, href,
- *               ariaLabel, cssPath, rect, instruction} (instruction trimmed,
- *               cap 500) and keeps the card open for the next element; Enter
- *               adds, Esc cancels/closes; re-click on an already-selected
- *               element (cssPath match) pre-fills the card (edit mode).
- *               Toolbar chip "N elements" + Clear clears all selections.
- *               While the picker is active, page clicks are swallowed
- *               (preventDefault + stopPropagation) so links/buttons don't
- *               fire.
+ *               outline + numbered badge (1..N), opens the instruction chat
+ *               card and the element inspector. Add appends {index, tag, id,
+ *               className, text, href, ariaLabel, cssPath, rect, instruction}
+ *               (instruction trimmed, cap 500) and keeps the card open for
+ *               the next element; Enter adds, Esc cancels/closes; re-click on
+ *               an already-selected element (cssPath match) pre-fills the
+ *               card (edit mode). Toolbar chip "N elements" + Clear clears
+ *               all selections. While the picker is active, page clicks are
+ *               swallowed (preventDefault + stopPropagation) so links/buttons
+ *               don't fire.
  *
  * Send -> chrome.runtime.sendMessage({type:"annotate", payload}) with the
  * spec payload {source, url, title, viewport, label, strokes, elements};
+ * elements[] entries carry "edits": {property: desiredValue} when edited.
  * status shows "sent ✓" or "bridge offline"; strokes, elements and all
  * markers are cleared only after a successful send.
  *
@@ -47,6 +70,7 @@
 (() => {
   if (window.__hermesAnnotateInjected) return; // guard duplicate injection
   window.__hermesAnnotateInjected = true;
+  window.__browserlinkInjected = true;
 
   /* ---------------- spec constants ---------------- */
   const COLORS = ['#ff5252', '#4a9eff', '#ffd166', '#35c759']; // red blue yellow green
@@ -60,6 +84,8 @@
   const HL_COLOR = '#4a9eff';
   const SEL_COLOR = '#ff5252';
   const CHIP_MAX = 40;
+  const POS_PAD = 12;              // viewport inset for toolbar/chip/inspector
+  const DRAG_PERSIST_MS = 120;     // throttle for live position persistence
 
   /* ---------------- state ---------------- */
   const state = {
@@ -71,7 +97,14 @@
     elements: [],        // [{descriptor, el, outlineEl}]
     currentStroke: null, // in-progress stroke
     nextIndex: 1,        // selection numbering (1-based)
+    capturedPointerId: null, // active canvas pointer capture (released on exit)
+    collapsed: false,    // toolbar minimized to the 48px chip
+    position: null,      // {x, y} top-left of toolbar/chip (viewport px)
   };
+
+  // Element inspector: {el, descriptor} — descriptor is the object that
+  // receives "edits" so committed elements keep their edits.
+  const inspector = { el: null, descriptor: null };
 
   // Selection awaiting Add/Cancel: {descriptor, el, isEdit, editIndex, outlineEl}
   let pending = null;
@@ -93,7 +126,123 @@
   let chatCard = null;
   let chatHead = null;
   let chatInput = null;
+  let chipEl = null;         // 48px collapsed chip
+  let dragHandle = null;     // ⋮⋮ toolbar handle
+  let inspPanel = null;      // element inspector panel
+  let inspRows = null;
+  let inspCountEl = null;
+  let inspInput = null;
+  let inspSend = null;
   const rafPending = { v: false };
+
+  /* ---------------- drag + per-tab persistence ---------------- */
+  let drag = null;             // {target, pointerId, startX, startY, baseX, baseY, moved}
+  let suppressChipClick = false; // chip click right after a drag = restore, not drag
+  let lastDragPersist = 0;
+  let messagesBound = false;   // chrome.runtime.onMessage registered once
+
+  // Per-tab chrome.storage.session state (key "browserlink:<tabId>").
+  // tabId is learned from message senders (popup/SW forwards carry
+  // sender.tab) and from a {type:"browserlinkGetTabId"} ping; when the
+  // background does not answer, we fall back to a shared key.
+  let knownTabId = null;
+
+  function rememberTabId(id) {
+    if (id) knownTabId = id;
+  }
+
+  function tabStorageKey() {
+    return 'browserlink:' + (knownTabId || 'unknown');
+  }
+
+  function saveTabState(patch) {
+    const key = tabStorageKey();
+    try {
+      chrome.storage.session.get(key).then((got) => {
+        const cur = (got && got[key]) || {};
+        const obj = {};
+        obj[key] = Object.assign({}, cur, patch);
+        chrome.storage.session.set(obj);
+      }).catch(() => { /* storage unavailable */ });
+    } catch (_) { /* storage unavailable */ }
+  }
+
+  function pingTabId() {
+    try {
+      chrome.runtime.sendMessage({ type: 'browserlinkGetTabId' }, (resp) => {
+        if (chrome.runtime.lastError) return; // background does not answer
+        if (resp && resp.ok && resp.tabId) rememberTabId(resp.tabId);
+      });
+    } catch (_) { /* no background */ }
+  }
+
+  /* ---------------- toolbar position / collapse ---------------- */
+  // Size of the currently visible control surface (toolbar or collapsed chip).
+  function currentSurfaceSize() {
+    const el = state.collapsed ? chipEl : toolbar;
+    return el
+      ? { w: el.offsetWidth || 0, h: el.offsetHeight || 0 }
+      : { w: 0, h: 0 };
+  }
+
+  function clampPos(x, y, w, h) {
+    const maxX = Math.max(POS_PAD, window.innerWidth - w - POS_PAD);
+    const maxY = Math.max(POS_PAD, window.innerHeight - h - POS_PAD);
+    return {
+      x: Math.min(Math.max(x, POS_PAD), maxX),
+      y: Math.min(Math.max(y, POS_PAD), maxY),
+    };
+  }
+
+  function defaultPosition() {
+    const s = currentSurfaceSize();
+    return clampPos(window.innerWidth - s.w - POS_PAD, POS_PAD, s.w, s.h);
+  }
+
+  function applyPosition(x, y) {
+    if (!toolbar) return;
+    const s = currentSurfaceSize();
+    const p = clampPos(x, y, s.w, s.h);
+    state.position = p;
+    const l = p.x + 'px';
+    const t = p.y + 'px';
+    toolbar.style.left = l;
+    toolbar.style.top = t;
+    toolbar.style.right = 'auto'; // left/top win over the CSS right:12px default
+    if (chipEl) {
+      chipEl.style.left = l;
+      chipEl.style.top = t;
+      chipEl.style.right = 'auto';
+    }
+    positionInspector(); // inspector hangs below the toolbar
+  }
+
+  function setCollapsed(on) {
+    if (on === state.collapsed) return;
+    state.collapsed = on;
+    toolbar.style.display = on ? 'none' : '';
+    if (chipEl) chipEl.style.display = on ? '' : 'none';
+    if (on) closeInspector();
+    if (state.position) applyPosition(state.position.x, state.position.y);
+    else { const d = defaultPosition(); applyPosition(d.x, d.y); }
+    saveTabState({ collapsed: on });
+  }
+
+  // Inspector panel hangs below the toolbar, clamped to the viewport.
+  function positionInspector() {
+    if (!inspPanel || inspPanel.hidden || !toolbar) return;
+    const r = toolbar.getBoundingClientRect();
+    const iw = inspPanel.offsetWidth || 320;
+    const ih = inspPanel.offsetHeight || 0;
+    const left = Math.min(Math.max(POS_PAD, r.left), Math.max(POS_PAD, window.innerWidth - iw - POS_PAD));
+    let top = r.bottom + 8;
+    if (top + ih > window.innerHeight - POS_PAD) {
+      top = Math.max(POS_PAD, window.innerHeight - ih - POS_PAD);
+    }
+    inspPanel.style.left = left + 'px';
+    inspPanel.style.top = top + 'px';
+    inspPanel.style.right = 'auto';
+  }
 
   /* ---------------- helpers ---------------- */
   const clamp01 = (v) => Math.min(1, Math.max(0, v));
@@ -164,6 +313,7 @@
     if (!state.annotateOn || state.elementMode) return;
     e.preventDefault();
     try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* ok */ }
+    state.capturedPointerId = e.pointerId;
     state.currentStroke = {
       color: state.color,
       width: state.width,
@@ -186,6 +336,7 @@
     if (!state.currentStroke) return;
     const s = state.currentStroke;
     state.currentStroke = null;
+    state.capturedPointerId = null;
     if (s.points.length >= 2) state.strokes.push(s); // spec: min 2 points
     redraw();
   }
@@ -379,6 +530,7 @@
 
   // Open the instruction card for a clicked element. New selection -> fresh
   // outline; already-selected (cssPath match) -> edit mode, pre-filled.
+  // The element inspector opens alongside the card.
   function openChat(descriptor, el, isEdit, editIndex) {
     // Drop any previous NEW (not-yet-added) pending outline; edit pendings
     // share the entry's outline and must stay.
@@ -397,6 +549,11 @@
     chatCard.hidden = false;
     chatInput.focus();
     positionSelections();
+    // v1.1: inspector below the toolbar, bound to the committed descriptor
+    // (edit mode re-click keeps the stored entry so edits accumulate).
+    const inspDesc = isEdit ? state.elements[editIndex].descriptor : descriptor;
+    openInspector(el, inspDesc);
+    if (inspInput) inspInput.value = inspDesc.instruction || '';
   }
 
   function addChat() {
@@ -414,6 +571,7 @@
     }
     pending = null;
     chatInput.value = '';
+    if (inspInput) inspInput.value = '';
     chatInput.focus(); // stays open for the next element
     updateCount();
   }
@@ -426,6 +584,7 @@
     pending = null;
     chatCard.hidden = true;
     chatInput.value = '';
+    closeInspector(); // deselection closes the inspector
   }
 
   function onMouseMove(e) {
@@ -473,6 +632,156 @@
     }
   }
 
+  /* ---------------- element inspector (v1.1) ---------------- */
+  // CURRENT computed values for the selected element, one row per property.
+  function inspectorProps(el) {
+    const out = [];
+    let r = null;
+    try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+    if (r) {
+      out.push({ prop: 'width', current: Math.round(r.width) + 'px' });
+      out.push({ prop: 'height', current: Math.round(r.height) + 'px' });
+    }
+    let cs = null;
+    try { cs = getComputedStyle(el); } catch (_) { cs = null; }
+    if (cs) {
+      out.push({ prop: 'fontFamily', current: cs.fontFamily });
+      out.push({ prop: 'fontSize', current: cs.fontSize });
+      out.push({ prop: 'fontWeight', current: cs.fontWeight });
+      out.push({ prop: 'lineHeight', current: cs.lineHeight });
+      out.push({ prop: 'color', current: cs.color });
+      out.push({ prop: 'display', current: cs.display });
+      out.push({ prop: 'margin', current: cs.margin });
+      out.push({ prop: 'padding', current: cs.padding });
+      out.push({ prop: 'borderRadius', current: cs.borderRadius });
+    }
+    let text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT);
+    out.push({ prop: 'text', current: text });
+    try {
+      if ((el.tagName === 'A' || el.tagName === 'AREA') && el.href) {
+        out.push({ prop: 'href', current: String(el.href) });
+      }
+    } catch (_) { /* ok */ }
+    return out;
+  }
+
+  function currentEdits() {
+    return inspector.descriptor && inspector.descriptor.edits
+      ? inspector.descriptor.edits
+      : {};
+  }
+
+  function renderInspector() {
+    if (!inspPanel) return;
+    const el = inspector.el;
+    if (!el) {
+      inspPanel.hidden = true;
+      return;
+    }
+    inspRows.innerHTML = '';
+    const edits = currentEdits();
+    for (const p of inspectorProps(el)) {
+      const row = document.createElement('div');
+      row.className = 'comet-insp-row';
+      row.dataset.prop = p.prop;
+
+      const lab = document.createElement('span');
+      lab.className = 'comet-insp-label';
+      lab.textContent = p.prop;
+      lab.title = p.prop;
+
+      const cur = document.createElement('code');
+      cur.className = 'comet-insp-cur';
+      cur.textContent = p.current;
+      cur.title = p.current;
+
+      const inp = document.createElement('input');
+      inp.className = 'comet-insp-input';
+      inp.type = 'text';
+      inp.placeholder = 'desired value';
+      inp.setAttribute('aria-label', 'Desired ' + p.prop);
+      if (edits[p.prop] !== undefined && edits[p.prop] !== null) {
+        inp.value = String(edits[p.prop]);
+      }
+
+      const clr = document.createElement('button');
+      clr.type = 'button';
+      clr.className = 'comet-insp-clear';
+      clr.textContent = '✕';
+      clr.title = 'Clear edit for ' + p.prop;
+
+      row.appendChild(lab);
+      row.appendChild(cur);
+      row.appendChild(inp);
+      row.appendChild(clr);
+      inspRows.appendChild(row);
+    }
+    updateInspectorState();
+  }
+
+  // Accent-marks edited rows and refreshes the "N edits" footer count.
+  function updateInspectorState() {
+    if (!inspPanel) return;
+    const edits = currentEdits();
+    let n = 0;
+    inspRows.querySelectorAll('.comet-insp-row').forEach((row) => {
+      const v = edits[row.dataset.prop];
+      const nonEmpty = v !== undefined && v !== null && String(v).trim() !== '';
+      row.classList.toggle('edited', nonEmpty);
+      if (nonEmpty) n++;
+    });
+    inspCountEl.textContent = n === 1 ? '1 edit' : n + ' edits';
+  }
+
+  function openInspector(el, descriptor) {
+    inspector.el = el;
+    inspector.descriptor = descriptor;
+    renderInspector();
+    inspPanel.hidden = false;
+    positionInspector();
+  }
+
+  function closeInspector() {
+    inspector.el = null;
+    inspector.descriptor = null;
+    if (inspPanel) inspPanel.hidden = true;
+  }
+
+  // Typing in an edit input stores the desired value; empty input removes it.
+  function onInspectorInput(e) {
+    const row = e.target && e.target.closest ? e.target.closest('.comet-insp-row') : null;
+    if (!row || !inspector.descriptor) return;
+    const prop = row.dataset.prop;
+    const v = e.target.value;
+    if (!inspector.descriptor.edits) inspector.descriptor.edits = {};
+    if (String(v).trim() === '') delete inspector.descriptor.edits[prop];
+    else inspector.descriptor.edits[prop] = v;
+    updateInspectorState();
+  }
+
+  // Per-row clear: reset the edit input and drop the stored edit.
+  function onInspectorClear(e) {
+    const btn = e.target && e.target.closest ? e.target.closest('.comet-insp-clear') : null;
+    if (!btn) return;
+    const row = btn.closest('.comet-insp-row');
+    if (!row) return;
+    const prop = row.dataset.prop;
+    const inp = row.querySelector('.comet-insp-input');
+    if (inp) inp.value = '';
+    if (inspector.descriptor && inspector.descriptor.edits) {
+      delete inspector.descriptor.edits[prop];
+    }
+    updateInspectorState();
+  }
+
+  // Footer instruction textarea: same instruction field as the chat card.
+  function onInspectorInstr(e) {
+    if (!inspector.descriptor) return;
+    inspector.descriptor.instruction = e.target.value;
+    if (chatInput) chatInput.value = e.target.value;
+  }
+
   /* ---------------- toolbar ---------------- */
   function applyMode() {
     canvas.style.pointerEvents = state.annotateOn ? 'all' : 'none';
@@ -489,12 +798,14 @@
 
   function setElementMode(on) {
     if (!on && state.elementMode) {
-      // Leaving picker mode: drop the pending selection + close the card.
+      // Leaving picker mode: drop the pending selection + close the card
+      // and the inspector (mode switch to Annotate closes the panel too).
       if (pending && !pending.isEdit && pending.outlineEl && pending.outlineEl.parentNode) {
         pending.outlineEl.parentNode.removeChild(pending.outlineEl);
       }
       pending = null;
       if (chatCard) chatCard.hidden = true;
+      closeInspector();
       stopHoverLoop();
       mouse = null;
       mouseDirty = false;
@@ -536,6 +847,7 @@
     while (selLayer.firstChild) selLayer.removeChild(selLayer.firstChild); // all markers
     pending = null;
     if (chatCard) chatCard.hidden = true;
+    closeInspector();
     updateCount();
     redraw();
   }
@@ -553,7 +865,22 @@
       viewport: { w: window.innerWidth, h: window.innerHeight },
       label: label.slice(0, MAX_TEXT),
       strokes: state.strokes.map((s) => ({ color: s.color, width: s.width, points: s.points })),
-      elements: state.elements.map((en) => en.descriptor), // includes instruction
+      // v1.1: elements carry "edits" ({property: desiredValue}, non-empty only).
+      elements: state.elements.map((en) => {
+        const d = Object.assign({}, en.descriptor);
+        if (d.edits) {
+          const edits = {};
+          for (const k of Object.keys(d.edits)) {
+            const v = d.edits[k];
+            if (v !== undefined && v !== null && String(v).trim() !== '') {
+              edits[k] = String(v).trim();
+            }
+          }
+          if (Object.keys(edits).length) d.edits = edits;
+          else delete d.edits;
+        }
+        return d;
+      }),
     };
     setStatus('sending…', '');
     let ok = false;
@@ -569,6 +896,7 @@
       while (selLayer.firstChild) selLayer.removeChild(selLayer.firstChild);
       pending = null;
       if (chatCard) chatCard.hidden = true;
+      closeInspector();
       updateCount();
       redraw();
     } else {
@@ -586,6 +914,11 @@
       case 'undo': undo(); break;
       case 'clear': clearAll(); break;
       case 'send': send(); break;
+      case 'power': fullExit(); break;
+      case 'exit': fullExit(); break;
+      case 'collapse':
+        setCollapsed(!state.collapsed);
+        break;
       default: break;
     }
   }
@@ -595,6 +928,198 @@
       const v = parseInt(e.target.value, 10);
       if (WIDTHS.indexOf(v) !== -1) state.width = v;
     }
+  }
+
+  /* ---------------- drag (toolbar handle + collapsed chip) ---------------- */
+  function startDrag(e) {
+    if (e.button !== 0 && e.pointerType === 'mouse') return; // left button only
+    e.preventDefault();
+    const target = e.currentTarget; // ⋮⋮ handle or the chip itself
+    try { target.setPointerCapture(e.pointerId); } catch (_) { /* ok */ }
+    const base = state.position || defaultPosition();
+    drag = {
+      target,
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      baseX: base.x,
+      baseY: base.y,
+      moved: false,
+    };
+    lastDragPersist = 0;
+    target.classList.add('dragging');
+  }
+
+  function onDragMove(e) {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+    if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
+    applyPosition(drag.baseX + dx, drag.baseY + dy); // live position update
+    const now = Date.now();
+    if (now - lastDragPersist >= DRAG_PERSIST_MS) {
+      lastDragPersist = now;
+      saveTabState({ position: state.position }); // throttled per-tab persist
+    }
+  }
+
+  function endDrag(e) {
+    if (!drag || (e.pointerId !== undefined && e.pointerId !== drag.pointerId)) return;
+    try {
+      if (drag.target.hasPointerCapture(drag.pointerId)) {
+        drag.target.releasePointerCapture(drag.pointerId);
+      }
+    } catch (_) { /* ok */ }
+    drag.target.classList.remove('dragging');
+    if (drag.moved && drag.target === chipEl) suppressChipClick = true;
+    drag = null;
+    saveTabState({ position: state.position }); // final persist
+  }
+
+  function onChipClick() {
+    if (suppressChipClick) {
+      suppressChipClick = false; // this click finished a drag, not a restore
+      return;
+    }
+    setCollapsed(false); // click restores the full toolbar
+  }
+
+  /* ---------------- activation / deactivation ---------------- */
+  // Full exit: remove the shadow host + overlay from the DOM, close the chat
+  // card and inspector, cancel pointer capture, leave the page 100% clean,
+  // and persist per-tab {enabled:false}.
+  function fullExit() {
+    // Cancel any pending pointer capture (draw strokes + drag handles).
+    if (state.capturedPointerId != null && canvas) {
+      try {
+        if (canvas.hasPointerCapture(state.capturedPointerId)) {
+          canvas.releasePointerCapture(state.capturedPointerId);
+        }
+      } catch (_) { /* ok */ }
+      state.capturedPointerId = null;
+    }
+    if (drag) {
+      try {
+        if (drag.target.hasPointerCapture(drag.pointerId)) {
+          drag.target.releasePointerCapture(drag.pointerId);
+        }
+      } catch (_) { /* ok */ }
+      drag.target.classList.remove('dragging');
+    }
+    drag = null;
+    suppressChipClick = false;
+
+    state.annotateOn = false;
+    state.elementMode = false;
+    state.currentStroke = null;
+    pending = null;
+    closeInspector();
+    stopHoverLoop();
+    mouse = null;
+    mouseDirty = false;
+    hoveredEl = null;
+
+    // Unbind page-level listeners so nothing of ours remains active.
+    window.removeEventListener('mousemove', onMouseMove);
+    window.removeEventListener('click', onPageClick, true);
+    window.removeEventListener('keydown', onKeyDown, true);
+    document.removeEventListener('scroll', repositionAll, true);
+    window.removeEventListener('resize', onWindowResize);
+    window.removeEventListener('orientationchange', onWindowResize);
+
+    // Remove the shadow host from the DOM (removes toolbar, canvas, chat
+    // card, inspector, chip — every node we added).
+    if (host && host.parentNode) {
+      try { host.parentNode.removeChild(host); } catch (_) { /* ok */ }
+    }
+    host = null;
+    shadow = null;
+    toolbar = null;
+    canvas = null;
+    ctx = null;
+    statusEl = null;
+    countEl = null;
+    selLayer = null;
+    hlEl = null;
+    hlChip = null;
+    chatCard = null;
+    chatHead = null;
+    chatInput = null;
+    chipEl = null;
+    dragHandle = null;
+    inspPanel = null;
+    inspRows = null;
+    inspCountEl = null;
+    inspInput = null;
+    inspSend = null;
+    state.strokes = [];
+    state.elements = [];
+    state.nextIndex = 1;
+    // UI state is gone with the DOM; rebuild from chrome.storage.session on
+    // reinject (setCollapsed early-returns when the value is unchanged, so
+    // the collapsed/position state must be reset here).
+    state.collapsed = false;
+    state.position = null;
+    window.__hermesAnnotateInjected = false;
+    window.__browserlinkInjected = false;
+    saveTabState({ enabled: false }); // deactivation persists per tab
+  }
+
+  // Idempotent re-injection (popup master switch ON / browserlinkToggle true).
+  function reinject() {
+    if (host && host.parentNode) return; // already active
+    try {
+      buildUI();
+      bindEvents();
+      injectShadowStyles();
+      window.__hermesAnnotateInjected = true;
+      window.__browserlinkInjected = true;
+      chrome.storage.session.get(tabStorageKey()).then((got) => {
+        const st = got && got[tabStorageKey()] ? got[tabStorageKey()] : null;
+        restoreTabState(st);
+      }).catch(() => {
+        restoreTabState(null);
+      });
+      saveTabState({ enabled: true });
+      pingTabId();
+    } catch (err) {
+      try { if (host && host.parentNode) host.parentNode.removeChild(host); } catch (_) { /* ok */ }
+      window.__hermesAnnotateInjected = false;
+      window.__browserlinkInjected = false;
+      console.error('Browserlink reinject failed:', err);
+    }
+  }
+
+  function restoreTabState(st) {
+    if (st && st.position && typeof st.position.x === 'number' && typeof st.position.y === 'number') {
+      applyPosition(st.position.x, st.position.y);
+    } else {
+      const d = defaultPosition();
+      applyPosition(d.x, d.y);
+    }
+    setCollapsed(!!(st && st.collapsed));
+  }
+
+  // Messages from the popup (forwarded by the service worker) / background.
+  function onRuntimeMessage(msg, sender, sendResponse) {
+    if (!msg || typeof msg.type !== 'string') return false;
+    if (sender && sender.tab && sender.tab.id) rememberTabId(sender.tab.id);
+    if (msg.type === 'browserlinkGetTabId') {
+      try {
+        sendResponse({ ok: true, tabId: sender && sender.tab ? sender.tab.id : null });
+      } catch (_) { /* ok */ }
+      return false;
+    }
+    if (msg.type === 'browserlinkToggle') {
+      if (msg.enabled === true) reinject();
+      else fullExit(); // off == exit
+      return false;
+    }
+    if (msg.type === 'browserlinkExit') {
+      fullExit();
+      return false;
+    }
+    return false;
   }
 
   /* ---------------- UI construction ---------------- */
@@ -611,6 +1136,9 @@
     toolbar.setAttribute('role', 'toolbar');
     toolbar.setAttribute('aria-label', 'Browserlink — Browser Annotate & Connect');
     toolbar.innerHTML =
+      '<button type="button" data-act="power" class="comet-btn comet-power" title="Deactivate Browserlink (removes everything from this page)">⏻</button>' +
+      '<button type="button" data-act="collapse" class="comet-btn comet-collapse" title="Collapse to a floating chip">−</button>' +
+      '<span class="comet-drag" data-act="drag" title="Drag to move">⋮⋮</span>' +
       '<button type="button" data-act="annotate" class="comet-btn" title="Toggle drawing">Annotate</button>' +
       '<button type="button" data-act="element" class="comet-btn" title="Element picker: hover to highlight, click to select + instruct">Element</button>' +
       '<button type="button" data-act="color" class="comet-swatch" title="Cycle color">' +
@@ -628,7 +1156,20 @@
       '<button type="button" data-act="undo" class="comet-btn">Undo</button>' +
       '<button type="button" data-act="clear" class="comet-btn">Clear</button>' +
       '<button type="button" data-act="send" class="comet-btn comet-send">Send</button>' +
-      '<span class="status"></span>';
+      '<span class="status"></span>' +
+      '<button type="button" data-act="exit" class="comet-btn comet-exit" title="Exit Browserlink (removes everything from this page)">✕</button>';
+    dragHandle = toolbar.querySelector('.comet-drag');
+
+    // Collapsed 48px floating chip (same fixed position as the toolbar).
+    chipEl = document.createElement('div');
+    chipEl.className = 'comet-chip';
+    chipEl.setAttribute('role', 'button');
+    chipEl.setAttribute('aria-label', 'Restore Browserlink toolbar');
+    chipEl.title = 'Restore Browserlink toolbar';
+    chipEl.style.display = 'none';
+    const chipDot = document.createElement('span');
+    chipDot.className = 'comet-chip-dot';
+    chipEl.appendChild(chipDot);
 
     canvas = document.createElement('canvas');
     canvas.className = 'comet-canvas';
@@ -660,11 +1201,27 @@
       '  <button type="button" class="comet-btn comet-chat-add" data-chat="add">Add</button>' +
       '</div>';
 
+    // Element inspector panel (attached below the toolbar, max 320px wide).
+    inspPanel = document.createElement('div');
+    inspPanel.className = 'comet-inspector';
+    inspPanel.hidden = true;
+    inspPanel.innerHTML =
+      '<div class="comet-insp-head">Element inspector</div>' +
+      '<div class="comet-insp-rows"></div>' +
+      '<div class="comet-insp-foot">' +
+      '  <span class="comet-insp-count">0 edits</span>' +
+      '  <textarea class="comet-chat-input comet-insp-instr" rows="2" ' +
+      ' placeholder="Your thoughts/instructions for this element…"></textarea>' +
+      '  <button type="button" class="comet-btn comet-send comet-insp-send">Send</button>' +
+      '</div>';
+
     shadow.appendChild(toolbar);
+    shadow.appendChild(chipEl);
     shadow.appendChild(selLayer);
     selLayer.appendChild(hlEl);
     shadow.appendChild(canvas);
     shadow.appendChild(chatCard);
+    shadow.appendChild(inspPanel);
     ctx = canvas.getContext('2d');
 
     // ONE shadow host on the page; nothing else touches the page DOM.
@@ -674,6 +1231,10 @@
     countEl = toolbar.querySelector('.comet-count');
     chatHead = chatCard.querySelector('.comet-chat-head');
     chatInput = chatCard.querySelector('.comet-chat-input');
+    inspRows = inspPanel.querySelector('.comet-insp-rows');
+    inspCountEl = inspPanel.querySelector('.comet-insp-count');
+    inspInput = inspPanel.querySelector('.comet-insp-instr');
+    inspSend = inspPanel.querySelector('.comet-insp-send');
     toolbar.querySelector('.comet-swatch .dot').classList.add('active');
     updateCount();
     applyMode();
@@ -734,16 +1295,71 @@
         '.comet-chat-input:focus{border-color:#4a9eff;}' +
         '.comet-chat-actions{display:flex;justify-content:flex-end;gap:6px;}' +
         '.comet-chat-add{background:#4a9eff;border-color:#4a9eff;color:#fff;}' +
-        '.comet-count{min-width:64px;text-align:center;font-size:12px;color:#9aa0a6;white-space:nowrap;}';
+        '.comet-count{min-width:64px;text-align:center;font-size:12px;color:#9aa0a6;white-space:nowrap;}' +
+        '.comet-chip{position:fixed;width:48px;height:48px;border-radius:50%;z-index:2147483647;' +
+        'display:flex;align-items:center;justify-content:center;background:var(--bl-bg,rgba(16,18,24,.92));' +
+        'border:1px solid var(--bl-border,rgba(255,255,255,.14));box-shadow:0 6px 24px rgba(0,0,0,.35);' +
+        'cursor:pointer;pointer-events:auto;user-select:none;touch-action:none;}' +
+        '.comet-chip-dot{width:14px;height:14px;border-radius:50%;background:var(--bl-accent,#4a9eff);' +
+        'box-shadow:0 0 0 4px rgba(74,158,255,.25);}' +
+        '.comet-drag{cursor:grab;padding:4px 6px;border-radius:6px;color:var(--bl-muted,#9aa0a6);' +
+        'font-weight:600;letter-spacing:1px;touch-action:none;}' +
+        '.comet-drag:hover{background:rgba(255,255,255,.14);color:#e8eaed;}' +
+        '.comet-chip.dragging,.comet-drag.dragging{cursor:grabbing;}' +
+        '.comet-power:hover{background:#35c759;border-color:#35c759;color:#07130a;}' +
+        '.comet-exit:hover{background:#ff5252;border-color:#ff5252;color:#fff;}' +
+        '.comet-inspector{position:fixed;z-index:2147483647;width:320px;max-width:calc(100vw - 24px);' +
+        'max-height:60vh;display:flex;flex-direction:column;gap:8px;padding:10px;' +
+        'background:var(--bl-bg,rgba(16,18,24,.95));border:1px solid var(--bl-border,rgba(255,255,255,.16));' +
+        'border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.35);font:13px/1.4 system-ui;' +
+        'color:var(--bl-text,#e8eaed);pointer-events:auto;user-select:none;}' +
+        '.comet-inspector[hidden]{display:none;}' +
+        '.comet-insp-head{font-size:12px;color:#9aa0a6;border-bottom:1px solid rgba(255,255,255,.14);padding-bottom:6px;}' +
+        '.comet-insp-rows{overflow-y:auto;display:flex;flex-direction:column;gap:6px;}' +
+        '.comet-insp-row{display:grid;grid-template-columns:84px minmax(0,1fr) minmax(0,1fr) 20px;gap:6px;' +
+        'align-items:center;border:1px solid transparent;border-radius:6px;padding:4px 6px;}' +
+        '.comet-insp-row.edited{border-color:#4a9eff;background:rgba(74,158,255,.08);}' +
+        '.comet-insp-label{font-size:11px;color:#9aa0a6;text-transform:capitalize;overflow:hidden;' +
+        'text-overflow:ellipsis;white-space:nowrap;}' +
+        '.comet-insp-cur{font:11px/1.3 ui-monospace,Menlo,Consolas,monospace;color:#9aa0a6;' +
+        'background:rgba(255,255,255,.05);border-radius:4px;padding:3px 5px;overflow:hidden;' +
+        'text-overflow:ellipsis;white-space:nowrap;}' +
+        '.comet-insp-input{min-width:0;width:100%;box-sizing:border-box;background:rgba(255,255,255,.06);' +
+        'border:1px solid rgba(255,255,255,.16);border-radius:4px;color:#e8eaed;font:inherit;' +
+        'padding:3px 5px;outline:none;}' +
+        '.comet-insp-input:focus{border-color:#4a9eff;}' +
+        '.comet-insp-row.edited .comet-insp-input{border-color:#4a9eff;}' +
+        '.comet-insp-clear{border:none;background:transparent;color:#9aa0a6;cursor:pointer;font-size:11px;' +
+        'padding:2px;border-radius:4px;}' +
+        '.comet-insp-clear:hover{color:#ff5252;}' +
+        '.comet-insp-foot{display:flex;flex-direction:column;gap:6px;border-top:1px solid rgba(255,255,255,.14);' +
+        'padding-top:8px;}' +
+        '.comet-insp-count{font-size:11px;color:#9aa0a6;}' +
+        '.comet-insp-send{align-self:flex-end;}';
     }
     style.textContent = css;
     shadow.appendChild(style);
   }
 
   /* ---------------- wiring ---------------- */
+  function onWindowResize() {
+    resizeCanvas();
+    repositionAll();
+    if (state.position) applyPosition(state.position.x, state.position.y); // re-clamp
+  }
+
   function bindEvents() {
     toolbar.addEventListener('click', onToolbarClick);
     toolbar.addEventListener('change', onToolbarChange);
+    dragHandle.addEventListener('pointerdown', startDrag);
+    dragHandle.addEventListener('pointermove', onDragMove);
+    dragHandle.addEventListener('pointerup', endDrag);
+    dragHandle.addEventListener('pointercancel', endDrag);
+    chipEl.addEventListener('pointerdown', startDrag);
+    chipEl.addEventListener('pointermove', onDragMove);
+    chipEl.addEventListener('pointerup', endDrag);
+    chipEl.addEventListener('pointercancel', endDrag);
+    chipEl.addEventListener('click', onChipClick);
     canvas.addEventListener('pointerdown', pointerDown);
     canvas.addEventListener('pointermove', pointerMove);
     canvas.addEventListener('pointerup', endStroke);
@@ -754,24 +1370,54 @@
       if (b.dataset.chat === 'add') addChat();
       else if (b.dataset.chat === 'cancel') cancelChat();
     });
+    chatInput.addEventListener('input', () => {
+      if (pending && pending.descriptor) pending.descriptor.instruction = chatInput.value;
+      if (inspInput) inspInput.value = chatInput.value;
+    });
+    inspRows.addEventListener('input', onInspectorInput);
+    inspRows.addEventListener('click', onInspectorClear);
+    inspInput.addEventListener('input', onInspectorInstr);
+    inspSend.addEventListener('click', send);
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('click', onPageClick, true);
     window.addEventListener('keydown', onKeyDown, true);
     document.addEventListener('scroll', repositionAll, true); // incl. inner scrollers
-    window.addEventListener('resize', () => { resizeCanvas(); repositionAll(); });
-    window.addEventListener('orientationchange', () => { resizeCanvas(); repositionAll(); });
+    window.addEventListener('resize', onWindowResize);
+    window.addEventListener('orientationchange', onWindowResize);
+    if (!messagesBound) {
+      messagesBound = true;
+      chrome.runtime.onMessage.addListener(onRuntimeMessage);
+    }
   }
 
   /* ---------------- init ---------------- */
-  function init() {
+  async function init() {
     try {
+      // The message listener must survive exit so the popup can re-enable us.
+      if (!messagesBound) {
+        messagesBound = true;
+        chrome.runtime.onMessage.addListener(onRuntimeMessage);
+      }
+      pingTabId();
+      let saved = null;
+      try {
+        saved = await chrome.storage.session.get(tabStorageKey());
+      } catch (_) { saved = null; }
+      const st = saved && saved[tabStorageKey()] ? saved[tabStorageKey()] : null;
+      if (st && st.enabled === false) {
+        // Deactivation persists per tab: stay off until the popup re-enables.
+        saveTabState({ enabled: false });
+        return;
+      }
       buildUI();
       bindEvents();
       injectShadowStyles();
+      restoreTabState(st);
     } catch (err) {
       // Never break the host page.
       try { if (host && host.parentNode) host.parentNode.removeChild(host); } catch (_) { /* ok */ }
       window.__hermesAnnotateInjected = false;
+      window.__browserlinkInjected = false;
       console.error('Browserlink init failed:', err);
     }
   }

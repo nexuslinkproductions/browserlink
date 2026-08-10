@@ -64,3 +64,51 @@ def test_status_has_adapter_names(data_dir):
     assert status["version"] == "1.0.0"
     assert status["dataDir"] == str(data_dir)
     assert isinstance(status["adapters"], list)
+
+
+ALL_EDIT_KEYS = [
+    "width", "height", "fontFamily", "fontSize", "fontWeight", "lineHeight",
+    "color", "backgroundColor", "text", "href", "display", "margin",
+    "padding", "borderRadius",
+]
+
+
+def test_elements_edits_round_trip(data_dir):
+    p = payload()
+    p["elements"] = [{
+        "index": 1,
+        "tag": "button",
+        "text": "Log in",
+        "instruction": "Make this blue and round",
+        "edits": {"width": "48px", "fontSize": "16px", "color": "#0af", "text": "Shop now"},
+    }]
+    assert hub.validate_payload(p) is None
+    path = hub.store_annotation(p)
+    stored = json.loads(path.read_text())
+    assert stored["elements"][0]["edits"] == p["elements"][0]["edits"]
+
+
+def test_elements_edits_all_allowed_keys_round_trip(data_dir):
+    p = payload()
+    p["elements"] = [{"index": 1, "tag": "div", "edits": {k: "v" for k in ALL_EDIT_KEYS}}]
+    assert hub.validate_payload(p) is None
+    path = hub.store_annotation(p)
+    assert json.loads(path.read_text())["elements"][0]["edits"] == p["elements"][0]["edits"]
+
+
+def test_elements_edits_unknown_key_rejected():
+    p = payload()
+    p["elements"] = [{"index": 1, "tag": "button", "edits": {"bogusKey": "1px"}}]
+    assert hub.validate_payload(p) == "elements[0].edits has unknown key 'bogusKey'"
+
+
+def test_elements_edits_values_must_be_strings():
+    p = payload()
+    p["elements"] = [{"index": 1, "tag": "button", "edits": {"width": 48}}]
+    assert hub.validate_payload(p) == "elements[0].edits.width must be a string"
+
+
+def test_elements_edits_must_be_an_object():
+    p = payload()
+    p["elements"] = [{"index": 1, "tag": "button", "edits": "48px"}]
+    assert hub.validate_payload(p) == "elements[0].edits must be an object"
