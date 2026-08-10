@@ -8,6 +8,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -379,9 +380,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             os.replace(temp_path, path_out)
             for adapter_name, adapter_register in ADAPTERS:
                 try:
-                    adapter_register(payload)
+                    threading.Thread(
+                        target=adapter_register, args=(payload,), daemon=True
+                    ).start()
                 except Exception as adapter_error:
-                    LOGGER.warning("%s adapter failed: %s", adapter_name, adapter_error)
+                    LOGGER.warning("%s adapter failed to dispatch: %s", adapter_name, adapter_error)
             status = 200
             self.send_json(status, {"ok": True, "file": os.path.basename(path_out)})
         finally:
