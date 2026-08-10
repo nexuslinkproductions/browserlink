@@ -214,8 +214,93 @@ function dispatchAdapter(
 
 export type HubServer = http.Server & { port: number };
 
-export function createHub(port = 0): HubServer {
+export type FetchLike = typeof fetch;
+
+export type HubSessionSummary = {
+  id: string;
+  title: string | null;
+  preview: string | null;
+  updatedAt: string | null;
+};
+
+export type ProxySessionsResult =
+  | { ok: true; sessions: HubSessionSummary[] }
+  | { ok: false; status: number; error: string };
+
+/**
+ * Proxy Hermes GET /api/sessions into a hub-friendly list.
+ * Requires HERMES_API_URL + HERMES_API_KEY (else 503).
+ * fetchImpl is injectable for unit tests.
+ */
+export async function proxyHermesSessions(
+  fetchImpl: FetchLike = fetch,
+): Promise<ProxySessionsResult> {
+  const apiUrl = process.env.HERMES_API_URL;
+  const apiKey = process.env.HERMES_API_KEY;
+  if (!(apiUrl && apiKey)) {
+    return { ok: false, status: 503, error: "adapter not configured" };
+  }
+
+  const endpoint = `${String(apiUrl).replace(/\/+$/, "")}/api/sessions`;
+  try {
+    const response = await fetchImpl(endpoint, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+      },
+    });
+    if (!(response.status >= 200 && response.status < 300)) {
+      return {
+        ok: false,
+        status: 502,
+        error: `upstream status ${response.status}`,
+      };
+    }
+    const raw = (await response.json()) as unknown;
+    const data =
+      raw &&
+      typeof raw === "object" &&
+      !Array.isArray(raw) &&
+      Array.isArray((raw as JsonObject).data)
+        ? ((raw as JsonObject).data as unknown[])
+        : Array.isArray(raw)
+          ? raw
+          : [];
+    const sessions: HubSessionSummary[] = [];
+    for (const item of data) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const row = item as JsonObject;
+      if (typeof row.id !== "string" || !row.id) continue;
+      sessions.push({
+        id: row.id,
+        title: typeof row.title === "string" ? row.title : null,
+        preview: typeof row.preview === "string" ? row.preview : null,
+        updatedAt:
+          typeof row.last_active === "string"
+            ? row.last_active
+            : row.last_active == null
+              ? null
+              : String(row.last_active),
+      });
+    }
+    return { ok: true, sessions };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 502,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export type CreateHubOptions = {
+  fetchImpl?: FetchLike;
+};
+
+export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
   reloadAdapters();
+  const fetchImpl = options.fetchImpl ?? fetch;
 
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? "GET";
@@ -233,6 +318,15 @@ export function createHub(port = 0): HubServer {
       }
       if (pathname === "/status") {
         sendJson(res, 200, statusPayload());
+        return;
+      }
+      if (pathname === "/sessions") {
+        const result = await proxyHermesSessions(fetchImpl);
+        if (!result.ok) {
+          sendJson(res, result.status, { error: result.error });
+          return;
+        }
+        sendJson(res, 200, { sessions: result.sessions });
         return;
       }
       if (pathname === "/target") {

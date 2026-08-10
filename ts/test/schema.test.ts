@@ -39,6 +39,34 @@ describe("validatePayload", () => {
     );
   });
 
+  it("accepts optional sessionId and trims it", () => {
+    const p = payload();
+    p.sessionId = "  sess-picker-1  ";
+    assert.equal(validatePayload(p), null);
+    assert.equal(p.sessionId, "sess-picker-1");
+  });
+
+  it("rejects overlong sessionId", () => {
+    assert.equal(
+      validatePayload({ ...payload(), sessionId: "s".repeat(201) }),
+      "sessionId must be at most 200 characters",
+    );
+  });
+
+  it("rejects empty/whitespace sessionId", () => {
+    assert.equal(
+      validatePayload({ ...payload(), sessionId: "   " }),
+      "sessionId must be a non-empty string",
+    );
+  });
+
+  it("rejects non-string sessionId", () => {
+    assert.equal(
+      validatePayload({ ...payload(), sessionId: 123 }),
+      "sessionId must be a string",
+    );
+  });
+
   it("accepts all allowed edit keys and string values", () => {
     const p = payload();
     p.elements = [

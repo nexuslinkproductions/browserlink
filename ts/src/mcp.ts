@@ -190,6 +190,8 @@ export async function annotationsWatch(seconds = 10): Promise<string[]> {
   return after.reverse();
 }
 
+// Popup session picker and browserlink_connect both write target.json;
+// last writer wins.
 export async function browserlinkConnect(
   sessionId: string,
   label = "",

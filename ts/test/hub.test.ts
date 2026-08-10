@@ -10,10 +10,11 @@ import {
   createHubServer,
   dataDir,
   isSafeName,
+  proxyHermesSessions,
   reloadAdapters,
   storeAnnotation,
 } from "../src/hub.ts";
-import { formatMessage } from "../src/adapters/hermes.ts";
+import { formatMessage, resolveSessionId } from "../src/adapters/hermes.ts";
 
 const TINY_PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -245,6 +246,179 @@ describe("hermes message format", () => {
         ),
       );
       assert.ok(msg.includes("1 stroke(s)"));
+    });
+  });
+});
+
+describe("resolveSessionId priority", () => {
+  test("annotation > target.json > env > null", async () => {
+    await withTempDataDir(async (dir) => {
+      const prevEnv = process.env.HERMES_SESSION_ID;
+      try {
+        delete process.env.HERMES_SESSION_ID;
+        assert.equal(resolveSessionId(), null);
+        assert.equal(resolveSessionId({}), null);
+
+        process.env.HERMES_SESSION_ID = "env-sess";
+        assert.equal(resolveSessionId(), "env-sess");
+
+        await writeFile(
+          path.join(dir, "target.json"),
+          JSON.stringify({ sessionId: "target-sess", label: "t", ts: 1, activate: false }),
+        );
+        assert.equal(resolveSessionId(), "target-sess");
+        assert.equal(resolveSessionId({ sessionId: "ann-sess" }), "ann-sess");
+        assert.equal(resolveSessionId({ sessionId: "  ann-trim  " }), "ann-trim");
+        // Empty / whitespace annotation sessionId falls through.
+        assert.equal(resolveSessionId({ sessionId: "   " }), "target-sess");
+        // Overlong annotation sessionId is ignored (falls through).
+        assert.equal(resolveSessionId({ sessionId: "x".repeat(201) }), "target-sess");
+      } finally {
+        if (prevEnv === undefined) delete process.env.HERMES_SESSION_ID;
+        else process.env.HERMES_SESSION_ID = prevEnv;
+      }
+    });
+  });
+});
+
+describe("GET /sessions proxy", () => {
+  test("503 when adapter env missing", async () => {
+    const prevUrl = process.env.HERMES_API_URL;
+    const prevKey = process.env.HERMES_API_KEY;
+    try {
+      delete process.env.HERMES_API_URL;
+      delete process.env.HERMES_API_KEY;
+      const result = await proxyHermesSessions(async () => {
+        throw new Error("fetch should not be called");
+      });
+      assert.deepEqual(result, {
+        ok: false,
+        status: 503,
+        error: "adapter not configured",
+      });
+    } finally {
+      if (prevUrl === undefined) delete process.env.HERMES_API_URL;
+      else process.env.HERMES_API_URL = prevUrl;
+      if (prevKey === undefined) delete process.env.HERMES_API_KEY;
+      else process.env.HERMES_API_KEY = prevKey;
+    }
+  });
+
+  test("normalizes Hermes list and maps last_active to updatedAt", async () => {
+    const prevUrl = process.env.HERMES_API_URL;
+    const prevKey = process.env.HERMES_API_KEY;
+    process.env.HERMES_API_URL = "http://hermes.test";
+    process.env.HERMES_API_KEY = "test-key";
+    try {
+      const result = await proxyHermesSessions(async (url, init) => {
+        assert.equal(String(url), "http://hermes.test/api/sessions");
+        assert.equal((init?.headers as Record<string, string>).Authorization, "Bearer test-key");
+        return new Response(
+          JSON.stringify({
+            object: "list",
+            data: [
+              {
+                id: "s1",
+                title: "Chat One",
+                preview: "hello",
+                last_active: "2026-08-10T12:00:00Z",
+              },
+              { id: "s2", title: null, preview: null, last_active: null },
+              { id: 99, title: "bad" },
+            ],
+            limit: 50,
+            offset: 0,
+            has_more: false,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      });
+      assert.equal(result.ok, true);
+      if (result.ok) {
+        assert.deepEqual(result.sessions, [
+          {
+            id: "s1",
+            title: "Chat One",
+            preview: "hello",
+            updatedAt: "2026-08-10T12:00:00Z",
+          },
+          { id: "s2", title: null, preview: null, updatedAt: null },
+        ]);
+      }
+    } finally {
+      if (prevUrl === undefined) delete process.env.HERMES_API_URL;
+      else process.env.HERMES_API_URL = prevUrl;
+      if (prevKey === undefined) delete process.env.HERMES_API_KEY;
+      else process.env.HERMES_API_KEY = prevKey;
+    }
+  });
+
+  test("502 on non-2xx upstream and on fetch failure", async () => {
+    const prevUrl = process.env.HERMES_API_URL;
+    const prevKey = process.env.HERMES_API_KEY;
+    process.env.HERMES_API_URL = "http://hermes.test/";
+    process.env.HERMES_API_KEY = "test-key";
+    try {
+      let result = await proxyHermesSessions(async () =>
+        new Response("nope", { status: 401 }),
+      );
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.status, 502);
+        assert.match(result.error, /upstream status 401/);
+      }
+
+      result = await proxyHermesSessions(async () => {
+        throw new Error("network down");
+      });
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.status, 502);
+        assert.match(result.error, /network down/);
+      }
+    } finally {
+      if (prevUrl === undefined) delete process.env.HERMES_API_URL;
+      else process.env.HERMES_API_URL = prevUrl;
+      if (prevKey === undefined) delete process.env.HERMES_API_KEY;
+      else process.env.HERMES_API_KEY = prevKey;
+    }
+  });
+
+  test("HTTP GET /sessions returns normalized JSON with CORS", async () => {
+    const prevUrl = process.env.HERMES_API_URL;
+    const prevKey = process.env.HERMES_API_KEY;
+    await withTempDataDir(async () => {
+      process.env.HERMES_API_URL = "http://hermes.test";
+      process.env.HERMES_API_KEY = "k";
+      const fetchImpl: typeof fetch = async () =>
+        new Response(
+          JSON.stringify({
+            object: "list",
+            data: [{ id: "live-1", title: "T", preview: "p", last_active: "t1" }],
+          }),
+          { status: 200 },
+        );
+      const { createHub } = await import("../src/hub.ts");
+      const server = createHub(0, { fetchImpl });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const { port } = server.address() as AddressInfo;
+        const res = await fetch(`http://127.0.0.1:${port}/sessions`);
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("access-control-allow-origin"), "*");
+        const json = await res.json();
+        assert.deepEqual(json, {
+          sessions: [{ id: "live-1", title: "T", preview: "p", updatedAt: "t1" }],
+        });
+      } finally {
+        await new Promise<void>((resolve, reject) => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        });
+        if (prevUrl === undefined) delete process.env.HERMES_API_URL;
+        else process.env.HERMES_API_URL = prevUrl;
+        if (prevKey === undefined) delete process.env.HERMES_API_KEY;
+        else process.env.HERMES_API_KEY = prevKey;
+      }
     });
   });
 });

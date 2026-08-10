@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Browserlink \u2014 Browser Annotate & Connect",
-  "version": "1.6.3",
+  "version": "1.7.0",
   "description": "Annotate any page with strokes and numbered element markers, delivered to any AI harness via your local hub.",
   "action": {
     "default_popup": "popup.html",

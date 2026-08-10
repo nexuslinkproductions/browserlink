@@ -35,8 +35,19 @@ function readTargetSessionId(): string | null {
   }
 }
 
-function resolveSessionId(): string | null {
-  // target.json sessionId wins over HERMES_SESSION_ID env (target-over-env).
+/**
+ * Resolve delivery session id.
+ * Priority: annotation.sessionId > target.json > HERMES_SESSION_ID env > null.
+ * Exported for unit tests.
+ */
+export function resolveSessionId(annotation?: JsonObject | null): string | null {
+  if (annotation && typeof annotation === "object" && !Array.isArray(annotation)) {
+    const annSid = annotation.sessionId;
+    if (typeof annSid === "string") {
+      const trimmed = annSid.trim();
+      if (trimmed && trimmed.length <= 200) return trimmed;
+    }
+  }
   const targetSid = readTargetSessionId();
   if (targetSid) return targetSid;
   const envSid = process.env.HERMES_SESSION_ID;
@@ -206,10 +217,10 @@ export async function register(
   const apiKey = process.env.HERMES_API_KEY;
   if (!(apiUrl && apiKey)) return;
 
-  const sessionId = resolveSessionId();
+  const sessionId = resolveSessionId(annotation);
   if (!sessionId) {
     console.info(
-      "Hermes adapter: no sessionId in target.json or HERMES_SESSION_ID; skipping delivery",
+      "Hermes adapter: no sessionId in annotation, target.json, or HERMES_SESSION_ID; skipping delivery",
     );
     return;
   }

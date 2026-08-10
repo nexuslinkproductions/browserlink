@@ -116,6 +116,27 @@
     background: rgba(255, 255, 255, 0.08);
   }
   button.mini:hover { background: rgba(255, 255, 255, 0.16); }
+  select {
+    flex: 1;
+    width: 100%;
+    padding: 7px 9px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.05);
+    color: #e8eaed;
+    font: inherit;
+  }
+  select:focus {
+    outline: none;
+    border-color: #4a9eff;
+  }
+  .hint {
+    margin: -6px 0 12px;
+    font-size: 11px;
+    color: #9aa0a6;
+    min-height: 14px;
+  }
+  .hint.err { color: #ff5252; }
   .result {
     min-height: 18px;
     margin-top: 10px;
@@ -140,6 +161,16 @@
     <button id="refreshStatus" type="button" class="mini"
             title="Re-check hub connection">Check</button>
   </div>
+
+  <label for="sessionSelect">Delivery session</label>
+  <div class="row">
+    <select id="sessionSelect">
+      <option value="">Select session...</option>
+    </select>
+    <button id="refreshSessions" type="button" class="mini"
+            title="Reload sessions from hub">Refresh</button>
+  </div>
+  <div id="sessionStatus" class="hint"></div>
 
   <label for="endpointInput">Hub endpoint</label>
   <input id="endpointInput" type="text"
