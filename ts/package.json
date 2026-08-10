@@ -1,0 +1,31 @@
+{
+  "name": "browserlink-mcp",
+  "version": "2.0.0",
+  "description": "TypeScript MCP server and hub for Browserlink annotations",
+  "type": "module",
+  "main": "dist/mcp.js",
+  "bin": {
+    "browserlink-mcp": "dist/cli-mcp.js",
+    "browserlink-hub": "dist/cli-hub.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^7.0.2"
+  }
+}

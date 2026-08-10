@@ -82,6 +82,32 @@ What happens next:
 Disconnect with `browserlink_disconnect()`. Check with `browserlink_status()`.
 See [MCP tools](docs/mcp.md) for Claude Code and Hermes setup examples.
 
+## TypeScript quickstart (v2)
+
+The Node/TypeScript hub and MCP server ship as `browserlink-mcp` (Node 22+).
+They speak the same REST contract and MCP tool names as the Python path.
+
+```bash
+# Hub (localhost, port 8787 by default)
+npx browserlink-hub
+# or: npm install -g browserlink-mcp && browserlink-hub
+
+# MCP server (stdio) for any MCP client
+npx browserlink-mcp
+# or: npm install -g browserlink-mcp && browserlink-mcp
+```
+
+Example MCP client config:
+
+```json
+{ "mcpServers": { "browserlink": { "command": "npx", "args": ["browserlink-mcp"] } } }
+```
+
+Override the hub URL with `BROWSERLINK_HUB_URL` (default
+`http://127.0.0.1:8787`). Data dir resolution matches Python:
+`BROWSERLINK_DATA_DIR`, else `HERMES_HOME/annotations`, else
+`~/.browserlink/annotations`.
+
 ## Features
 
 - **Draw annotations** - circles, arrows, scribbles; normalized coordinates

@@ -4,6 +4,27 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [2.0.0] - 2026-08-10
+
+### Added
+
+- **TypeScript hub + MCP** - Node 22 package `browserlink-mcp` with bins
+  `browserlink-hub` and `browserlink-mcp`; shared schema module; same REST
+  contract, data-dir resolution, env vars, and MCP tool names as the Python
+  path (`hub_status`, `annotations_list`, `annotations_latest`,
+  `annotations_get`, `annotations_watch`, `browserlink_connect`,
+  `browserlink_disconnect`, `browserlink_status`)
+- **CI** - Node job under `ts/`: `npm ci`, `tsc --noEmit`, and
+  `node --test` for the TypeScript suite
+- **Docs** - README TypeScript quickstart (`npx browserlink-hub` /
+  `npx browserlink-mcp` or global install)
+
+### Notes
+
+- Python `server/` and `mcp/` remain the legacy path for this release; the
+  TypeScript stack is drop-in compatible and intended to become the default
+  after production soak.
+
 ## [1.6.0] - 2026-08-10
 
 ### Added
