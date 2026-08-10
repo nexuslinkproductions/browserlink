@@ -44,6 +44,8 @@ export interface AnnotationPayload {
   title?: string;
   viewport: { w: number; h: number };
   label?: string;
+  /** Optional per-annotation Hermes session override (max 200 chars). */
+  sessionId?: string;
   strokes: Array<{
     color: string;
     width: number;
@@ -255,6 +257,22 @@ export function validatePayload(payload: unknown): string | null {
     if (label.length > 200) {
       return "label must be at most 200 characters";
     }
+  }
+
+  if ("sessionId" in obj) {
+    const sessionId = obj.sessionId;
+    if (typeof sessionId !== "string") {
+      return "sessionId must be a string";
+    }
+    const trimmed = sessionId.trim();
+    if (!trimmed) {
+      return "sessionId must be a non-empty string";
+    }
+    if (trimmed.length > 200) {
+      return "sessionId must be at most 200 characters";
+    }
+    // Normalize to trimmed form for adapters / stored annotations.
+    obj.sessionId = trimmed;
   }
 
   if ("screenshot" in obj) {

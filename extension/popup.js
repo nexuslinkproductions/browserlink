@@ -7,6 +7,9 @@
  *     <endpoint>/health); refreshed on open and on demand (Check button /
  *     after saving an endpoint). Also GETs /target to show
  *     "Delivered to: <label|sessionId|not connected>".
+ *   - Session picker: GETs /sessions, lists options (title|preview|id),
+ *     preselects the current /target sessionId; on change POSTs /target
+ *     {sessionId, label, activate:false}. Refresh reloads the list.
  *   - Context label: persisted via chrome.storage.local ("contextLabel"),
  *     merged into payload.label at send time by content.js.
  *   - Master switch ("Tool active"): persisted via chrome.storage.local
@@ -36,6 +39,128 @@ function deliveredText(target) {
   return 'Delivered to: not connected';
 }
 
+function setSessionStatus(text, isErr) {
+  const el = $('sessionStatus');
+  el.textContent = text || '';
+  el.className = isErr ? 'hint err' : 'hint';
+}
+
+function sessionOptionLabel(session) {
+  if (!session || typeof session !== 'object') return '';
+  const title = session.title ? String(session.title).trim() : '';
+  if (title) return title;
+  const preview = session.preview ? String(session.preview).trim() : '';
+  if (preview) return preview;
+  return session.id ? String(session.id) : '';
+}
+
+function updateDeliveredLine(hubLine, hubCls, target) {
+  const delivered = deliveredText(target);
+  setHubStatus(hubLine + ' · ' + delivered, hubCls);
+}
+
+/* Populate session <select> from GET /sessions; preselect currentTargetId. */
+async function loadSessions(currentTargetId) {
+  const select = $('sessionSelect');
+  const endpoint = ($('endpointInput').value || '').trim() || DEFAULT_ENDPOINT;
+  setSessionStatus('Loading sessions...', false);
+
+  // Reset to placeholder while loading.
+  select.innerHTML = '';
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'Select session...';
+  select.appendChild(placeholder);
+
+  try {
+    const res = await fetch(endpoint + '/sessions');
+    if (res.status === 404) {
+      setSessionStatus('Sessions endpoint not found (404).', true);
+      return;
+    }
+    if (res.status === 503) {
+      setSessionStatus('Hub unavailable (503).', true);
+      return;
+    }
+    if (!res.ok) {
+      setSessionStatus('Failed to load sessions (' + res.status + ').', true);
+      return;
+    }
+
+    const body = await res.json();
+    const sessions = (body && Array.isArray(body.sessions)) ? body.sessions : [];
+    if (sessions.length === 0) {
+      setSessionStatus('No sessions available.', false);
+      return;
+    }
+
+    let matched = false;
+    for (let i = 0; i < sessions.length; i++) {
+      const s = sessions[i];
+      if (!s || !s.id) continue;
+      const opt = document.createElement('option');
+      opt.value = String(s.id);
+      opt.textContent = sessionOptionLabel(s) || String(s.id);
+      opt.dataset.label = sessionOptionLabel(s) || String(s.id);
+      if (currentTargetId && String(s.id) === String(currentTargetId)) {
+        opt.selected = true;
+        matched = true;
+      }
+      select.appendChild(opt);
+    }
+
+    if (currentTargetId && !matched) {
+      // Target session not in list: keep placeholder selected.
+      select.value = '';
+      setSessionStatus('Current target not in session list.', false);
+    } else {
+      setSessionStatus('', false);
+    }
+  } catch (_) {
+    setSessionStatus('Could not reach hub /sessions.', true);
+  }
+}
+
+/* On select change: POST /target and refresh delivered line. */
+async function onSessionChange() {
+  const select = $('sessionSelect');
+  const sessionId = (select.value || '').trim();
+  if (!sessionId) return;
+
+  const selected = select.options[select.selectedIndex];
+  const label = (selected && selected.dataset.label)
+    ? selected.dataset.label
+    : (selected ? selected.textContent : sessionId);
+  const endpoint = ($('endpointInput').value || '').trim() || DEFAULT_ENDPOINT;
+
+  setSessionStatus('Setting target...', false);
+  try {
+    const res = await fetch(endpoint + '/target', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: sessionId, label: label, activate: false }),
+    });
+    if (!res.ok) {
+      setSessionStatus('Failed to set target (' + res.status + ').', true);
+      return;
+    }
+    let body = null;
+    try { body = await res.json(); } catch (_) { body = null; }
+    const target = (body && typeof body === 'object')
+      ? body
+      : { sessionId: sessionId, label: label };
+    // Preserve current hub status class/prefix from the status element.
+    const hubEl = $('hubStatus');
+    const hubCls = hubEl.classList.contains('ok') ? 'ok'
+      : (hubEl.classList.contains('err') ? 'err' : '');
+    const hubLine = hubEl.classList.contains('ok') ? 'Hub: connected ✓' : 'Hub: offline';
+    updateDeliveredLine(hubLine, hubCls, target);
+    setSessionStatus('', false);
+  } catch (_) {
+    setSessionStatus('Could not set target.', true);
+  }
+}
+
 /* hub health via the service worker (endpoint is resolved there) */
 async function checkHub() {
   setHubStatus('Hub: checking…', '');
@@ -50,12 +175,13 @@ async function checkHub() {
   } catch (_) { /* offline */ }
 
   let delivered = 'Delivered to: not connected';
+  let targetBody = null;
   try {
     const endpoint = ($('endpointInput').value || '').trim() || DEFAULT_ENDPOINT;
     const res = await fetch(endpoint + '/target');
     if (res.ok) {
-      const body = await res.json();
-      delivered = deliveredText(body);
+      targetBody = await res.json();
+      delivered = deliveredText(targetBody);
     } else if (res.status === 404) {
       delivered = 'Delivered to: not connected';
     }
@@ -63,6 +189,19 @@ async function checkHub() {
     delivered = 'Delivered to: not connected';
   }
   setHubStatus(hubLine + ' · ' + delivered, hubCls);
+
+  // After a successful /target fetch, load sessions and preselect.
+  if (targetBody) {
+    const currentId = targetBody.sessionId
+      ? String(targetBody.sessionId).trim()
+      : '';
+    await loadSessions(currentId);
+  } else if (hubCls === 'ok') {
+    // Hub is up but no target yet; still list sessions.
+    await loadSessions('');
+  } else {
+    setSessionStatus('Hub offline; sessions unavailable.', true);
+  }
 }
 
 /* hub endpoint persistence */
@@ -176,6 +315,11 @@ async function sendTest() {
 $('toolToggle').addEventListener('change', onToolToggle);
 $('saveEndpoint').addEventListener('click', saveEndpoint);
 $('refreshStatus').addEventListener('click', checkHub);
+$('refreshSessions').addEventListener('click', () => {
+  // Re-run full hub check so /target preselect stays in sync.
+  checkHub();
+});
+$('sessionSelect').addEventListener('change', onSessionChange);
 $('contextLabel').addEventListener('input', saveLabel);
 $('sendTest').addEventListener('click', sendTest);
 checkHub();

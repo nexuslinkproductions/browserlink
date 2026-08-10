@@ -4,6 +4,16 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [2.2.0] - 2026-08-10
+
+### Added
+
+- **Session picker** - the extension popup now lists active Hermes sessions
+  (title, preview, last activity) and lets you choose where annotations are
+  delivered; the hub proxies the Hermes session list (`GET /sessions`) and
+  the adapter resolves the target per annotation, then the stored target,
+  then the environment pin
+
 ## [2.1.0] - 2026-08-10
 
 ### Removed
