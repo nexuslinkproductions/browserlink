@@ -80,7 +80,7 @@ async function startTempHub(dataDir: string): Promise<{
     if (method === "GET" && pathname === "/status") {
       sendJson(res, 200, {
         ok: true,
-        version: "2.0.0",
+        version: "2.2.0",
         dataDir,
         adapters: [],
         target: target
@@ -177,7 +177,7 @@ describe("mcp annotation tools", () => {
 
       const status = await hubStatus();
       assert.equal(status.ok, true);
-      assert.equal(status.version, "2.0.0");
+      assert.equal(status.version, "2.2.0");
       assert.equal(status.dataDir, dir);
       assert.deepEqual(status.adapters, []);
 
