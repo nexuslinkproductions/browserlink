@@ -9,7 +9,7 @@
 [![MCP](https://img.shields.io/badge/MCP-server-ffd166.svg)](docs/mcp.md)
 [![Chromium](https://img.shields.io/badge/Chromium-MV3-ff5252.svg)](extension/manifest.json)
 
-![browserlink social preview](docs/social-preview.png)
+![Browserlink social preview](assets/browserlink-social-preview.png)
 
 browserlink is a harness-agnostic annotation link between your browser and
 your AI coding tools. Draw on a page, pick elements DevTools-style, type your
