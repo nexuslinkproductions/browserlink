@@ -4,6 +4,15 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [1.6.2] - 2026-08-10
+
+### Fixed
+
+- **Element-only screenshots** - the service worker now crops the captured
+  tab to the selected element(s) rect (dpr-scaled) instead of sending the
+  full screen, and the content script hides the tool overlay during capture
+  so the toolbar, inspector, and markers never appear in the shot
+
 ## [2.0.2] - 2026-08-10
 
 ### Fixed
