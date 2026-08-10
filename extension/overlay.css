@@ -504,3 +504,339 @@
 .comet-insp-send {
   align-self: flex-end;
 }
+
+/* ---- v1.4 motion + multi-selection UI ----
+ * Every moving property below is transform and/or opacity. Positioning and
+ * sizing of the picker overlays are updated by content.js from live rects;
+ * the page layout itself is never animated. */
+#hermes-annotate-host {
+  transition: transform 180ms ease-out, opacity 180ms ease-out;
+}
+#hermes-annotate-host.is-entering {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+#hermes-annotate-host.is-entered {
+  opacity: 1;
+  transform: translateY(0);
+}
+#hermes-annotate-host.is-exiting {
+  opacity: 0;
+  transform: scale(0.95);
+  transition-duration: 120ms;
+}
+
+.comet-toolbar,
+.comet-chip,
+.comet-btn,
+.comet-swatch,
+.comet-width,
+.comet-drag,
+.comet-insp-reset,
+.comet-insp-reset-all,
+.comet-selection-main,
+.comet-selection-remove,
+.comet-send {
+  transition: transform 120ms ease-out, opacity 120ms ease-out;
+}
+.comet-btn:hover,
+.comet-swatch:hover,
+.comet-width:hover,
+.comet-selection-main:hover,
+.comet-selection-remove:hover {
+  transform: scale(1.08);
+}
+.comet-btn:active,
+.comet-swatch:active,
+.comet-width:active,
+.comet-send:active,
+.comet-selection-main:active,
+.comet-selection-remove:active,
+.comet-send.send-press {
+  transform: scale(0.94);
+}
+
+/* Sliding pill mode switch. The buttons retain their old data-act hooks. */
+.comet-mode-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 7px;
+  padding: 2px;
+  isolation: isolate;
+}
+.comet-mode-pill {
+  position: absolute;
+  z-index: -1;
+  inset: 2px auto 2px 2px;
+  width: calc(50% - 2px);
+  border-radius: 5px;
+  background: #4a9eff;
+  transform: translateX(0);
+  transition: transform 180ms ease-out, opacity 180ms ease-out;
+}
+.comet-mode-btn {
+  position: relative;
+  z-index: 1;
+  border-color: transparent;
+  background: transparent;
+  padding: 3px 8px;
+}
+.comet-mode-btn.active {
+  background: transparent;
+  border-color: transparent;
+  color: #ffffff;
+}
+
+/* Toolbar collapse, chip bounce, and drag shadow lift. */
+.comet-toolbar.is-collapsing {
+  transform: scale(0.9);
+  opacity: 0;
+  transition-duration: 200ms;
+}
+.comet-toolbar.is-restoring {
+  animation: bl-toolbar-in 200ms ease-out both;
+}
+.comet-chip.is-chip-enter {
+  animation: bl-chip-pop 200ms ease-out both;
+}
+.comet-chip-dot {
+  animation: bl-chip-breathe 3s ease-in-out infinite;
+}
+.comet-drag.dragging,
+.comet-chip.dragging {
+  transform: scale(1.02);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+}
+
+/* Inspector entrance and its 30ms staggered rows. */
+.comet-inspector {
+  opacity: 0;
+  transform: translateY(-8px);
+  transition: transform 200ms ease-out, opacity 200ms ease-out;
+}
+.comet-inspector.is-open {
+  opacity: 1;
+  transform: translateY(0);
+}
+.comet-insp-row {
+  position: relative;
+  animation: bl-row-in 240ms ease-out var(--row-delay, 0ms) both;
+}
+.comet-insp-row::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: rgba(74, 158, 255, 0.14);
+  opacity: 0;
+  pointer-events: none;
+}
+.comet-insp-row.edited::after {
+  opacity: 0.35;
+}
+.comet-insp-row.edited-pulse::after {
+  animation: bl-edited-glow 400ms ease-out both;
+}
+.comet-insp-row.reset-flash {
+  animation: bl-reset-flash 200ms ease-out both;
+}
+.comet-insp-val.value-tick {
+  animation: bl-value-tick 100ms ease-out both;
+}
+
+/* Selection badge/list and deselection fade. */
+.comet-selection-head {
+  display: flex;
+  align-items: center;
+  min-height: 18px;
+}
+.comet-selection-count {
+  color: var(--bl-text, #e8eaed);
+  font-size: 11px;
+  font-weight: 600;
+  transform-origin: left center;
+}
+.comet-selection-count.selection-pop {
+  animation: bl-selection-pop 150ms ease-out both;
+}
+.comet-selection-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 116px;
+  overflow-y: auto;
+}
+.comet-selection-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  animation: bl-row-in 200ms ease-out var(--row-delay, 0ms) both;
+}
+.comet-selection-row.active {
+  background: rgba(74, 158, 255, 0.1);
+  border-radius: 5px;
+}
+.comet-selection-main {
+  appearance: none;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  border: 0;
+  border-radius: 5px;
+  padding: 3px 5px;
+  background: transparent;
+  color: var(--bl-text, #e8eaed);
+  font: 11px/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.comet-selection-remove {
+  appearance: none;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 50%;
+  padding: 1px 5px;
+  background: transparent;
+  color: var(--bl-muted, #9aa0a6);
+  cursor: pointer;
+  font: 14px/1 system-ui, sans-serif;
+}
+.comet-selection-remove:hover {
+  color: var(--bl-err, #ff5252);
+}
+.comet-selection-row.is-removing {
+  animation: bl-row-remove 120ms ease-out both;
+  pointer-events: none;
+}
+.comet-el-badge {
+  animation: bl-marker-pop 150ms ease-out both;
+}
+.comet-el.is-removing {
+  animation: bl-marker-remove 100ms ease-out both;
+}
+
+/* Send feedback and the transient Sent toast. */
+.comet-send {
+  position: relative;
+  overflow: hidden;
+}
+.comet-send.send-success::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: rgba(144, 255, 168, 0.75);
+  pointer-events: none;
+  animation: bl-success-flash 400ms ease-out both;
+}
+.comet-send.send-error {
+  animation: bl-send-error 300ms ease-out both;
+}
+.comet-toast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483647;
+  padding: 7px 11px;
+  border: 1px solid rgba(53, 199, 89, 0.5);
+  border-radius: 7px;
+  background: rgba(16, 18, 24, 0.95);
+  color: #7ff095;
+  font: 12px/1.2 system-ui, -apple-system, sans-serif;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(8px);
+  transition: transform 150ms ease-out, opacity 150ms ease-out;
+}
+.comet-toast[hidden] {
+  display: none;
+}
+.comet-toast.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+.comet-toast.leaving {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+@keyframes bl-toolbar-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes bl-chip-pop {
+  0% { opacity: 0; transform: scale(0.6); }
+  70% { opacity: 1; transform: scale(1.05); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes bl-chip-breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.03); }
+}
+@keyframes bl-row-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes bl-row-remove {
+  from { opacity: 1; transform: translateX(0); }
+  to { opacity: 0; transform: translateX(-6px); }
+}
+@keyframes bl-marker-pop {
+  0% { opacity: 0; transform: translate(-50%, -100%) scale(0.5); }
+  65% { opacity: 1; transform: translate(-50%, -100%) scale(1.1); }
+  100% { opacity: 1; transform: translate(-50%, -100%) scale(1); }
+}
+@keyframes bl-marker-remove {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(0.8); }
+}
+@keyframes bl-value-tick {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+@keyframes bl-edited-glow {
+  0% { opacity: 0; transform: scale(0.98); }
+  45% { opacity: 0.8; transform: scale(1.01); }
+  100% { opacity: 0; transform: scale(1); }
+}
+@keyframes bl-reset-flash {
+  0% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.7; transform: scale(1.015); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes bl-selection-pop {
+  0% { opacity: 0.6; transform: scale(0.5); }
+  65% { opacity: 1; transform: scale(1.1); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes bl-success-flash {
+  0% { opacity: 0.8; transform: scale(0.96); }
+  100% { opacity: 0; transform: scale(1); }
+}
+@keyframes bl-send-error {
+  0%, 100% { opacity: 1; transform: translateX(0); }
+  20% { opacity: 1; transform: translateX(-3px); }
+  40% { opacity: 1; transform: translateX(3px); }
+  60% { opacity: 1; transform: translateX(-3px); }
+  80% { opacity: 1; transform: translateX(3px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .comet-chip-dot,
+  .comet-el-badge,
+  .comet-insp-row,
+  .comet-selection-row {
+    animation: none !important;
+  }
+}

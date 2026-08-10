@@ -101,6 +101,12 @@ async function loadToolEnabled() {
     const got = await chrome.storage.local.get('toolEnabled');
     if (got && typeof got.toolEnabled === 'boolean') enabled = got.toolEnabled;
   } catch (_) { /* storage unavailable */ }
+  // Reflect the ACTIVE TAB's real state (the tool may have been closed via
+  // the toolbar's exit button, which does not touch toolEnabled).
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'browserlinkGetState' });
+    if (resp && resp.ok && typeof resp.enabled === 'boolean') enabled = resp.enabled;
+  } catch (_) { /* no receiver: keep the stored default */ }
   $('toolToggle').checked = enabled;
 }
 
@@ -112,6 +118,16 @@ function onToolToggle() {
     : { type: 'browserlinkExit' };
   // The service worker forwards this to the active tab's content script.
   chrome.runtime.sendMessage(msg).catch(() => { /* no receiver */ });
+  // Re-query the real state shortly after (the content script may be
+  // mid-exit-animation); keep the switch honest.
+  setTimeout(async () => {
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: 'browserlinkGetState' });
+      if (resp && resp.ok && typeof resp.enabled === 'boolean') {
+        $('toolToggle').checked = resp.enabled;
+      }
+    } catch (_) { /* no receiver */ }
+  }, 250);
 }
 
 /* send test annotation */

@@ -199,3 +199,60 @@ def test_status_includes_target(hub_server):
     status, body = hub_server("GET", "/status")
     assert status == 200
     assert body["target"] == {"sessionId": "s1", "label": "L"}
+
+
+# --- screenshot attachment (v1.4) ---
+
+# 1x1 transparent PNG
+TINY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+TINY_PNG_DATA_URL = "data:image/png;base64," + TINY_PNG_B64
+
+
+def test_screenshot_stores_png_and_screenshot_file(data_dir):
+    p = payload()
+    p["screenshot"] = TINY_PNG_DATA_URL
+    assert hub.validate_payload(p) is None
+    path = hub.store_annotation(p)
+    stored = json.loads(path.read_text())
+    assert "screenshot" not in stored
+    assert "screenshotFile" in stored
+    png_name = stored["screenshotFile"]
+    assert png_name.endswith(".png")
+    png_path = path.parent / png_name
+    assert png_path.is_file()
+    assert png_path.stat().st_size > 0
+    # PNG magic bytes
+    assert png_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_screenshot_non_png_data_url_rejected():
+    p = payload()
+    p["screenshot"] = "data:image/jpeg;base64,/9j/4AAQ"
+    err = hub.validate_payload(p)
+    assert err is not None
+    assert "screenshot" in err
+
+
+def test_payload_without_screenshot_unchanged(data_dir):
+    p = payload()
+    assert "screenshot" not in p
+    assert hub.validate_payload(p) is None
+    path = hub.store_annotation(p)
+    stored = json.loads(path.read_text())
+    assert stored == p
+    assert "screenshotFile" not in stored
+    assert list(path.parent.glob("*.png")) == []
+
+
+def test_screenshot_via_http(hub_server, data_dir):
+    p = payload()
+    p["screenshot"] = TINY_PNG_DATA_URL
+    status, body = hub_server("POST", "/annotations", p)
+    assert status == 200
+    assert body["ok"] is True
+    name = body["file"]
+    stored = json.loads((data_dir / "annotations" / name).read_text())
+    assert "screenshotFile" in stored
+    assert (data_dir / "annotations" / stored["screenshotFile"]).is_file()

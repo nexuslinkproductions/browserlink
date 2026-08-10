@@ -90,36 +90,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'annotate') {
     if (!msg.payload || typeof msg.payload !== 'object') return false;
-    getEndpoint()
-      .then((endpoint) =>
-        fetch(endpoint + '/annotations', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(msg.payload),
-        })
-          .then(async (res) => {
-            let detail = '';
-            try {
-              const text = await res.text();
-              if (text) {
-                const body = JSON.parse(text);
-                if (body && body.error) detail = String(body.error);
-                else if (body && body.file) detail = String(body.file);
-              }
-            } catch (_) { /* non-JSON body */ }
-            if (res.ok) {
-              sendResponse({ ok: true });
-            } else {
-              sendResponse({ ok: false, error: detail || 'HTTP ' + res.status });
-            }
-          })
-          .catch((err) => {
-            sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
-          })
-      )
-      .catch((err) => {
-        sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
+    (async () => {
+      const payload = Object.assign({}, msg.payload);
+      // Capture visible tab when possible; never block annotation on failure.
+      try {
+        const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
+        if (typeof dataUrl === 'string' && dataUrl) {
+          payload.screenshot = dataUrl;
+        }
+      } catch (_) { /* proceed without screenshot */ }
+
+      const endpoint = await getEndpoint();
+      const res = await fetch(endpoint + '/annotations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       });
+      let detail = '';
+      try {
+        const text = await res.text();
+        if (text) {
+          const body = JSON.parse(text);
+          if (body && body.error) detail = String(body.error);
+          else if (body && body.file) detail = String(body.file);
+        }
+      } catch (_) { /* non-JSON body */ }
+      if (res.ok) {
+        sendResponse({ ok: true });
+      } else {
+        sendResponse({ ok: false, error: detail || 'HTTP ' + res.status });
+      }
+    })().catch((err) => {
+      sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
+    });
     return true; // keep the message channel open for the async sendResponse
   }
 
@@ -186,6 +189,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch((err) => {
         sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
       });
+    return true;
+  }
+
+  if (msg.type === 'browserlinkGetTabId') {
+    // The content script pings us to learn its own tab id (stable per-tab
+    // storage key). Answer with the sender's tab id.
+    try {
+      sendResponse({ ok: true, tabId: sender && sender.tab ? sender.tab.id : null });
+    } catch (_) { /* ok */ }
+    return false;
+  }
+
+  if (msg.type === 'browserlinkGetState') {
+    // Popup asks for the active tab's real tool state (enabled/closed).
+    chrome.tabs.query({ active: true, currentWindow: true })
+      .then((tabs) => {
+        const tab = tabs && tabs[0];
+        if (!tab || typeof tab.id !== 'number') {
+          sendResponse({ ok: true, enabled: false });
+          return;
+        }
+        return chrome.tabs.sendMessage(tab.id, { type: 'browserlinkGetState' })
+          .then((resp) => sendResponse({ ok: true, enabled: !!(resp && resp.enabled) }))
+          .catch(() => sendResponse({ ok: true, enabled: false }));
+      })
+      .catch(() => sendResponse({ ok: true, enabled: false }));
     return true;
   }
 

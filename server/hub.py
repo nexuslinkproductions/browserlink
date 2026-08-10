@@ -2,6 +2,7 @@
 """Local HTTP bridge for the Comet annotation extension."""
 
 import argparse
+import base64
 import json
 import logging
 import math
@@ -12,7 +13,7 @@ import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 from urllib.parse import urlsplit
 
 from adapters import hermes, webhook
@@ -25,6 +26,8 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 VERSION = "1.0.0"
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+SCREENSHOT_PREFIX = "data:image/png;base64,"
+MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024
 
 # Schema v1.1: allowed keys for elements[].edits (protocol, docs/protocol.md).
 ALLOWED_EDIT_KEYS = frozenset((
@@ -91,20 +94,64 @@ def clear_target() -> None:
         pass
 
 
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    directory = path.parent
+    os.makedirs(directory, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="wb", dir=str(directory),
+                                     prefix=".annotation-", suffix=".tmp", delete=False) as temp_file:
+        temp_path = temp_file.name
+        temp_file.write(data)
+        temp_file.flush()
+        os.fsync(temp_file.fileno())
+    os.replace(temp_path, str(path))
+
+
 def store_annotation(payload: Dict[str, Any]) -> Path:
+    """Persist annotation JSON; optional screenshot becomes a sibling PNG.
+
+    When payload contains a validated ``screenshot`` data URL, decode it to
+    ``<timestamp>.png`` beside the JSON and store ``screenshotFile`` instead of
+    the base64 blob. Payloads without ``screenshot`` are written unchanged.
+    """
     directory = annotations_dir()
     os.makedirs(directory, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+
+    stored: Dict[str, Any] = {key: value for key, value in payload.items() if key != "screenshot"}
+    screenshot = payload.get("screenshot")
+    if isinstance(screenshot, str) and screenshot.startswith(SCREENSHOT_PREFIX):
+        png_name = timestamp + ".png"
+        png_path = Path(directory) / png_name
+        raw = base64.b64decode(screenshot[len(SCREENSHOT_PREFIX):], validate=True)
+        atomic_write_bytes(png_path, raw)
+        stored["screenshotFile"] = png_name
+
     path = Path(directory) / (timestamp + ".json")
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
                                      prefix=".annotation-", suffix=".tmp", delete=False) as temp_file:
         temp_path = temp_file.name
-        json.dump(payload, temp_file, ensure_ascii=False, indent=2)
+        json.dump(stored, temp_file, ensure_ascii=False, indent=2)
         temp_file.write("\n")
         temp_file.flush()
         os.fsync(temp_file.fileno())
     os.replace(temp_path, str(path))
+
+    # Expose the on-disk shape to callers (e.g. adapters).
+    payload.clear()
+    payload.update(stored)
     return path
+
+
+def _dispatch_adapter(
+    register_fn: Callable[..., None],
+    annotation: Dict[str, Any],
+    path: Path,
+) -> None:
+    """Call adapter with annotation path when supported; else annotation only."""
+    try:
+        register_fn(annotation, str(path))
+    except TypeError:
+        register_fn(annotation)
 
 
 ADAPTERS = []
@@ -214,6 +261,20 @@ def validate_payload(payload: Any) -> Optional[str]:
             return "label must be a string"
         if len(label) > 200:
             return "label must be at most 200 characters"
+
+    # Schema v1.4: optional screenshot data URL (PNG base64).
+    if "screenshot" in payload:
+        screenshot = payload.get("screenshot")
+        if not isinstance(screenshot, str):
+            return "screenshot must be a string"
+        if not screenshot.startswith(SCREENSHOT_PREFIX):
+            return "screenshot must be a data:image/png;base64, data URL"
+        try:
+            raw = base64.b64decode(screenshot[len(SCREENSHOT_PREFIX):], validate=True)
+        except Exception:
+            return "screenshot must be valid base64 PNG data"
+        if len(raw) > MAX_SCREENSHOT_BYTES:
+            return "screenshot exceeds 10MB decoded size"
     return None
 
 
@@ -361,32 +422,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 status = 400
                 self.send_json(status, {"error": err})
                 return
+            assert isinstance(payload, dict)
             error = validate_payload(payload)
             if error is not None:
                 status = 400
                 self.send_json(status, {"error": error})
                 return
-            directory = annotations_dir()
-            os.makedirs(directory, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-            path_out = os.path.join(directory, timestamp + ".json")
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
-                                             prefix=".annotation-", suffix=".tmp", delete=False) as temp_file:
-                temp_path = temp_file.name
-                json.dump(payload, temp_file, ensure_ascii=False, indent=2)
-                temp_file.write("\n")
-                temp_file.flush()
-                os.fsync(temp_file.fileno())
-            os.replace(temp_path, path_out)
+            path_out = store_annotation(payload)
             for adapter_name, adapter_register in ADAPTERS:
                 try:
                     threading.Thread(
-                        target=adapter_register, args=(payload,), daemon=True
+                        target=_dispatch_adapter,
+                        args=(adapter_register, payload, path_out),
+                        daemon=True,
                     ).start()
                 except Exception as adapter_error:
                     LOGGER.warning("%s adapter failed to dispatch: %s", adapter_name, adapter_error)
             status = 200
-            self.send_json(status, {"ok": True, "file": os.path.basename(path_out)})
+            self.send_json(status, {"ok": True, "file": path_out.name})
         finally:
             print("POST %s %d" % (urlsplit(self.path).path, status), flush=True)
 
