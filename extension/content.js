@@ -1,4 +1,4 @@
-/* Browserlink — Browser Annotate & Connect — content script (MV3). SPEC v1.1.
+/* Browserlink — Browser Annotate & Connect — content script (MV3). SPEC v1.2.
  *
  * Attaches ONE closed ShadowRoot to document.documentElement containing:
  *   - a floating top-right toolbar [⏻ power | − collapse | ⋮⋮ drag handle |
@@ -21,15 +21,14 @@
  *     outlines + numbered badges
  *   - an instruction chat card (bottom-right of the viewport)
  *   - an element inspector panel (attached below the toolbar, Element mode):
- *     one row per property with the CURRENT computed value
- *     (width/height from getBoundingClientRect, px rounded; fontFamily,
- *     fontSize, fontWeight, lineHeight, color, display, margin, padding,
- *     borderRadius from getComputedStyle; text trimmed to 200 chars; href
- *     for anchors) plus a labeled read-only current value and an editable
- *     input per row. Edited rows get an accent marker; the footer shows
- *     "N edits" + the instruction textarea + Send. Send payload elements
- *     gain "edits": {property: desiredValue} (non-empty edits only). The
- *     panel closes on deselection, mode switch to Annotate, and exit/power.
+ *     one row per property with live manipulators (sliders/selects/color/
+ *     text) that write element.style (or textContent/href) immediately.
+ *     Original computed/inline values are tracked for per-row Reset and
+ *     panel "Reset all". Hover/focus on a row draws a property hint on the
+ *     overlay canvas. Edited rows get an accent marker; the footer shows
+ *     "N edits" + Reset all + the instruction textarea + Send. Send payload
+ *     elements gain "edits": {property: desiredValue} (non-empty edits only).
+ *     The panel closes on deselection, mode switch to Annotate, and exit/power.
  *
  * Modes:
  *   Annotate -> canvas pointer-events: all; pointerdown/move/up with
@@ -105,6 +104,15 @@
   // Element inspector: {el, descriptor} — descriptor is the object that
   // receives "edits" so committed elements keep their edits.
   const inspector = { el: null, descriptor: null };
+  // Per-property originals for Reset: Map<prop, {value, wasInline, kind}>
+  let inspectorOriginals = new Map();
+  // Persist originals per descriptor so reopen/reset survive live preview.
+  const originalsByDesc = new WeakMap();
+  // Active property-hint row (hover/focus) drawn on the overlay canvas.
+  let hintProp = null;
+  let hintRaf = 0;
+  let fontFamilyCache = null; // Promise<string[]> of available families
+  let inspResetAllBtn = null;
 
   // Selection awaiting Add/Cancel: {descriptor, el, isEdit, editIndex, outlineEl}
   let pending = null;
@@ -306,6 +314,8 @@
     }
     // Element selections are rendered as DOM outlines in the shadow root
     // (positioned from getBoundingClientRect) — not on this canvas.
+    // v1.2: property-affect hint overlays the strokes while a row is active.
+    drawPropertyHint();
   }
 
   /* ---------------- drawing (Annotate mode, v2, untouched) ---------------- */
@@ -482,6 +492,7 @@
   function repositionAll() {
     positionHover();
     positionSelections();
+    if (hintProp) scheduleRedraw();
   }
 
   // rAF loop while element mode is active: re-resolve the hovered element
@@ -632,35 +643,152 @@
     }
   }
 
-  /* ---------------- element inspector (v1.1) ---------------- */
-  // CURRENT computed values for the selected element, one row per property.
+  /* ---------------- element inspector (v1.2) ---------------- */
+  const SYSTEM_FONTS = [
+    'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'Helvetica', 'Arial',
+    'Georgia', 'Times New Roman', 'Courier New', 'Verdana', 'Tahoma',
+    'Trebuchet MS', 'Impact', 'Comic Sans MS', 'monospace', 'serif', 'sans-serif',
+  ];
+  const FONT_WEIGHTS = ['100', '200', '300', '400', '500', '600', '700', '800', '900'];
+  const DISPLAY_VALUES = ['block', 'inline', 'inline-block', 'flex', 'grid', 'none'];
+  const TEXT_HINT_PROPS = new Set(['fontSize', 'fontWeight', 'fontFamily', 'lineHeight', 'color']);
+  const UNDERLINE_HINT_PROPS = new Set(['text', 'href']);
+
+  function parsePx(v) {
+    const n = parseFloat(String(v));
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function parseLineHeight(v, fontSizePx) {
+    const s = String(v || '').trim();
+    if (!s || s === 'normal') return 1.2;
+    if (s.endsWith('px')) {
+      const px = parseFloat(s);
+      const fs = fontSizePx || 16;
+      return Number.isFinite(px) && fs > 0 ? Math.round((px / fs) * 100) / 100 : 1.2;
+    }
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : 1.2;
+  }
+
+  function rgbToHex(color) {
+    if (!color) return '#000000';
+    const s = String(color).trim();
+    if (s[0] === '#') {
+      if (s.length === 4) {
+        return ('#' + s[1] + s[1] + s[2] + s[2] + s[3] + s[3]).toLowerCase();
+      }
+      return s.slice(0, 7).toLowerCase();
+    }
+    const m = s.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (!m) return '#000000';
+    const hex = (n) => Math.max(0, Math.min(255, parseInt(n, 10))).toString(16).padStart(2, '0');
+    return '#' + hex(m[1]) + hex(m[2]) + hex(m[3]);
+  }
+
+  function firstFontFamily(v) {
+    if (!v) return 'sans-serif';
+    const part = String(v).split(',')[0].trim().replace(/^["']|["']$/g, '');
+    return part || 'sans-serif';
+  }
+
+  function mapFontWeight(v) {
+    const s = String(v || '').trim().toLowerCase();
+    if (s === 'normal') return '400';
+    if (s === 'bold') return '700';
+    const n = parseInt(s, 10);
+    if (!Number.isFinite(n)) return '400';
+    const nearest = FONT_WEIGHTS.reduce((best, w) =>
+      Math.abs(parseInt(w, 10) - n) < Math.abs(parseInt(best, 10) - n) ? w : best
+    , '400');
+    return nearest;
+  }
+
+  function stylePropName(prop) {
+    return prop; // camelCase matches CSSStyleDeclaration
+  }
+
+  function readInlineStyle(el, prop) {
+    try {
+      if (prop === 'text') return el.textContent || '';
+      if (prop === 'href') return el.getAttribute('href') || '';
+      return el.style.getPropertyValue(
+        prop.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase())
+      ) || el.style[prop] || '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  // CURRENT values + manipulator metadata for the selected element.
   function inspectorProps(el) {
     const out = [];
     let r = null;
     try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
-    if (r) {
-      out.push({ prop: 'width', current: Math.round(r.width) + 'px' });
-      out.push({ prop: 'height', current: Math.round(r.height) + 'px' });
-    }
     let cs = null;
     try { cs = getComputedStyle(el); } catch (_) { cs = null; }
+    const fontSizePx = cs ? parsePx(cs.fontSize) : 16;
+
+    if (r) {
+      out.push({
+        prop: 'width', kind: 'slider', min: 0, max: 2000, step: 1, unit: 'px',
+        numeric: Math.round(r.width), current: Math.round(r.width) + 'px',
+      });
+      out.push({
+        prop: 'height', kind: 'slider', min: 0, max: 2000, step: 1, unit: 'px',
+        numeric: Math.round(r.height), current: Math.round(r.height) + 'px',
+      });
+    }
     if (cs) {
-      out.push({ prop: 'fontFamily', current: cs.fontFamily });
-      out.push({ prop: 'fontSize', current: cs.fontSize });
-      out.push({ prop: 'fontWeight', current: cs.fontWeight });
-      out.push({ prop: 'lineHeight', current: cs.lineHeight });
-      out.push({ prop: 'color', current: cs.color });
-      out.push({ prop: 'display', current: cs.display });
-      out.push({ prop: 'margin', current: cs.margin });
-      out.push({ prop: 'padding', current: cs.padding });
-      out.push({ prop: 'borderRadius', current: cs.borderRadius });
+      out.push({
+        prop: 'fontFamily', kind: 'fontFamily',
+        current: cs.fontFamily, value: firstFontFamily(cs.fontFamily),
+      });
+      out.push({
+        prop: 'fontSize', kind: 'slider', min: 6, max: 96, step: 1, unit: 'px',
+        numeric: Math.round(fontSizePx) || 16, current: cs.fontSize,
+      });
+      out.push({
+        prop: 'fontWeight', kind: 'select', options: FONT_WEIGHTS,
+        current: cs.fontWeight, value: mapFontWeight(cs.fontWeight),
+      });
+      const lh = parseLineHeight(cs.lineHeight, fontSizePx);
+      out.push({
+        prop: 'lineHeight', kind: 'slider', min: 0.8, max: 3.0, step: 0.05, unit: '',
+        numeric: lh, current: String(cs.lineHeight),
+      });
+      out.push({
+        prop: 'color', kind: 'color', current: cs.color, value: rgbToHex(cs.color),
+      });
+      out.push({
+        prop: 'backgroundColor', kind: 'color',
+        current: cs.backgroundColor, value: rgbToHex(cs.backgroundColor),
+      });
+      out.push({
+        prop: 'display', kind: 'select', options: DISPLAY_VALUES,
+        current: cs.display,
+        value: DISPLAY_VALUES.indexOf(cs.display) !== -1 ? cs.display : 'block',
+      });
+      out.push({
+        prop: 'margin', kind: 'slider', min: 0, max: 200, step: 1, unit: 'px',
+        numeric: Math.round(parsePx(cs.marginTop)), current: cs.margin,
+      });
+      out.push({
+        prop: 'padding', kind: 'slider', min: 0, max: 200, step: 1, unit: 'px',
+        numeric: Math.round(parsePx(cs.paddingTop)), current: cs.padding,
+      });
+      out.push({
+        prop: 'borderRadius', kind: 'slider', min: 0, max: 100, step: 1, unit: 'px',
+        numeric: Math.round(parsePx(cs.borderTopLeftRadius)), current: cs.borderRadius,
+      });
     }
     let text = (el.textContent || '').replace(/\s+/g, ' ').trim();
     if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT);
-    out.push({ prop: 'text', current: text });
+    out.push({ prop: 'text', kind: 'text', current: text, value: text, max: MAX_TEXT });
     try {
-      if ((el.tagName === 'A' || el.tagName === 'AREA') && el.href) {
-        out.push({ prop: 'href', current: String(el.href) });
+      if (el.tagName === 'A' || el.tagName === 'AREA') {
+        const href = el.getAttribute('href') || el.href || '';
+        out.push({ prop: 'href', kind: 'text', current: String(href), value: String(href) });
       }
     } catch (_) { /* ok */ }
     return out;
@@ -672,6 +800,258 @@
       : {};
   }
 
+  function formatManipValue(prop, numeric, unit) {
+    if (prop === 'lineHeight') {
+      const n = Math.round(Number(numeric) * 100) / 100;
+      return String(n);
+    }
+    return Math.round(Number(numeric)) + (unit || 'px');
+  }
+
+  function captureOriginals(el) {
+    if (inspector.descriptor && originalsByDesc.has(inspector.descriptor)) {
+      inspectorOriginals = originalsByDesc.get(inspector.descriptor);
+      return;
+    }
+    inspectorOriginals = new Map();
+    const edits = currentEdits();
+    for (const p of inspectorProps(el)) {
+      const inline = readInlineStyle(el, p.prop);
+      const editVal = edits[p.prop];
+      // If the current inline value is our live edit, treat it as not original.
+      const inlineIsEdit = editVal != null
+        && String(inline).trim() !== ''
+        && String(inline).trim() === String(editVal).trim();
+      const wasInline = !!(inline && String(inline).trim() !== '' && !inlineIsEdit);
+      let value;
+      if (p.prop === 'text') {
+        value = (editVal != null) ? String(p.value || '') : (el.textContent || '');
+      } else if (p.prop === 'href') {
+        value = (editVal != null) ? String(p.value || '') : (el.getAttribute('href') || '');
+      } else if (wasInline) {
+        value = inline;
+      } else if (p.kind === 'slider') {
+        value = formatManipValue(p.prop, p.numeric, p.unit);
+      } else if (p.kind === 'color') {
+        value = p.value;
+      } else {
+        value = p.value != null ? p.value : p.current;
+      }
+      // Prefer manipulator baseline over a live-edited current when edits exist.
+      if (editVal != null && !wasInline) {
+        if (p.kind === 'slider') value = formatManipValue(p.prop, p.numeric, p.unit);
+        else if (p.kind === 'color') value = p.value;
+        else if (p.kind === 'select' || p.kind === 'fontFamily') value = p.value;
+        else if (p.prop === 'text' || p.prop === 'href') value = p.value || '';
+      }
+      inspectorOriginals.set(p.prop, { value, wasInline, kind: p.kind, unit: p.unit || '' });
+    }
+    if (inspector.descriptor) originalsByDesc.set(inspector.descriptor, inspectorOriginals);
+  }
+
+  function applyLive(prop, value) {
+    const el = inspector.el;
+    if (!el) return;
+    if (prop === 'text') {
+      el.textContent = value;
+      return;
+    }
+    if (prop === 'href') {
+      try { el.setAttribute('href', value); } catch (_) { /* ok */ }
+      try { el.href = value; } catch (_) { /* ok */ }
+      return;
+    }
+    try {
+      el.style[stylePropName(prop)] = value;
+    } catch (_) { /* ok */ }
+  }
+
+  function recordEdit(prop, value) {
+    if (!inspector.descriptor) return;
+    if (!inspector.descriptor.edits) inspector.descriptor.edits = {};
+    if (value === undefined || value === null || String(value).trim() === '') {
+      delete inspector.descriptor.edits[prop];
+    } else {
+      inspector.descriptor.edits[prop] = String(value);
+    }
+    updateInspectorState();
+  }
+
+  function restoreProp(prop) {
+    const el = inspector.el;
+    const orig = inspectorOriginals.get(prop);
+    if (!el || !orig) return;
+    if (prop === 'text') {
+      el.textContent = orig.value;
+    } else if (prop === 'href') {
+      try { el.setAttribute('href', orig.value); } catch (_) { /* ok */ }
+    } else if (orig.wasInline) {
+      try { el.style[stylePropName(prop)] = orig.value; } catch (_) { /* ok */ }
+    } else {
+      try { el.style[stylePropName(prop)] = ''; } catch (_) { /* ok */ }
+      try {
+        el.style.removeProperty(prop.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase()));
+      } catch (_) { /* ok */ }
+    }
+    if (inspector.descriptor && inspector.descriptor.edits) {
+      delete inspector.descriptor.edits[prop];
+    }
+  }
+
+  function syncRowControl(row, prop) {
+    const orig = inspectorOriginals.get(prop);
+    if (!row || !orig) return;
+    const control = row.querySelector('[data-insp-control]');
+    const valEl = row.querySelector('.comet-insp-val');
+    if (!control) return;
+    const display = orig.value || '';
+    if (prop === 'text' || prop === 'href') {
+      control.value = display;
+    } else if (control.type === 'range') {
+      let n;
+      if (prop === 'lineHeight') n = parseFloat(String(display));
+      else n = parsePx(display);
+      control.value = String(Number.isFinite(n) ? n : control.min);
+      if (valEl) valEl.textContent = formatManipValue(prop, control.value, control.dataset.unit || '');
+    } else if (control.type === 'color') {
+      control.value = rgbToHex(display);
+    } else if (prop === 'fontWeight') {
+      control.value = mapFontWeight(display);
+    } else if (prop === 'fontFamily') {
+      control.value = firstFontFamily(display);
+    } else {
+      control.value = display;
+    }
+  }
+
+  async function getFontFamilies() {
+    if (fontFamilyCache) return fontFamilyCache;
+    fontFamilyCache = (async () => {
+      const set = new Set(SYSTEM_FONTS);
+      try {
+        if (typeof navigator !== 'undefined' && typeof navigator.queryLocalFonts === 'function') {
+          const fonts = await navigator.queryLocalFonts();
+          for (const f of fonts || []) {
+            const fam = f && (f.family || f.fullName);
+            if (fam) set.add(String(fam));
+          }
+        }
+      } catch (_) { /* permission denied / unavailable */ }
+      try {
+        if (document.fonts && typeof document.fonts.forEach === 'function') {
+          document.fonts.forEach((face) => {
+            if (face && face.family) set.add(String(face.family).replace(/^["']|["']$/g, ''));
+          });
+        }
+      } catch (_) { /* ok */ }
+      return Array.from(set).sort((a, b) => a.localeCompare(b));
+    })();
+    return fontFamilyCache;
+  }
+
+  function buildControl(p, edits) {
+    const wrap = document.createElement('div');
+    wrap.className = 'comet-insp-control';
+    const edited = edits[p.prop] !== undefined && edits[p.prop] !== null
+      ? String(edits[p.prop])
+      : null;
+
+    if (p.kind === 'slider') {
+      const inp = document.createElement('input');
+      inp.type = 'range';
+      inp.className = 'comet-insp-slider';
+      inp.min = String(p.min);
+      inp.max = String(p.max);
+      inp.step = String(p.step);
+      inp.dataset.unit = p.unit || '';
+      inp.dataset.inspControl = '1';
+      inp.setAttribute('aria-label', p.prop);
+      const start = edited != null ? parseFloat(edited) : p.numeric;
+      inp.value = String(Number.isFinite(start) ? start : p.min);
+      const val = document.createElement('span');
+      val.className = 'comet-insp-val';
+      val.textContent = formatManipValue(p.prop, inp.value, p.unit);
+      wrap.appendChild(inp);
+      wrap.appendChild(val);
+      return wrap;
+    }
+
+    if (p.kind === 'select') {
+      const sel = document.createElement('select');
+      sel.className = 'comet-insp-select';
+      sel.dataset.inspControl = '1';
+      sel.setAttribute('aria-label', p.prop);
+      for (const opt of p.options) {
+        const o = document.createElement('option');
+        o.value = opt;
+        o.textContent = opt;
+        sel.appendChild(o);
+      }
+      sel.value = edited != null ? edited : p.value;
+      wrap.appendChild(sel);
+      return wrap;
+    }
+
+    if (p.kind === 'fontFamily') {
+      const sel = document.createElement('select');
+      sel.className = 'comet-insp-select';
+      sel.dataset.inspControl = '1';
+      sel.setAttribute('aria-label', 'fontFamily');
+      const cur = edited != null ? firstFontFamily(edited) : p.value;
+      const seed = new Set(SYSTEM_FONTS);
+      seed.add(cur);
+      Array.from(seed).sort((a, b) => a.localeCompare(b)).forEach((fam) => {
+        const o = document.createElement('option');
+        o.value = fam;
+        o.textContent = fam;
+        sel.appendChild(o);
+      });
+      sel.value = cur;
+      wrap.appendChild(sel);
+      getFontFamilies().then((fams) => {
+        if (!sel.isConnected) return;
+        const keep = sel.value;
+        sel.innerHTML = '';
+        fams.forEach((fam) => {
+          const o = document.createElement('option');
+          o.value = fam;
+          o.textContent = fam;
+          sel.appendChild(o);
+        });
+        if (fams.indexOf(keep) === -1) {
+          const o = document.createElement('option');
+          o.value = keep;
+          o.textContent = keep;
+          sel.insertBefore(o, sel.firstChild);
+        }
+        sel.value = keep;
+      }).catch(() => { /* ok */ });
+      return wrap;
+    }
+
+    if (p.kind === 'color') {
+      const inp = document.createElement('input');
+      inp.type = 'color';
+      inp.className = 'comet-insp-color';
+      inp.dataset.inspControl = '1';
+      inp.setAttribute('aria-label', p.prop);
+      inp.value = edited != null ? rgbToHex(edited) : p.value;
+      wrap.appendChild(inp);
+      return wrap;
+    }
+
+    // text / href
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.className = 'comet-insp-input';
+    inp.dataset.inspControl = '1';
+    inp.setAttribute('aria-label', p.prop);
+    if (p.max) inp.maxLength = p.max;
+    inp.value = edited != null ? edited : (p.value || '');
+    wrap.appendChild(inp);
+    return wrap;
+  }
+
   function renderInspector() {
     if (!inspPanel) return;
     const el = inspector.el;
@@ -679,42 +1059,37 @@
       inspPanel.hidden = true;
       return;
     }
+    clearPropertyHint();
     inspRows.innerHTML = '';
     const edits = currentEdits();
     for (const p of inspectorProps(el)) {
       const row = document.createElement('div');
       row.className = 'comet-insp-row';
       row.dataset.prop = p.prop;
+      row.tabIndex = -1;
 
       const lab = document.createElement('span');
       lab.className = 'comet-insp-label';
       lab.textContent = p.prop;
       lab.title = p.prop;
 
-      const cur = document.createElement('code');
-      cur.className = 'comet-insp-cur';
-      cur.textContent = p.current;
-      cur.title = p.current;
+      const control = buildControl(p, edits);
 
-      const inp = document.createElement('input');
-      inp.className = 'comet-insp-input';
-      inp.type = 'text';
-      inp.placeholder = 'desired value';
-      inp.setAttribute('aria-label', 'Desired ' + p.prop);
-      if (edits[p.prop] !== undefined && edits[p.prop] !== null) {
-        inp.value = String(edits[p.prop]);
+      // Re-apply stored edits live when reopening the inspector.
+      if (edits[p.prop] !== undefined && edits[p.prop] !== null && String(edits[p.prop]).trim() !== '') {
+        applyLive(p.prop, String(edits[p.prop]));
       }
 
-      const clr = document.createElement('button');
-      clr.type = 'button';
-      clr.className = 'comet-insp-clear';
-      clr.textContent = '✕';
-      clr.title = 'Clear edit for ' + p.prop;
+      const rst = document.createElement('button');
+      rst.type = 'button';
+      rst.className = 'comet-insp-reset';
+      rst.textContent = 'Reset';
+      rst.title = 'Reset ' + p.prop + ' to original';
+      rst.dataset.inspReset = '1';
 
       row.appendChild(lab);
-      row.appendChild(cur);
-      row.appendChild(inp);
-      row.appendChild(clr);
+      row.appendChild(control);
+      row.appendChild(rst);
       inspRows.appendChild(row);
     }
     updateInspectorState();
@@ -735,44 +1110,250 @@
   }
 
   function openInspector(el, descriptor) {
+    clearPropertyHint();
     inspector.el = el;
     inspector.descriptor = descriptor;
+    captureOriginals(el);
     renderInspector();
     inspPanel.hidden = false;
     positionInspector();
   }
 
   function closeInspector() {
+    clearPropertyHint();
     inspector.el = null;
     inspector.descriptor = null;
+    inspectorOriginals = new Map();
     if (inspPanel) inspPanel.hidden = true;
   }
 
-  // Typing in an edit input stores the desired value; empty input removes it.
-  function onInspectorInput(e) {
-    const row = e.target && e.target.closest ? e.target.closest('.comet-insp-row') : null;
-    if (!row || !inspector.descriptor) return;
-    const prop = row.dataset.prop;
-    const v = e.target.value;
-    if (!inspector.descriptor.edits) inspector.descriptor.edits = {};
-    if (String(v).trim() === '') delete inspector.descriptor.edits[prop];
-    else inspector.descriptor.edits[prop] = v;
-    updateInspectorState();
+  function valueFromControl(control, prop) {
+    if (!control) return '';
+    if (control.type === 'range') {
+      return formatManipValue(prop, control.value, control.dataset.unit || '');
+    }
+    return control.value;
   }
 
-  // Per-row clear: reset the edit input and drop the stored edit.
-  function onInspectorClear(e) {
-    const btn = e.target && e.target.closest ? e.target.closest('.comet-insp-clear') : null;
+  // Live manipulators write element.style / textContent immediately and
+  // store the live value as the edits payload entry.
+  function onInspectorInput(e) {
+    const t = e.target;
+    if (!t || !t.closest) return;
+    const row = t.closest('.comet-insp-row');
+    if (!row || !inspector.descriptor) return;
+    const prop = row.dataset.prop;
+    const control = t.matches('[data-insp-control]') ? t : row.querySelector('[data-insp-control]');
+    if (!control) return;
+    const v = valueFromControl(control, prop);
+    if (control.type === 'range') {
+      const valEl = row.querySelector('.comet-insp-val');
+      if (valEl) valEl.textContent = v;
+    }
+    applyLive(prop, v);
+    recordEdit(prop, v);
+    if (hintProp === prop) scheduleRedraw();
+  }
+
+  // Per-row Reset: restore original style/text and drop the stored edit.
+  function onInspectorReset(e) {
+    const btn = e.target && e.target.closest ? e.target.closest('[data-insp-reset]') : null;
     if (!btn) return;
     const row = btn.closest('.comet-insp-row');
     if (!row) return;
     const prop = row.dataset.prop;
-    const inp = row.querySelector('.comet-insp-input');
-    if (inp) inp.value = '';
-    if (inspector.descriptor && inspector.descriptor.edits) {
-      delete inspector.descriptor.edits[prop];
-    }
+    restoreProp(prop);
+    syncRowControl(row, prop);
     updateInspectorState();
+    if (hintProp === prop) scheduleRedraw();
+  }
+
+  function onInspectorResetAll() {
+    if (!inspector.el) return;
+    const props = Array.from(inspectorOriginals.keys());
+    for (const prop of props) restoreProp(prop);
+    inspRows.querySelectorAll('.comet-insp-row').forEach((row) => {
+      syncRowControl(row, row.dataset.prop);
+    });
+    updateInspectorState();
+    if (hintProp) scheduleRedraw();
+  }
+
+  function setPropertyHint(prop) {
+    if (hintProp === prop) return;
+    hintProp = prop;
+    if (inspRows) {
+      inspRows.querySelectorAll('.comet-insp-row').forEach((row) => {
+        row.classList.toggle('hint-active', row.dataset.prop === prop);
+      });
+    }
+    startHintLoop();
+    scheduleRedraw();
+  }
+
+  function clearPropertyHint() {
+    if (!hintProp && !hintRaf) {
+      if (inspRows) {
+        inspRows.querySelectorAll('.comet-insp-row.hint-active').forEach((row) => {
+          row.classList.remove('hint-active');
+        });
+      }
+      return;
+    }
+    hintProp = null;
+    stopHintLoop();
+    if (inspRows) {
+      inspRows.querySelectorAll('.comet-insp-row.hint-active').forEach((row) => {
+        row.classList.remove('hint-active');
+      });
+    }
+    scheduleRedraw();
+  }
+
+  function startHintLoop() {
+    if (hintRaf) return;
+    const tick = () => {
+      hintRaf = 0;
+      if (!hintProp) return;
+      scheduleRedraw();
+      hintRaf = requestAnimationFrame(tick);
+    };
+    hintRaf = requestAnimationFrame(tick);
+  }
+
+  function stopHintLoop() {
+    if (hintRaf) {
+      cancelAnimationFrame(hintRaf);
+      hintRaf = 0;
+    }
+  }
+
+  function textAreaRect(el) {
+    try {
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+      let node = walker.nextNode();
+      while (node) {
+        if (node.nodeValue && node.nodeValue.trim()) {
+          const range = document.createRange();
+          range.selectNodeContents(node);
+          const rects = range.getClientRects();
+          if (rects && rects.length) {
+            const r = rects[0];
+            return { left: r.left, top: r.top, width: r.width, height: r.height };
+          }
+        }
+        node = walker.nextNode();
+      }
+    } catch (_) { /* fall through */ }
+    try {
+      const r = el.getBoundingClientRect();
+      return { left: r.left, top: r.top, width: r.width, height: r.height };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function drawPropertyHint() {
+    if (!ctx || !hintProp || !inspector.el) return;
+    const el = inspector.el;
+    let box = null;
+    try { box = el.getBoundingClientRect(); } catch (_) { box = null; }
+    if (!box) return;
+    let cs = null;
+    try { cs = getComputedStyle(el); } catch (_) { cs = null; }
+
+    ctx.save();
+    ctx.strokeStyle = '#ffd166';
+    ctx.fillStyle = 'rgba(255, 209, 102, 0.18)';
+    ctx.lineWidth = 1.5;
+
+    if (hintProp === 'width') {
+      ctx.beginPath();
+      ctx.moveTo(box.left, box.top);
+      ctx.lineTo(box.left, box.bottom);
+      ctx.moveTo(box.right, box.top);
+      ctx.lineTo(box.right, box.bottom);
+      ctx.stroke();
+    } else if (hintProp === 'height') {
+      ctx.beginPath();
+      ctx.moveTo(box.left, box.top);
+      ctx.lineTo(box.right, box.top);
+      ctx.moveTo(box.left, box.bottom);
+      ctx.lineTo(box.right, box.bottom);
+      ctx.stroke();
+    } else if (hintProp === 'margin' && cs) {
+      const mt = parsePx(cs.marginTop);
+      const mr = parsePx(cs.marginRight);
+      const mb = parsePx(cs.marginBottom);
+      const ml = parsePx(cs.marginLeft);
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(box.left - ml, box.top - mt, box.width + ml + mr, box.height + mt + mb);
+    } else if (hintProp === 'padding' && cs) {
+      const pt = parsePx(cs.paddingTop);
+      const pr = parsePx(cs.paddingRight);
+      const pb = parsePx(cs.paddingBottom);
+      const pl = parsePx(cs.paddingLeft);
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(box.left + pl, box.top + pt,
+        Math.max(0, box.width - pl - pr), Math.max(0, box.height - pt - pb));
+    } else if (hintProp === 'borderRadius') {
+      const rad = cs ? Math.max(4, Math.min(16, parsePx(cs.borderTopLeftRadius) || 8)) : 8;
+      const corners = [
+        [box.left, box.top],
+        [box.right, box.top],
+        [box.right, box.bottom],
+        [box.left, box.bottom],
+      ];
+      for (const [x, y] of corners) {
+        ctx.beginPath();
+        ctx.arc(x, y, rad, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    } else if (TEXT_HINT_PROPS.has(hintProp)) {
+      const tr = textAreaRect(el) || box;
+      ctx.fillRect(tr.left, tr.top, tr.width, tr.height);
+      ctx.strokeRect(tr.left, tr.top, tr.width, tr.height);
+    } else if (UNDERLINE_HINT_PROPS.has(hintProp)) {
+      const tr = textAreaRect(el) || box;
+      ctx.beginPath();
+      ctx.moveTo(tr.left, tr.top + tr.height - 1);
+      ctx.lineTo(tr.left + tr.width, tr.top + tr.height - 1);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function onInspectorPointerOver(e) {
+    const row = e.target && e.target.closest ? e.target.closest('.comet-insp-row') : null;
+    if (!row) return;
+    setPropertyHint(row.dataset.prop);
+  }
+
+  function onInspectorFocusIn(e) {
+    const row = e.target && e.target.closest ? e.target.closest('.comet-insp-row') : null;
+    if (!row) return;
+    setPropertyHint(row.dataset.prop);
+  }
+
+  function onInspectorPointerLeave(e) {
+    // Keep hint while focus remains inside a control of the active row.
+    const active = shadow && shadow.activeElement;
+    if (active && active.closest && active.closest('.comet-insp-row')) return;
+    const related = e.relatedTarget;
+    if (related && related.closest && related.closest('.comet-insp-row')) return;
+    clearPropertyHint();
+  }
+
+  function onInspectorFocusOut(e) {
+    const next = e.relatedTarget;
+    if (next && next.closest && next.closest('.comet-insp-row')) return;
+    // Defer so a focus move within the panel does not flash-clear the hint.
+    setTimeout(() => {
+      const active = shadow && shadow.activeElement;
+      if (active && active.closest && active.closest('.comet-insp-row')) return;
+      clearPropertyHint();
+    }, 0);
   }
 
   // Footer instruction textarea: same instruction field as the chat card.
@@ -1050,8 +1631,12 @@
     inspPanel = null;
     inspRows = null;
     inspCountEl = null;
+    inspResetAllBtn = null;
     inspInput = null;
     inspSend = null;
+    inspectorOriginals = new Map();
+    hintProp = null;
+    stopHintLoop();
     state.strokes = [];
     state.elements = [];
     state.nextIndex = 1;
@@ -1209,7 +1794,10 @@
       '<div class="comet-insp-head">Element inspector</div>' +
       '<div class="comet-insp-rows"></div>' +
       '<div class="comet-insp-foot">' +
-      '  <span class="comet-insp-count">0 edits</span>' +
+      '  <div class="comet-insp-foot-meta">' +
+      '    <span class="comet-insp-count">0 edits</span>' +
+      '    <button type="button" class="comet-insp-reset-all" title="Reset all live edits">Reset all</button>' +
+      '  </div>' +
       '  <textarea class="comet-chat-input comet-insp-instr" rows="2" ' +
       ' placeholder="Your thoughts/instructions for this element…"></textarea>' +
       '  <button type="button" class="comet-btn comet-send comet-insp-send">Send</button>' +
@@ -1233,6 +1821,7 @@
     chatInput = chatCard.querySelector('.comet-chat-input');
     inspRows = inspPanel.querySelector('.comet-insp-rows');
     inspCountEl = inspPanel.querySelector('.comet-insp-count');
+    inspResetAllBtn = inspPanel.querySelector('.comet-insp-reset-all');
     inspInput = inspPanel.querySelector('.comet-insp-instr');
     inspSend = inspPanel.querySelector('.comet-insp-send');
     toolbar.querySelector('.comet-swatch .dot').classList.add('active');
@@ -1316,25 +1905,32 @@
         '.comet-inspector[hidden]{display:none;}' +
         '.comet-insp-head{font-size:12px;color:#9aa0a6;border-bottom:1px solid rgba(255,255,255,.14);padding-bottom:6px;}' +
         '.comet-insp-rows{overflow-y:auto;display:flex;flex-direction:column;gap:6px;}' +
-        '.comet-insp-row{display:grid;grid-template-columns:84px minmax(0,1fr) minmax(0,1fr) 20px;gap:6px;' +
+        '.comet-insp-row{display:grid;grid-template-columns:72px minmax(0,1fr) auto;gap:6px;' +
         'align-items:center;border:1px solid transparent;border-radius:6px;padding:4px 6px;}' +
         '.comet-insp-row.edited{border-color:#4a9eff;background:rgba(74,158,255,.08);}' +
+        '.comet-insp-row.hint-active{border-color:rgba(255,209,102,.7);background:rgba(255,209,102,.08);}' +
         '.comet-insp-label{font-size:11px;color:#9aa0a6;text-transform:capitalize;overflow:hidden;' +
         'text-overflow:ellipsis;white-space:nowrap;}' +
-        '.comet-insp-cur{font:11px/1.3 ui-monospace,Menlo,Consolas,monospace;color:#9aa0a6;' +
-        'background:rgba(255,255,255,.05);border-radius:4px;padding:3px 5px;overflow:hidden;' +
-        'text-overflow:ellipsis;white-space:nowrap;}' +
-        '.comet-insp-input{min-width:0;width:100%;box-sizing:border-box;background:rgba(255,255,255,.06);' +
+        '.comet-insp-control{display:flex;align-items:center;gap:6px;min-width:0;}' +
+        '.comet-insp-slider{flex:1 1 auto;min-width:0;width:100%;accent-color:#4a9eff;cursor:pointer;}' +
+        '.comet-insp-val{flex:0 0 auto;min-width:42px;text-align:right;font:11px/1.3 ui-monospace,Menlo,Consolas,monospace;color:#9aa0a6;}' +
+        '.comet-insp-input,.comet-insp-select{min-width:0;width:100%;box-sizing:border-box;background:rgba(255,255,255,.06);' +
         'border:1px solid rgba(255,255,255,.16);border-radius:4px;color:#e8eaed;font:inherit;' +
         'padding:3px 5px;outline:none;}' +
-        '.comet-insp-input:focus{border-color:#4a9eff;}' +
-        '.comet-insp-row.edited .comet-insp-input{border-color:#4a9eff;}' +
-        '.comet-insp-clear{border:none;background:transparent;color:#9aa0a6;cursor:pointer;font-size:11px;' +
-        'padding:2px;border-radius:4px;}' +
-        '.comet-insp-clear:hover{color:#ff5252;}' +
+        '.comet-insp-select{cursor:pointer;}' +
+        '.comet-insp-color{width:36px;height:24px;padding:0;border:1px solid rgba(255,255,255,.16);border-radius:4px;background:transparent;cursor:pointer;}' +
+        '.comet-insp-input:focus,.comet-insp-select:focus,.comet-insp-row.edited .comet-insp-input,' +
+        '.comet-insp-row.edited .comet-insp-select{border-color:#4a9eff;}' +
+        '.comet-insp-reset{border:1px solid transparent;background:transparent;color:#9aa0a6;cursor:pointer;font-size:10px;' +
+        'padding:2px 4px;border-radius:4px;white-space:nowrap;}' +
+        '.comet-insp-reset:hover{color:#ff5252;background:rgba(255,82,82,.12);}' +
         '.comet-insp-foot{display:flex;flex-direction:column;gap:6px;border-top:1px solid rgba(255,255,255,.14);' +
         'padding-top:8px;}' +
+        '.comet-insp-foot-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;}' +
         '.comet-insp-count{font-size:11px;color:#9aa0a6;}' +
+        '.comet-insp-reset-all{border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#e8eaed;' +
+        'cursor:pointer;font:11px system-ui;padding:3px 8px;border-radius:4px;}' +
+        '.comet-insp-reset-all:hover{border-color:#ff5252;color:#ff5252;}' +
         '.comet-insp-send{align-self:flex-end;}';
     }
     style.textContent = css;
@@ -1375,7 +1971,13 @@
       if (inspInput) inspInput.value = chatInput.value;
     });
     inspRows.addEventListener('input', onInspectorInput);
-    inspRows.addEventListener('click', onInspectorClear);
+    inspRows.addEventListener('change', onInspectorInput);
+    inspRows.addEventListener('click', onInspectorReset);
+    inspRows.addEventListener('pointerover', onInspectorPointerOver);
+    inspRows.addEventListener('focusin', onInspectorFocusIn);
+    inspRows.addEventListener('pointerout', onInspectorPointerLeave);
+    inspRows.addEventListener('focusout', onInspectorFocusOut);
+    if (inspResetAllBtn) inspResetAllBtn.addEventListener('click', onInspectorResetAll);
     inspInput.addEventListener('input', onInspectorInstr);
     inspSend.addEventListener('click', send);
     window.addEventListener('mousemove', onMouseMove);
@@ -1420,6 +2022,26 @@
       window.__browserlinkInjected = false;
       console.error('Browserlink init failed:', err);
     }
+  }
+
+  // Test/harness hooks (no-op unless window.__BL_TEST__ is set before inject).
+  if (typeof window !== 'undefined' && window.__BL_TEST__) {
+    window.__BL_INSPECTOR__ = {
+      openInspector,
+      closeInspector,
+      renderInspector,
+      applyLive,
+      recordEdit,
+      restoreProp,
+      setPropertyHint,
+      clearPropertyHint,
+      drawPropertyHint,
+      get hintProp() { return hintProp; },
+      get inspector() { return inspector; },
+      get originals() { return inspectorOriginals; },
+      getRows: () => inspRows,
+      getCtx: () => ctx,
+    };
   }
 
   init();
