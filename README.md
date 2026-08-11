@@ -123,9 +123,6 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
 - **Annotation note queue** - the annotate tool pops a note card in the corner;
   Enter queues notes with a live counter in the toolbar; Send ships the whole
   batch (elements + notes) in one payload.
-- **Premium border glow** - the element inspector wears a slow rotating,
-  breathing cyan-silver ring bound inside its border (GSAP-driven angle,
-  reduced-motion static).
 - **Diagnostics** - `Ctrl+Shift+D` opens a live overlay (state, event ring
   buffer, health codes D-1..D-6) for deterministic troubleshooting; the same
   data is on `window.__browserlinkDiag`.

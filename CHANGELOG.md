@@ -8,9 +8,6 @@ All notable changes to browserlink are documented here. Format follows
 
 ### Added
 
-- **Premium motion layer** - GSAP-driven animations across the UI (Apple
-  HIG / MD3 Emphasized easings, layered scale/translate/opacity, staggered
-  reveals, pressed states); reduced-motion fully respected
 - **Toolbar edge docking** - drag to a screen edge to dock: vertical bar on
   the left/right, horizontal on the bottom; per-tab persistence, animated
   snap, centered-left first-run placement
@@ -20,8 +17,6 @@ All notable changes to browserlink are documented here. Format follows
   live toolbar counter, notes ship with Send only
 - **Element inspector resize** - corner drag handle with min/max clamps and
   per-tab persistence; cursor glow inside the panel
-- **Premium border glow** - rotating breathing cyan-silver ring bound inside
-  the inspector border (GSAP-driven angle with CSS keyframe fallback)
 - **Diagnostics overlay** - Ctrl+Shift+D: state dump, event ring buffer,
   health codes D-1..D-6, `window.__browserlinkDiag` API
 - **On-demand injection** - popup master switch injects the content script
