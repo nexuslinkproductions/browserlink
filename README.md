@@ -123,6 +123,13 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
 - **Annotation note queue** - the annotate tool pops a note card in the corner;
   Enter queues notes with a live counter in the toolbar; Send ships the whole
   batch (elements + notes) in one payload.
+- **Direct chat attachment delivery** - a sent annotation lands in the
+  selected Hermes chat's composer as real attachment chips (screenshot + JSON),
+  exactly like drag-and-drop, via the gateway's `composer.attach` injection;
+  the message also posts as a fallback so delivery never blocks.
+- **Chat selector drives delivery** - pick the target session in the extension
+  popup; the hub routes annotations to that chat (auto-connect on pick,
+  hardened endpoint resolution).
 - **Diagnostics** - `Ctrl+Shift+D` opens a live overlay (state, event ring
   buffer, health codes D-1..D-6) for deterministic troubleshooting; the same
   data is on `window.__browserlinkDiag`.

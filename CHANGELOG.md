@@ -4,6 +4,42 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [2.4.0] - 2026-08-11
+
+### Added
+
+- **Annotation attachments in the chat composer** - sending an annotation now
+  lands the screenshot + JSON directly in the selected Hermes chat's composer
+  as real attachment chips, exactly like drag-and-drop (hub calls the gateway
+  `POST /api/composer/attach`; the desktop docks them into its native
+  add-attachment function via `mainComposerScope.add`). The message still
+  posts as a fallback, so delivery never blocks.
+- **Chat selector drives delivery direction** - picking a session in the
+  extension popup auto-connects (`activate: true`) and routes annotations to
+  that chat; endpoint porting hardened (`localhost` -> `127.0.0.1`, trailing
+  slash strip, stale-endpoint fallback).
+- **Transport hardening** - Hermes adapter: response-status checking, bounded
+  retry (1s/4s) on network failures only, dedupe by annotation id, structured
+  success/error logging to `browserlink-error.log`, text-only fallback when no
+  screenshot exists, directive lines protected from text caps. Webhook
+  adapter: payload size cap + skip logging. Hub: oversized payloads -> 413,
+  malformed JSON handling, per-adapter crash isolation.
+- **Queued note delivery** - annotation notes (`note` + `notes`) now flow
+  through to the chat message (previously dropped).
+
+### Fixed
+
+- **Send no longer hides the UI** - the capture state hides only the hover
+  box + canvas; the toolbar and inspector stay visible during send.
+- **'n' key no longer exits isolation** - UI-origin keystrokes call
+  `stopImmediatePropagation` so host-page shortcuts (Comet's 'n') never fire
+  from extension controls.
+- **Selection queue persists** - picking a new element no longer clears
+  committed selections; hover chip shows the queue count.
+- **Drag never sticks to the cursor** - pointer capture released on
+  `lostpointercapture` + window `pointerup`/`mouseup` fallbacks.
+- **Inspector info section** - no longer cut off or squashed (flex fixes).
+
 ## [2.3.0] - 2026-08-11
 
 ### Added
