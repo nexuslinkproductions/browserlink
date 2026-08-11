@@ -4,7 +4,40 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
-## [2.2.0] - 2026-08-10
+## [2.3.0] - 2026-08-11
+
+### Added
+
+- **Premium motion layer** - GSAP-driven animations across the UI (Apple
+  HIG / MD3 Emphasized easings, layered scale/translate/opacity, staggered
+  reveals, pressed states); reduced-motion fully respected
+- **Toolbar edge docking** - drag to a screen edge to dock: vertical bar on
+  the left/right, horizontal on the bottom; per-tab persistence, animated
+  snap, centered-left first-run placement
+- **Toolbar orientation morph** - vertical to horizontal layout changes
+  animate with a staggered child tween instead of snapping
+- **Annotation note queue** - annotate-mode note card, Enter queues notes,
+  live toolbar counter, notes ship with Send only
+- **Element inspector resize** - corner drag handle with min/max clamps and
+  per-tab persistence; cursor glow inside the panel
+- **Premium border glow** - rotating breathing cyan-silver ring bound inside
+  the inspector border (GSAP-driven angle with CSS keyframe fallback)
+- **Diagnostics overlay** - Ctrl+Shift+D: state dump, event ring buffer,
+  health codes D-1..D-6, `window.__browserlinkDiag` API
+- **On-demand injection** - popup master switch injects the content script
+  into the active tab directly (no refresh required)
+
+### Fixed
+
+- Typing in inspector text fields no longer lands on the page (composedPath
+  UI exclusion)
+- Power button exits cleanly with a smooth-out animation; collapse folds with
+  a premium tween
+- Element screenshots isolate the selection (double-rAF flush, dpr-aware
+  crop, no tool UI in captures)
+- Hover highlight fully suppressed over the extension's own UI
+- Horizontal scroll eliminated from the inspector
+- Em-dashes removed from all file content
 
 ### Added
 

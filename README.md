@@ -3,7 +3,7 @@
 **Annotate in your browser. Deliver to any AI harness.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v2.1.0-4a9eff.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v2.3.0-4a9eff.svg)](CHANGELOG.md)
 [![CI](https://github.com/nexuslinkproductions/browserlink/actions/workflows/ci.yml/badge.svg)](https://github.com/nexuslinkproductions/browserlink/actions)
 [![MCP](https://img.shields.io/badge/MCP-server-ffd166.svg)](docs/mcp.md)
 [![Chromium](https://img.shields.io/badge/Chromium-MV3-ff5252.svg)](extension/manifest.json)
@@ -115,6 +115,23 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
 - **Collapsible, movable toolbar** - drag the toolbar anywhere on the page,
   collapse it to a small chip, or exit the tool entirely with the power or
   close button.
+- **Edge docking with animated morph** - drag the toolbar to a screen edge to
+  dock it: vertical bar on the left/right (slim icon buttons), horizontal bar
+  on the bottom; orientation changes morph with a GSAP-animated transition
+  (staggered children, spring settle), and the first launch docks centered on
+  the left edge.
+- **Annotation note queue** - the annotate tool pops a note card in the corner;
+  Enter queues notes with a live counter in the toolbar; Send ships the whole
+  batch (elements + notes) in one payload.
+- **Premium border glow** - the element inspector wears a slow rotating,
+  breathing cyan-silver ring bound inside its border (GSAP-driven angle,
+  reduced-motion static).
+- **Diagnostics** - `Ctrl+Shift+D` opens a live overlay (state, event ring
+  buffer, health codes D-1..D-6) for deterministic troubleshooting; the same
+  data is on `window.__browserlinkDiag`.
+- **On-demand injection** - the popup master switch now injects the extension
+  into the active tab on toggle (no page refresh needed) and reflects the
+  persisted state honestly.
 - **Element inspector with inline editing** - select an element in Element
   mode to see its current computed styles, type desired values inline, and
   ship them as structured `elements[].edits` in the annotation payload.
