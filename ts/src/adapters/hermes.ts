@@ -68,7 +68,7 @@ export function resolveSessionId(annotation?: JsonObject | null): string | null 
  * stores its runtime as JSON in `model_config`; the API server's session-chat
  * endpoint honors explicit provider/model in the request body, so we resolve
  * them here. Falls back to `{}` on any error (older Node without node:sqlite,
- * missing DB, unreadable row) — the caller then sends no pins and the API
+ * missing DB, unreadable row). The caller then sends no pins and the API
  * server uses its own defaults.
  */
 async function sessionModelConfig(sessionId: string): Promise<JsonObject> {
