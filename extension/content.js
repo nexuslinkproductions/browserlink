@@ -1084,7 +1084,7 @@
 
   // Primary angle driver for closed-shadow reliability: GSAP tweens the
   // registered (or unregistered) custom property on the host while CSS owns
-  // the masked conic + breathe. CSS comet-ring-spin remains the no-GSAP
+  // the outside conic glow + breathe. CSS comet-ring-spin remains the no-GSAP
   // fallback when document-level @property registration succeeded.
   function startInspectorRingTween() {
     stopInspectorRingTween();
@@ -1099,7 +1099,7 @@
     try {
       inspectorRingTween = gsapLib.to(inspPanel, {
         '--bl-ring-angle': '360deg',
-        duration: 14,
+        duration: 9,
         repeat: -1,
         ease: 'none',
       });

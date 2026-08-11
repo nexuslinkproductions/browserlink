@@ -2503,49 +2503,47 @@
   }
 }
 
-/* ---- inspector cyan-silver ring glow (slow conic sweep along the edges) ---- */
+/* ---- inspector cyan-silver ring glow (outside travelling sweep) ---- */
 @property --bl-ring-angle {
   syntax: '<angle>';
   inherits: false;
   initial-value: 0deg;
 }
 
-/* One soft light-cyan + silver travelling segment rotating around the panel
-   edges. ::before is masked to a thin ring, sits on the border (inset -1px)
-   and paints behind the panel content (negative z-index inside the panel's
-   own stacking context), so every control and any resize handle stay fully
-   interactive. When the panel is hidden ([hidden] -> display:none) the
-   pseudo is not rendered. */
+/* Soft light-cyan + silver travelling highlight on the OUTSIDE of the panel
+   border. ::before wraps the outer edge (inset -4px), no content-box mask,
+   and a light blur so the conic reads as a glow circling the perimeter
+   rather than a hard inset ring. Negative z-index + pointer-events:none keep
+   every control and the resize handle interactive. When the panel is hidden
+   ([hidden] -> display:none) the pseudo is not rendered. */
 .comet-inspector::before {
   content: '';
   position: absolute;
-  inset: -1px;
+  inset: -4px;
   border-radius: inherit;
-  padding: 1.5px;
   background: conic-gradient(from var(--bl-ring-angle, 0deg),
     transparent 0deg,
-    rgba(165, 243, 252, 0.02) 30deg,
-    rgba(125, 211, 252, 0.30) 70deg,
-    rgba(226, 232, 240, 0.28) 100deg,
-    rgba(165, 243, 252, 0.02) 130deg,
-    transparent 180deg,
+    rgba(165, 243, 252, 0.05) 40deg,
+    rgba(125, 211, 252, 0.45) 90deg,
+    rgba(226, 232, 240, 0.35) 120deg,
+    rgba(165, 243, 252, 0.05) 160deg,
+    transparent 200deg,
     transparent 360deg);
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  mask-composite: exclude;
+  filter: blur(2px);
+  box-shadow: 0 0 10px rgba(125, 211, 252, 0.18);
   pointer-events: none;
   z-index: -1;
   opacity: 0.4;
-  animation: comet-ring-spin 14s linear infinite, comet-ring-breathe 6.5s ease-in-out infinite;
+  animation: comet-ring-spin 9s linear infinite, comet-ring-breathe 6.5s ease-in-out infinite;
 }
 
 /* Static ambient cyan-silver edge so the perimeter never looks dead between
-   sweeps. Pointer-events none keeps resize/content interactive above it. */
+   sweeps. Outer inset sits on the border; pointer-events none keeps
+   resize/content interactive above it. */
 .comet-inspector::after {
   content: '';
   position: absolute;
-  inset: 0;
+  inset: -1px;
   border-radius: inherit;
   border: 1px solid rgba(148, 197, 233, 0.18);
   box-shadow: inset 0 0 0 1px rgba(226, 232, 240, 0.04);
@@ -2578,6 +2576,8 @@
   .comet-inspector::before,
   .comet-inspector.comet-ring-js::before {
     animation: none;
+    filter: none;
+    box-shadow: none;
     opacity: 0.2;
   }
 }
