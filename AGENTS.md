@@ -20,7 +20,7 @@ It captures strokes, selected elements, notes, and cropped screenshots, then rou
 | Build | `npm run build` | `ts/` | `tsc` compiles `ts/src` into `ts/dist` |
 | Tests | `npm test` | `ts/` | Node test suite (`test/*.test.ts`), including hub, MCP, and schema behavior |
 | Typecheck | `npm run typecheck` | `ts/` | Strict `tsc --noEmit` type validation |
-| Extension syntax | `node --check extension/content.js && node --check extension/service-worker.js && node --check extension/popup.js` | repo root | Parses every extension JS entrypoint; CI's multi-file form is in `.github/workflows/ci.yml` |
+| Extension syntax | `node --check extension/content.js && node --check extension/service-worker.js && node --check extension/popup.js` | repo root | Parses every extension JS entrypoint; CI's multi-file form (`node --check a b c`) only checks the FIRST file, so prefer the chained command in CI too |
 | Manifest check | `node -e "JSON.parse(require('fs').readFileSync('extension/manifest.json','utf8')); console.log('manifest ok')"` | repo root | Parses `extension/manifest.json` as JSON |
 
 Run `npm ci` in `ts/` before the TypeScript commands when dependencies are absent. There is no lint, formatter, or `scripts/` directory. Node 22+ is required by `ts/package.json`.
@@ -34,7 +34,7 @@ Run `npm ci` in `ts/` before the TypeScript commands when dependencies are absen
 5. If attach has no attachments, returns 404 or another error, or has a network failure, the adapter falls back to `POST ${HERMES_API_URL}/api/sessions/<sessionId>/chat`. The fallback carries formatted text, a real image part when available, and file/image references. Dedupe is by annotation id. Missing Hermes URL/key means no Hermes delivery.
 
 Important environment variables:
-`HERMES_API_URL`, `HERMES_API_KEY`, `HERMES_SESSION_ID`, `HERMES_HOME`, `BROWSERLINK_DATA_DIR`, `BROWSERLINK_WEBHOOK_URL`, and `BROWSERLINK_HUB_URL`.
+`HERMES_API_URL`, `HERMES_API_KEY`, `HERMES_SESSION_ID`, `HERMES_HOME`, `BROWSERLINK_DATA_DIR`, `BROWSERLINK_WEBHOOK_URL`, and `BROWSERLINK_HUB_URL`, plus `HERMES_PROVIDER` and `HERMES_MODEL` (explicit /chat fallback routing overrides; they supersede the session `model_config` for fallback chat delivery only).
 `BROWSERLINK_DATA_DIR` wins for data storage, then `HERMES_HOME/annotations`, then `~/.browserlink/annotations`. `BROWSERLINK_HUB_URL` selects the MCP client's hub base URL. `BROWSERLINK_WEBHOOK_URL` enables the webhook adapter.
 
 ## Hard repo conventions
@@ -42,7 +42,7 @@ Important environment variables:
 - Never introduce U+2014 em-dash characters in an edited file. Use a hyphen.
 - MV3 means service-worker-only background execution, no remote code, and permissions exactly centered on `activeTab`, `storage`, `scripting`, and `alarms`.
 - Version tracks are separate: extension version in `extension/manifest.json`; hub package version in `ts/package.json` plus `VERSION` constants; release truth is the head of `CHANGELOG.md`. Do not silently synchronize tracks.
-- Limits are contracts: decoded screenshot 10MB; formatted message text 20,000 characters; element instruction 500 characters; label 200 characters; annotation note queue 20 entries.
+- Limits are contracts: decoded screenshot 10MB; formatted content body 20,000 characters, excluding the appended `@image:`/`@file:` directive lines (probe: a 20,030-char message was produced with the file line intact); element instruction 500 characters (extension-enforced `MAX_INSTR`; hub validation does not inspect `instruction`); label 200 characters; annotation note queue 20 entries.
 - `ts/src/schema.ts` `ALLOWED_EDIT_KEYS` is the edit-key source of truth. `docs/protocol.md` currently claims schema v1.5 text-format keys that the hub does not accept. Do not let docs get ahead of `ALLOWED_EDIT_KEYS`; update code and validation first when expanding the schema.
 
 ## Testing doctrine
