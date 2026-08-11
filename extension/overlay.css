@@ -76,8 +76,11 @@
   border: 1px solid rgba(255, 255, 255, 0.13);
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.03));
   color: var(--bl-text, #eef1f6);
-  border-radius: 8px;
-  padding: 5px 11px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  padding: 4px 7px;
   font: inherit;
   font-weight: 500;
   letter-spacing: 0.015em;
@@ -114,8 +117,9 @@
 .comet-icon-btn {
   min-width: 32px;
   width: 32px;
+  height: 32px;
   box-sizing: border-box;
-  padding: 5px 0;
+  padding: 0;
   text-align: center;
   font-size: 15px;
   line-height: 1.15;
@@ -463,7 +467,7 @@
   flex-direction: column;
   align-items: center;
   justify-content: flex-start;
-  gap: 8px;
+  gap: 6px;
   padding: 10px 8px;
   max-height: calc(100vh - 24px);
   overflow-y: auto;
@@ -498,7 +502,8 @@
 .comet-toolbar.comet-dock-left .comet-mode-btn,
 .comet-toolbar.comet-dock-right .comet-mode-btn {
   width: 100%;
-  padding: 5px 8px;
+  min-height: 30px;
+  padding: 4px 6px;
 }
 .comet-toolbar.comet-dock-left .comet-swatch,
 .comet-toolbar.comet-dock-right .comet-swatch {
@@ -1524,12 +1529,15 @@
   z-index: 1;
   flex: 1 1 0;
   min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   text-align: center;
   white-space: nowrap;
   border-color: transparent;
   background: transparent;
   box-shadow: none;
-  padding: 3px 6px;
+  padding: 4px 6px;
   font-size: 14px;
   letter-spacing: 0;
   color: #c7cdd8;
@@ -2503,43 +2511,40 @@
   }
 }
 
-/* ---- inspector cyan-silver ring glow (outside travelling sweep) ---- */
-@property --bl-ring-angle {
-  syntax: '<angle>';
-  inherits: false;
-  initial-value: 0deg;
-}
-
-/* Soft light-cyan + silver travelling highlight on the OUTSIDE of the panel
-   border. ::before wraps the outer edge (inset -4px), no content-box mask,
-   and a light blur so the conic reads as a glow circling the perimeter
-   rather than a hard inset ring. Negative z-index + pointer-events:none keep
-   every control and the resize handle interactive. When the panel is hidden
-   ([hidden] -> display:none) the pseudo is not rendered. */
+/* ---- inspector cyan-silver ring glow (travelling along the OUTSIDE border) ----
+   A conic bright segment is masked to a thin ring that wraps the panel's outer
+   edge (inset -2px). The whole layer rotates via a plain CSS transform, so the
+   segment visibly travels around the border with no @property dependency
+   (reliable inside the closed shadow root). z-index 0 paints above the glass
+   background; the content surfaces below are lifted to z-index 1. */
 .comet-inspector::before {
   content: '';
   position: absolute;
-  inset: -4px;
+  inset: -2px;
   border-radius: inherit;
-  background: conic-gradient(from var(--bl-ring-angle, 0deg),
+  padding: 2px;
+  background: conic-gradient(from 0deg,
     transparent 0deg,
-    rgba(165, 243, 252, 0.05) 40deg,
-    rgba(125, 211, 252, 0.45) 90deg,
-    rgba(226, 232, 240, 0.35) 120deg,
-    rgba(165, 243, 252, 0.05) 160deg,
-    transparent 200deg,
+    rgba(125, 211, 252, 0.0) 20deg,
+    rgba(125, 211, 252, 0.55) 60deg,
+    rgba(226, 232, 240, 0.40) 90deg,
+    rgba(125, 211, 252, 0.0) 120deg,
+    transparent 180deg,
     transparent 360deg);
-  filter: blur(2px);
-  box-shadow: 0 0 10px rgba(125, 211, 252, 0.18);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  filter: blur(1.5px);
   pointer-events: none;
-  z-index: -1;
-  opacity: 0.4;
-  animation: comet-ring-spin 9s linear infinite, comet-ring-breathe 6.5s ease-in-out infinite;
+  z-index: 0;
+  opacity: 0.5;
+  transform-origin: 50% 50%;
+  will-change: transform, opacity;
+  animation: comet-ring-orbit 9s linear infinite, comet-ring-breathe 6.5s ease-in-out infinite;
 }
 
-/* Static ambient cyan-silver edge so the perimeter never looks dead between
-   sweeps. Outer inset sits on the border; pointer-events none keeps
-   resize/content interactive above it. */
+/* Static ambient edge keeps the perimeter present between travelling sweeps. */
 .comet-inspector::after {
   content: '';
   position: absolute;
@@ -2548,36 +2553,41 @@
   border: 1px solid rgba(148, 197, 233, 0.18);
   box-shadow: inset 0 0 0 1px rgba(226, 232, 240, 0.04);
   pointer-events: none;
-  z-index: -1;
+  z-index: 0;
 }
 
-/* GSAP-driven angle: suppress the discrete CSS spin (it would fight the GSAP
-   interpolation of --bl-ring-angle) but keep the opacity breathe. */
-.comet-inspector.comet-ring-js::before {
-  animation: comet-ring-breathe 6.5s ease-in-out infinite;
+/* The decorative layers sit above the glass background. Keep every panel
+   surface above them so labels and controls remain crisp and interactive. */
+.comet-inspector > .comet-insp-head,
+.comet-inspector > .comet-selection-head,
+.comet-inspector > .comet-selection-list,
+.comet-inspector > .comet-insp-rows,
+.comet-inspector > .comet-insp-foot {
+  position: relative;
+  z-index: 1;
 }
 
-@keyframes comet-ring-spin {
+@keyframes comet-ring-orbit {
+  from {
+    transform: rotate(0deg);
+  }
   to {
-    --bl-ring-angle: 360deg;
+    transform: rotate(360deg);
   }
 }
 
 @keyframes comet-ring-breathe {
   0%, 100% {
-    opacity: 0.4;
+    opacity: 0.42;
   }
   50% {
-    opacity: 0.85;
+    opacity: 0.78;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .comet-inspector::before,
-  .comet-inspector.comet-ring-js::before {
+  .comet-inspector::before {
     animation: none;
-    filter: none;
-    box-shadow: none;
     opacity: 0.2;
   }
 }

@@ -236,15 +236,29 @@ function saveLabel() {
 /* master switch ("Tool active"): default ON, persisted as "toolEnabled" */
 async function loadToolEnabled() {
   let enabled = true; // default ON
+  let stored = null;
   try {
     const got = await chrome.storage.local.get('toolEnabled');
-    if (got && typeof got.toolEnabled === 'boolean') enabled = got.toolEnabled;
+    if (got && typeof got.toolEnabled === 'boolean') {
+      enabled = got.toolEnabled;
+      stored = got.toolEnabled;
+    }
   } catch (_) { /* storage unavailable */ }
   // Reflect the ACTIVE TAB's real state (the tool may have been closed via
   // the toolbar's exit button, which does not touch toolEnabled).
   try {
     const resp = await chrome.runtime.sendMessage({ type: 'browserlinkGetState' });
-    if (resp && resp.ok && typeof resp.enabled === 'boolean') enabled = resp.enabled;
+    if (resp && resp.ok && typeof resp.enabled === 'boolean') {
+      enabled = resp.enabled;
+      // Belt-and-braces: when the content script is missing the SW reports
+      // the STORED toolEnabled; if it still reads false there, keep the
+      // persisted value instead of bouncing the switch OFF on a fresh page.
+      // (injected:false means no content script answered, so the stored
+      // value is the honest state; a real toolbar exit reports injected:true.)
+      if (resp.enabled === false && resp.injected === false && stored !== null) {
+        enabled = stored;
+      }
+    }
   } catch (_) { /* no receiver: keep the stored default */ }
   $('toolToggle').checked = enabled;
 }

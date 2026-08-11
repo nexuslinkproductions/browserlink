@@ -176,7 +176,6 @@
   // JavaScript loops (not only the CSS transitions in overlay.css).
   let reducedMotion = false;
   let motionMedia = null;
-  let inspectorRingPropertyRegistered = false;
   let inspectorRingTween = null;
   let collapseTimer = 0;
   let exitTimer = 0;
@@ -959,18 +958,10 @@
     statusEl.className = 'status' + (cls ? ' ' + cls : '');
   }
 
+  // Kept callable for init compatibility. The ring motion is transform-based
+  // CSS and does not require a registered custom property.
   function registerInspectorRingProperty() {
-    inspectorRingPropertyRegistered = false;
-    if (typeof CSS === 'undefined' || typeof CSS.registerProperty !== 'function') return;
-    inspectorRingPropertyRegistered = true;
-    try {
-      CSS.registerProperty({
-        name: '--bl-ring-angle',
-        syntax: '<angle>',
-        inherits: false,
-        initialValue: '0deg',
-      });
-    } catch (_) { /* already registered for this document */ }
+    return;
   }
 
   function updateMotionPreference() {
@@ -1082,56 +1073,15 @@
     inspectorRingTween = null;
   }
 
-  // Primary angle driver for closed-shadow reliability: GSAP tweens the
-  // registered (or unregistered) custom property on the host while CSS owns
-  // the outside conic glow + breathe. CSS comet-ring-spin remains the no-GSAP
-  // fallback when document-level @property registration succeeded.
+  // The inspector orbit is owned entirely by CSS transforms. Keep these
+  // lifecycle helpers callable so existing open/close paths stay unchanged.
   function startInspectorRingTween() {
     stopInspectorRingTween();
-    if (!inspPanel || inspPanel.hidden || isReducedMotion()) return;
-    if (!gsapReady || !gsapLib || typeof gsapLib.to !== 'function') return;
-    inspPanel.classList.add('comet-ring-js');
-    inspPanel.style.setProperty('--bl-ring-angle', '0deg');
-    // The custom-property tween is the one unguarded runtime call in the
-    // openInspector chain; a GSAP parse failure must degrade to a static
-    // ring, never crash element picking (crash surfaced at the
-    // openInspector call inside openChat).
-    try {
-      inspectorRingTween = gsapLib.to(inspPanel, {
-        '--bl-ring-angle': '360deg',
-        duration: 9,
-        repeat: -1,
-        ease: 'none',
-      });
-    } catch (err) {
-      inspectorRingTween = null;
-      inspPanel.classList.remove('comet-ring-js');
-      inspPanel.style.setProperty('--bl-ring-angle', '0deg');
-      diagLog('error', 'ring tween failed: ' + (err && err.message ? err.message : String(err)));
-    }
   }
 
   function syncInspectorRingAnimation() {
     try {
       stopInspectorRingTween();
-      if (!inspPanel || inspPanel.hidden) return;
-      if (isReducedMotion()) {
-        inspPanel.classList.remove('comet-ring-js');
-        inspPanel.style.setProperty('--bl-ring-angle', '0deg');
-        return;
-      }
-      if (gsapReady) {
-        startInspectorRingTween();
-        return;
-      }
-      // No GSAP: rely on CSS @keyframes spin when document-level registration
-      // succeeded; otherwise freeze a static angle (still shows ambient ::after).
-      inspPanel.classList.remove('comet-ring-js');
-      if (inspectorRingPropertyRegistered) {
-        inspPanel.style.removeProperty('--bl-ring-angle');
-        return;
-      }
-      inspPanel.style.setProperty('--bl-ring-angle', '0deg');
     } catch (err) {
       diagLog('error', 'syncInspectorRingAnimation failed: ' + (err && err.message ? err.message : String(err)));
     }

@@ -265,23 +265,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'browserlinkGetState') {
     // Popup asks for the active tab's real tool state (enabled/closed).
+    // When the content script is absent (fresh page, or after an extension
+    // reload) fall back to the STORED toolEnabled (default true) so the
+    // switch reflects the persisted state instead of a hardcoded OFF.
+    const storedEnabled = () =>
+      chrome.storage.local.get('toolEnabled')
+        .then((got) => (got && typeof got.toolEnabled === 'boolean' ? got.toolEnabled : true))
+        .catch(() => true);
+    const respondMissing = () =>
+      storedEnabled().then((enabled) =>
+        sendResponse({ ok: true, enabled: enabled, injected: false }));
     chrome.tabs.query({ active: true, currentWindow: true })
       .then((tabs) => {
         const tab = tabs && tabs[0];
-        if (!tab || typeof tab.id !== 'number') {
-          sendResponse({ ok: true, enabled: false });
-          return;
-        }
+        if (!tab || typeof tab.id !== 'number') return respondMissing();
         return chrome.tabs.sendMessage(tab.id, { type: 'browserlinkGetState' })
-          .then((resp) => sendResponse({ ok: true, enabled: !!(resp && resp.enabled) }))
-          .catch(() => sendResponse({ ok: true, enabled: false }));
+          .then((resp) => sendResponse({ ok: true, enabled: !!(resp && resp.enabled), injected: true }))
+          .catch(() => respondMissing());
       })
-      .catch(() => sendResponse({ ok: true, enabled: false }));
+      .catch(() => respondMissing());
     return true;
   }
 
   if (msg.type === 'browserlinkToggle' || msg.type === 'browserlinkExit') {
     // Forward activation/deactivation from the popup to the active tab.
+    // If the content script is absent (fresh page, or after an extension
+    // reload) inject it on demand so the popup works without a refresh.
     chrome.tabs.query({ active: true, currentWindow: true })
       .then((tabs) => {
         const tab = tabs && tabs[0];
@@ -289,10 +298,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, error: 'no active tab' });
           return;
         }
+        const injectThenSend = () =>
+          chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ['gsap.min.js', 'CustomEase.min.js', 'content.js'],
+          })
+            .then(() => {
+              // content.js init is async: try the message right away, and
+              // retry once after ~150ms if the listener is not ready yet.
+              const trySend = () =>
+                chrome.tabs.sendMessage(tab.id, msg)
+                  .then(() => sendResponse({ ok: true }))
+                  .catch((err) => {
+                    sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
+                  });
+              return chrome.tabs.sendMessage(tab.id, msg)
+                .then(() => sendResponse({ ok: true }))
+                .catch(() => new Promise((resolve) => setTimeout(resolve, 150)).then(trySend));
+            })
+            .catch((err) => {
+              sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
+            });
         return chrome.tabs.sendMessage(tab.id, msg)
           .then(() => sendResponse({ ok: true }))
-          .catch((err) => {
-            sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
+          .catch(() => {
+            if (msg.type === 'browserlinkExit') {
+              // Nothing to exit: the content script was never injected.
+              sendResponse({ ok: true });
+              return;
+            }
+            return injectThenSend();
           });
       })
       .catch((err) => {
