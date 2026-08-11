@@ -2,7 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { logError, logSuccess, MAX_MESSAGE_TEXT_LENGTH } from "../schema.ts";
 
 export type JsonObject = Record<string, unknown>;
@@ -248,6 +248,142 @@ function imageDataUrl(pngPath: string): string | null {
   }
 }
 
+/** One composer attachment chip: an image thumbnail or a file chip. */
+export interface ComposerAttachment {
+  kind: "image" | "file";
+  path: string;
+  label: string;
+}
+
+/**
+ * Build the composer attach payload for an annotation (exported for tests).
+ *
+ * The image chip is included only when the screenshot PNG exists on disk;
+ * the file chip is included when the annotation JSON exists. Both missing
+ * returns an empty array: text-only annotations skip the injection entirely
+ * and still ship through /chat.
+ */
+export function buildComposerAttachments(
+  annotation: JsonObject,
+  annotationPath?: string | null,
+): ComposerAttachment[] {
+  const attachments: ComposerAttachment[] = [];
+
+  const screenshotFile = annotation.screenshotFile;
+  if (typeof screenshotFile === "string" && screenshotFile) {
+    const pngPath = annotationPath
+      ? join(dirname(resolve(annotationPath)), screenshotFile)
+      : join(dataDir(), "annotations", screenshotFile);
+    try {
+      readFileSync(pngPath);
+      attachments.push({
+        kind: "image",
+        path: resolve(pngPath),
+        label: "Annotation screenshot",
+      });
+    } catch {
+      // omit the image chip when the PNG is missing on disk
+    }
+  }
+
+  if (annotationPath) {
+    try {
+      readFileSync(annotationPath);
+      attachments.push({
+        kind: "file",
+        path: resolve(annotationPath),
+        label: basename(resolve(annotationPath)),
+      });
+    } catch {
+      // omit the file chip when the JSON is missing on disk
+    }
+  }
+
+  return attachments;
+}
+
+// Best-effort surface: the injection must never delay or fail the /chat
+// delivery, so it gets a short bounded timeout and no retries.
+const COMPOSER_ATTACH_TIMEOUT_MS = 15_000;
+
+/**
+ * Deliver the annotation's screenshot + JSON to the Hermes gateway composer
+ * attach endpoint so the desktop surfaces them as drag-and-drop-style
+ * composer chips (image thumbnail + file chip). The user then sends them
+ * through the normal desktop submit path. Defensive by design: a missing
+ * endpoint (404 while the gateway side is still being deployed), any other
+ * HTTP error, or a network failure is logged and falls through; this call
+ * never throws and never blocks the /chat POST.
+ */
+async function injectComposerAttachments(
+  sessionId: string,
+  annotation: JsonObject,
+  annotationPath?: string | null,
+): Promise<void> {
+  const apiUrl = process.env.HERMES_API_URL;
+  const apiKey = process.env.HERMES_API_KEY;
+  if (!(apiUrl && apiKey)) return;
+
+  const attachments = buildComposerAttachments(annotation, annotationPath);
+  if (attachments.length === 0) return; // text-only: skip silently
+
+  const endpoint = `${apiUrl.replace(/\/+$/, "")}/api/composer/attach`;
+  const body = JSON.stringify({ sessionId, attachments });
+
+  const annotationId =
+    typeof annotation.id === "string" && annotation.id ? annotation.id : null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), COMPOSER_ATTACH_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (response.ok) {
+      logSuccess({
+        adapter: "hermes",
+        annotationId,
+        sessionId,
+        messageId: null,
+        message: "composer-attached",
+      });
+      console.info(
+        `Hermes adapter: composer attach delivered ${attachments.length} attachment(s) to session ${sessionId} (${response.status})`,
+      );
+      return;
+    }
+
+    if (response.status === 404) {
+      // The gateway endpoint may not be deployed yet. The /chat delivery
+      // still carries the annotation, so this is informational, not an error.
+      console.info(
+        `Hermes adapter: composer attach endpoint not available (404) for session ${sessionId}; annotation still delivered via /chat`,
+      );
+      return;
+    }
+
+    console.warn(
+      `Hermes adapter: composer attach HTTP ${response.status} for session ${sessionId}`,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `Hermes adapter: composer attach failed for session ${sessionId}: ${message}`,
+    );
+  }
+}
+
 export async function register(
   annotation: JsonObject,
   annotationPath?: string | null,
@@ -319,6 +455,13 @@ export async function register(
     console.info(`Hermes adapter: annotation ${annotationId} already delivered; skipping`);
     return;
   }
+
+  // Composer injection: surface the screenshot + JSON as drag-and-drop-style
+  // composer chips on the desktop. Runs before the (potentially minutes-long)
+  // /chat turn so the chips appear immediately; best-effort and 404-safe, it
+  // never blocks the /chat delivery below.
+  await injectComposerAttachments(sessionId, annotation, annotationPath);
+
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
