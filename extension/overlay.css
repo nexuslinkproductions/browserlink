@@ -20,6 +20,17 @@
  * page document, where the manifest-injected copy lives) ----
  * Single source for all UI colors. Only the fixed annotation palette
  * (#ff5252/#4a9eff/#ffd166/#35c759) is hardcoded in the shadow content. */
+/* ---- send capture state: hide only what overlaps the element crop ----
+   The capture is cropped to the selected element rect (+8px), so the toolbar
+   and chip are outside the shot and must NOT blink. The hover box and canvas
+   strokes sit ON the element and would pollute the crop, so they hide. The
+   inspector and chat card stay fully visible while the note sends. */
+:host(.comet-capturing) .comet-hl,
+:host(.comet-capturing) .comet-hover-box,
+:host(.comet-capturing) canvas {
+  visibility: hidden !important;
+}
+
 :host {
   /* Legacy tokens (kept as the single color source; values tuned for glass). */
   --bl-bg: rgba(16, 18, 24, 0.92);
@@ -47,6 +58,7 @@
   right: 12px;
   z-index: 2147483647;
   display: flex;
+  box-sizing: border-box;
   align-items: center;
   gap: 6px;
   padding: 8px 12px;
@@ -526,6 +538,25 @@
   white-space: normal;
   max-width: 72px;
 }
+
+/* JS owns these transforms. Disabling the generic 100ms transition prevents
+   CSS from low-pass filtering pointer and GSAP frame updates. */
+.comet-toolbar.comet-toolbar-dragging,
+.comet-chip.comet-toolbar-dragging,
+.comet-toolbar.comet-toolbar-motion,
+.comet-chip.comet-toolbar-motion,
+.comet-toolbar.comet-toolbar-morphing {
+  transition: none !important;
+  will-change: transform;
+}
+.comet-toolbar.comet-toolbar-morphing {
+  overflow: visible;
+  transform-origin: 0 0;
+}
+.comet-toolbar.comet-toolbar-morphing > * {
+  transition: none !important;
+  will-change: transform, opacity;
+}
 .comet-toolbar.comet-fold-out {
   will-change: transform, opacity, filter;
 }
@@ -580,13 +611,14 @@
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: 0 0 auto;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.09em;
   text-transform: uppercase;
   color: var(--bl-muted, #a3aab8);
   border-bottom: 1px solid rgba(255, 255, 255, 0.09);
-  padding-bottom: 8px;
+  padding: 2px 0 8px;
 }
 .comet-insp-drag {
   flex: 0 0 auto;
@@ -1613,7 +1645,8 @@
 .comet-selection-head {
   display: flex;
   align-items: center;
-  min-height: 18px;
+  flex-shrink: 0;
+  min-height: 22px;
 }
 .comet-selection-count {
   color: var(--bl-text, #eef1f6);
@@ -1629,6 +1662,8 @@
   display: flex;
   flex-direction: column;
   gap: 3px;
+  flex-shrink: 0;
+  min-height: 40px;
   max-height: 116px;
   overflow-y: auto;
   padding-right: 2px;
@@ -2512,11 +2547,13 @@
 }
 
 /* ---- inspector cyan-silver ring glow (travelling INSIDE the border) ----
-   A conic bright segment is masked to a thin ring that hugs the panel's inner
+   A conic bright segment is masked to a thin ring hugging the panel's inner
    edge (inset 0, border-radius inherit so it follows the corners), exactly
-   like the field focus glow but rotating. The layer rotates with a plain CSS
-   transform (no @property needed inside the closed shadow root), so the
-   segment travels around the frame while the ring itself stays put. */
+   like the field focus glow but rotating. The layer itself does NOT rotate
+   (a rotating rounded-rect mask would leave the corners); instead the conic
+   ANGLE --bl-ring-angle is animated: GSAP tweens the custom property on the
+   panel (reliable inside the closed shadow root) and the CSS keyframes below
+   are the no-GSAP fallback. */
 .comet-inspector::before {
   content: '';
   position: absolute;
@@ -2525,10 +2562,10 @@
   padding: 2px;
   background: conic-gradient(from var(--bl-ring-angle, 0deg),
     transparent 0deg,
-    rgba(165, 243, 252, 0.06) 40deg,
-    rgba(125, 211, 252, 0.55) 90deg,
-    rgba(226, 232, 240, 0.40) 120deg,
-    rgba(165, 243, 252, 0.06) 160deg,
+    rgba(165, 243, 252, 0.08) 40deg,
+    rgba(125, 211, 252, 0.72) 90deg,
+    rgba(226, 232, 240, 0.55) 120deg,
+    rgba(165, 243, 252, 0.08) 160deg,
     transparent 200deg,
     transparent 360deg);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
@@ -2538,10 +2575,19 @@
   filter: blur(1px);
   pointer-events: none;
   z-index: 0;
-  opacity: 0.5;
-  transform-origin: 50% 50%;
-  will-change: transform, opacity;
-  animation: comet-ring-orbit 9s linear infinite, comet-ring-breathe 6.5s ease-in-out infinite;
+  opacity: 0.62;
+  animation: comet-ring-breathe 6.5s ease-in-out infinite;
+}
+
+/* No-GSAP fallback: spin the angle with a keyframe (needs the property
+   registered at document level, which content.js does via
+   CSS.registerProperty('--bl-ring-angle')). */
+.comet-inspector:not(.comet-ring-js)::before {
+  animation: comet-ring-spin 9s linear infinite, comet-ring-breathe 6.5s ease-in-out infinite;
+}
+
+@keyframes comet-ring-spin {
+  to { --bl-ring-angle: 360deg; }
 }
 
 /* Static ambient edge keeps the perimeter present between travelling sweeps. */
@@ -2565,15 +2611,6 @@
 .comet-inspector > .comet-insp-foot {
   position: relative;
   z-index: 1;
-}
-
-@keyframes comet-ring-orbit {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
 }
 
 @keyframes comet-ring-breathe {

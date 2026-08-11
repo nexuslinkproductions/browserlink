@@ -3,8 +3,13 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { logError } from "../schema.ts";
 
 export type JsonObject = Record<string, unknown>;
+
+// Annotation ids already delivered in this process. Prevents a duplicate
+// POST (or a retry that actually succeeded server-side) from double-sending.
+const deliveredIds = new Set<string>();
 
 function expandUser(path: string): string {
   if (path === "~") return homedir();
@@ -166,6 +171,21 @@ export function formatMessage(
   const strokeCount = Array.isArray(strokes) ? strokes.length : 0;
   lines.push(`${strokeCount} stroke(s)`);
 
+  // Queued annotation notes (the extension sends both a legacy `note` and a
+  // `notes` array; surface whichever is present so the note is never dropped).
+  const notes = annotation.notes;
+  if (Array.isArray(notes) && notes.length) {
+    const list = notes
+      .map((n) => String(n ?? ""))
+      .filter((n) => n.trim())
+      .map((n) => `- ${n.trim()}`)
+      .join("\n");
+    if (list) lines.push(`Notes:\n${list}`);
+  } else {
+    const note = String(annotation.note ?? "");
+    if (note.trim()) lines.push(`Note: ${note.trim()}`);
+  }
+
   // Always append @file last when the annotation JSON exists.
   if (annotationPath) {
     try {
@@ -270,23 +290,76 @@ export async function register(
 
   const body = JSON.stringify(bodyDict);
 
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 300_000);
+  // Retry only on network/timeout failures (never on HTTP 4xx: those are
+  // deterministic and retrying them would just repeat the rejection). Two
+  // retries with 1s / 4s backoff. The annotation id dedupes deliveries so a
+  // duplicate POST cannot double-send the same annotation.
+  const annotationId =
+    typeof annotation.id === "string" && annotation.id ? annotation.id : null;
+  if (annotationId && deliveredIds.has(annotationId)) {
+    console.info(`Hermes adapter: annotation ${annotationId} already delivered; skipping`);
+    return;
+  }
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body,
-        signal: controller.signal,
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 300_000);
+      let response: Response;
+      try {
+        response = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body,
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (response.ok) {
+        if (annotationId) deliveredIds.add(annotationId);
+        console.info(
+          `Hermes adapter: delivered annotation${annotationId ? ` ${annotationId}` : ""} to session ${sessionId} (${response.status})`,
+        );
+        return;
+      }
+
+      // HTTP error: log it. 4xx is a hard failure (no retry); 5xx may be
+      // transient so retry those with backoff.
+      const detail = await response.text().catch(() => "");
+      logError({
+        adapter: "hermes",
+        annotationId,
+        sessionId,
+        error: `HTTP ${response.status} from ${endpoint}${detail ? `: ${detail.slice(0, 500)}` : ""}`,
       });
-    } finally {
-      clearTimeout(timer);
+      if (response.status < 500) {
+        console.warn(
+          `Hermes adapter: HTTP ${response.status} not retried for session ${sessionId}`,
+        );
+        return;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (attempt < maxAttempts) {
+        console.warn(
+          `Hermes adapter: attempt ${attempt} failed (${message}); retrying in ${attempt}s`,
+        );
+        await new Promise((resolveWait) =>
+          setTimeout(resolveWait, attempt * 1000),
+        );
+        continue;
+      }
+      logError({
+        adapter: "hermes",
+        annotationId,
+        sessionId,
+        error: `network failure after ${maxAttempts} attempts: ${message}`,
+      });
     }
-  } catch (error) {
-    console.warn("Hermes adapter failed:", error);
   }
 }

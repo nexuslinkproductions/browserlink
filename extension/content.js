@@ -187,9 +187,13 @@
   let lastSelectionCount = -1;
 
   /* ---------------- drag + per-tab persistence ---------------- */
-  let drag = null;             // {target, pointerId, startX, startY, baseX, baseY, prevDock, moved}
+  let drag = null;             // active toolbar/chip pointer drag
   let suppressChipClick = false; // chip click right after a drag = restore, not drag
   let lastDragPersist = 0;
+  let toolbarDragRaf = 0;
+  let toolbarDockLayoutToken = 0;
+  let toolbarMorphTimeline = null;
+  let toolbarMorphCleanup = null;
   let messagesBound = false;   // chrome.runtime.onMessage registered once
 
   /* ---------------- diagnostics (window.__browserlinkDiag) ----------------
@@ -490,10 +494,11 @@
     return clampPos(window.innerWidth - s.w - POS_PAD, POS_PAD, s.w, s.h);
   }
 
-  function applyPosition(x, y) {
+  // Commit an unclamped position to both toolbar surfaces. Dragging updates
+  // this only at frame boundaries, while normal placement clamps first.
+  function writeToolbarPosition(x, y) {
     if (!toolbar) return;
-    const s = currentSurfaceSize();
-    const p = clampPos(x, y, s.w, s.h);
+    const p = { x, y };
     state.position = p;
     const l = p.x + 'px';
     const t = p.y + 'px';
@@ -505,6 +510,12 @@
       chipEl.style.top = t;
       chipEl.style.right = 'auto';
     }
+  }
+
+  function applyPosition(x, y) {
+    const s = currentSurfaceSize();
+    const p = clampPos(x, y, s.w, s.h);
+    writeToolbarPosition(p.x, p.y);
   }
 
   function clearToolbarDockClasses() {
@@ -520,6 +531,47 @@
     if (TOOLBAR_DOCK_SIDES.indexOf(side) !== -1) {
       toolbar.classList.add('comet-dock-' + side);
     }
+  }
+
+  function toolbarRenderedDock() {
+    if (!toolbar) return null;
+    for (let i = 0; i < TOOLBAR_DOCK_SIDES.length; i += 1) {
+      const side = TOOLBAR_DOCK_SIDES[i];
+      if (toolbar.classList.contains('comet-dock-' + side)) return side;
+    }
+    return null;
+  }
+
+  function toolbarIsVertical(side) {
+    return side === 'left' || side === 'right';
+  }
+
+  // A dock class changes flex direction and therefore the measured box. Two
+  // frames plus a forced layout read guarantee measurement of the settled CSS
+  // shape, and the token prevents stale placement work from fighting a drag.
+  function scheduleToolbarLayout(fn) {
+    const token = ++toolbarDockLayoutToken;
+    const run = () => {
+      if (token !== toolbarDockLayoutToken || !toolbar) return;
+      void toolbar.offsetHeight;
+      fn();
+    };
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => requestAnimationFrame(run));
+    } else {
+      run();
+    }
+  }
+
+  function snapshotToolbarMorph() {
+    if (!toolbar || state.collapsed || toolbar.style.display === 'none') return null;
+    const box = toolbar.getBoundingClientRect();
+    if (!box.width || !box.height) return null;
+    const children = Array.from(toolbar.children).map((el) => ({
+      el,
+      rect: el.getBoundingClientRect(),
+    })).filter((entry) => entry.rect.width > 0 && entry.rect.height > 0);
+    return { box, children };
   }
 
   // Centered edge pin for the current surface size (toolbar or chip).
@@ -560,12 +612,15 @@
   }
 
   function animateToolbarDockTo(target, onDone) {
-    if (!toolbar) {
+    const surface = state.collapsed && chipEl ? chipEl : toolbar;
+    if (!surface) {
       if (typeof onDone === 'function') onDone();
       return;
     }
     const from = state.position || defaultPosition();
-    applyPosition(from.x, from.y);
+    // Keep the exact pointer-release position. The target was already clamped,
+    // so clamping here would create a visible jump before the snap tween.
+    writeToolbarPosition(from.x, from.y);
     if (isReducedMotion() || !gsapReady) {
       applyPosition(target.x, target.y);
       if (typeof onDone === 'function') onDone();
@@ -573,31 +628,27 @@
     }
     const dx = target.x - from.x;
     const dy = target.y - from.y;
-    gsapKill(toolbar);
-    gsapSet(toolbar, { x: 0, y: 0, scale: 1, opacity: 1 });
-    gsapLib.to(toolbar, {
+    surface.classList.add('comet-toolbar-motion');
+    gsapKill(surface);
+    gsapSet(surface, { x: 0, y: 0, scale: 1, opacity: 1 });
+    gsapLib.to(surface, {
       x: dx,
       y: dy,
       scale: 1.03,
       duration: 0.18,
       ease: EASE.md3Emphasized,
       overwrite: true,
-      onUpdate: () => {
-        if (chipEl && state.collapsed) {
-          chipEl.style.left = toolbar.style.left;
-          chipEl.style.top = toolbar.style.top;
-        }
-      },
       onComplete: () => {
-        applyPosition(target.x, target.y);
-        gsapSet(toolbar, { x: 0, y: 0 });
-        gsapLib.to(toolbar, {
+        writeToolbarPosition(target.x, target.y);
+        gsapSet(surface, { x: 0, y: 0 });
+        gsapLib.to(surface, {
           scale: 1,
           duration: 0.14,
           ease: EASE.spring,
           overwrite: true,
           onComplete: () => {
-            gsapSet(toolbar, { clearProps: 'transform,scale,x,y' });
+            gsapSet(surface, { clearProps: 'transform,scale,x,y' });
+            surface.classList.remove('comet-toolbar-motion');
             if (typeof onDone === 'function') onDone();
           },
         });
@@ -605,33 +656,203 @@
     });
   }
 
+  function stopToolbarOrientationMorph() {
+    const timeline = toolbarMorphTimeline;
+    const cleanup = toolbarMorphCleanup;
+    toolbarMorphTimeline = null;
+    toolbarMorphCleanup = null;
+    if (timeline) {
+      try { timeline.kill(); } catch (_) { /* ok */ }
+    }
+    if (cleanup) cleanup(false);
+  }
+
+  // Manual nested FLIP. The toolbar transform maps the new row/column box
+  // back onto the old box, while each child is counter-scaled and translated
+  // to its old screen rect. GSAP then resolves both layers to the new layout.
+  function animateToolbarOrientationMorph(snapshot, target, oldVertical, newVertical, onDone) {
+    if (!toolbar || !snapshot) {
+      applyPosition(target.x, target.y);
+      if (typeof onDone === 'function') onDone();
+      return;
+    }
+
+    writeToolbarPosition(target.x, target.y);
+    void toolbar.offsetHeight;
+    const finalBox = toolbar.getBoundingClientRect();
+    const pairs = snapshot.children.map((entry) => ({
+      el: entry.el,
+      from: entry.rect,
+      to: entry.el.getBoundingClientRect(),
+    })).filter((entry) => entry.to.width > 0 && entry.to.height > 0);
+
+    const finishInstant = () => {
+      writeToolbarPosition(target.x, target.y);
+      if (toolbar) toolbar.classList.remove('comet-toolbar-morphing', 'comet-toolbar-motion');
+      if (typeof onDone === 'function') onDone();
+    };
+    if (isReducedMotion() || !gsapReady || !finalBox.width || !finalBox.height || !pairs.length) {
+      finishInstant();
+      return;
+    }
+
+    stopToolbarOrientationMorph();
+    const scaleX = snapshot.box.width / finalBox.width;
+    const scaleY = snapshot.box.height / finalBox.height;
+    const translateX = snapshot.box.left - finalBox.left;
+    const translateY = snapshot.box.top - finalBox.top;
+    let finished = false;
+    const cleanup = (notify) => {
+      if (finished) return;
+      finished = true;
+      toolbarMorphTimeline = null;
+      toolbarMorphCleanup = null;
+      if (toolbar) {
+        gsapSet(toolbar, { clearProps: 'transform,transformOrigin,scale,scaleX,scaleY,x,y,rotation' });
+        toolbar.classList.remove('comet-toolbar-morphing', 'comet-toolbar-motion');
+      }
+      pairs.forEach((entry) => {
+        gsapSet(entry.el, { clearProps: 'transform,transformOrigin,opacity,scale,scaleX,scaleY,x,y,rotation' });
+      });
+      writeToolbarPosition(target.x, target.y);
+      applyMode({ instant: true });
+      if (notify && typeof onDone === 'function') onDone();
+    };
+    toolbarMorphCleanup = cleanup;
+
+    toolbar.classList.add('comet-toolbar-morphing', 'comet-toolbar-motion');
+    gsapKill(toolbar);
+    gsapSet(toolbar, {
+      transformOrigin: '0 0',
+      x: translateX,
+      y: translateY,
+      scaleX,
+      scaleY,
+    });
+
+    pairs.forEach((entry) => {
+      const oldLocalX = entry.from.left - snapshot.box.left;
+      const oldLocalY = entry.from.top - snapshot.box.top;
+      const newLocalX = entry.to.left - finalBox.left;
+      const newLocalY = entry.to.top - finalBox.top;
+      const childScaleX = (entry.from.width / (entry.to.width * scaleX)) * 0.96;
+      const childScaleY = (entry.from.height / (entry.to.height * scaleY)) * 0.96;
+      const vars = {
+        transformOrigin: '0 0',
+        x: (oldLocalX / scaleX) - newLocalX,
+        y: (oldLocalY / scaleY) - newLocalY,
+        scaleX: childScaleX,
+        scaleY: childScaleY,
+        opacity: 0.82,
+      };
+      if (entry.el === dragHandle) vars.rotation = oldVertical ? 90 : 0;
+      gsapKill(entry.el);
+      gsapSet(entry.el, vars);
+    });
+
+    toolbarMorphTimeline = gsapLib.timeline({
+      onComplete: () => cleanup(true),
+    });
+    toolbarMorphTimeline.to(toolbar, {
+      x: 0,
+      y: 0,
+      scaleX: 1,
+      scaleY: 1,
+      duration: 0.32,
+      ease: EASE.md3Emphasized,
+    }, 0);
+    toolbarMorphTimeline.to(pairs.map((entry) => entry.el), {
+      x: 0,
+      y: 0,
+      scaleX: 1,
+      scaleY: 1,
+      opacity: 1,
+      duration: 0.16,
+      ease: EASE.md3Emphasized,
+      stagger: 0.022,
+    }, 0.018);
+    if (dragHandle) {
+      toolbarMorphTimeline.to(dragHandle, {
+        rotation: newVertical ? 90 : 0,
+        duration: 0.28,
+        ease: EASE.md3Emphasized,
+      }, 0);
+    }
+  }
+
   // Snap / animate the main toolbar to an edge (or float). Persists toolbarDock.
   function setToolbarDock(side, opts) {
     const o = opts || {};
     const next = TOOLBAR_DOCK_SIDES.indexOf(side) !== -1 ? side : null;
-    const prev = state.toolbarDock;
+
+    // Finish any prior layout work before reading the rendered orientation.
+    toolbarDockLayoutToken += 1;
+    stopToolbarOrientationMorph();
+    const renderedBefore = toolbarRenderedDock();
+    const oldVertical = toolbarIsVertical(renderedBefore);
+    const newVertical = toolbarIsVertical(next);
+    const desiredPosition = state.position
+      ? { x: state.position.x, y: state.position.y }
+      : null;
+    const shouldMorph = !!o.animate && !state.collapsed && oldVertical !== newVertical;
+    const morphSnapshot = shouldMorph ? snapshotToolbarMorph() : null;
+
     state.toolbarDock = next;
     diagLog('dock', 'toolbar=' + (next || 'float'));
     applyToolbarDockClasses(next);
+    applyMode({ instant: true });
+
+    const finishPlacement = () => {
+      if (toolbar) toolbar.style.visibility = '';
+      if (chipEl) chipEl.style.visibility = '';
+      if (o.persist !== false) {
+        saveTabState({ toolbarDock: next, position: state.position });
+      }
+      if (typeof o.onComplete === 'function') o.onComplete();
+    };
+
     const place = () => {
+      if (!toolbar || state.toolbarDock !== next) return;
+      void toolbar.offsetHeight;
+      const size = currentSurfaceSize();
+      let target;
       if (next) {
-        const target = dockedToolbarPosition(next);
-        if (o.animate && prev !== next) animateToolbarDockTo(target);
-        else applyPosition(target.x, target.y);
-      } else if (state.position) {
-        applyPosition(state.position.x, state.position.y);
+        target = dockedToolbarPosition(next);
       } else {
-        const d = defaultPosition();
-        applyPosition(d.x, d.y);
+        const desired = desiredPosition || defaultPosition();
+        target = clampPos(desired.x, desired.y, size.w, size.h);
+      }
+
+      if (morphSnapshot) {
+        animateToolbarOrientationMorph(
+          morphSnapshot,
+          target,
+          oldVertical,
+          newVertical,
+          finishPlacement
+        );
+        return;
+      }
+
+      const from = state.position || target;
+      const moved = Math.abs(target.x - from.x) > 0.5 || Math.abs(target.y - from.y) > 0.5;
+      if (o.animate && moved) {
+        animateToolbarDockTo(target, finishPlacement);
+      } else {
+        applyPosition(target.x, target.y);
+        finishPlacement();
       }
     };
-    // Layout class change can alter size; place after the browser reflows.
-    if (typeof requestAnimationFrame === 'function') {
-      requestAnimationFrame(place);
-    } else {
+
+    // Runtime orientation FLIP must be inverted before this event can paint.
+    // Non-morph placement uses two frames so first-run centering measures the
+    // fully styled row/column dimensions rather than the pre-class box.
+    if (morphSnapshot) {
+      void toolbar.offsetHeight;
       place();
+    } else {
+      scheduleToolbarLayout(place);
     }
-    if (o.persist !== false) saveTabState({ toolbarDock: next, position: state.position });
   }
 
   function clearToolbarFoldProps() {
@@ -958,10 +1179,21 @@
     statusEl.className = 'status' + (cls ? ' ' + cls : '');
   }
 
-  // Kept callable for init compatibility. The ring motion is transform-based
-  // CSS and does not require a registered custom property.
+  // Document-level registration for the ring angle custom property. The
+  // stylesheet lives inside a closed shadow root where @property rules do not
+  // register reliably; CSS.registerProperty at document level makes the
+  // keyframe fallback (comet-ring-spin) interpolate smoothly.
   function registerInspectorRingProperty() {
-    return;
+    try {
+      if (typeof CSS !== 'undefined' && typeof CSS.registerProperty === 'function') {
+        CSS.registerProperty({
+          name: '--bl-ring-angle',
+          syntax: '<angle>',
+          inherits: true,
+          initialValue: '0deg',
+        });
+      }
+    } catch (_) { /* already registered or unsupported */ }
   }
 
   function updateMotionPreference() {
@@ -1071,17 +1303,38 @@
     if (!inspectorRingTween) return;
     try { inspectorRingTween.kill(); } catch (_) { /* ok */ }
     inspectorRingTween = null;
+    if (inspPanel) inspPanel.classList.remove('comet-ring-js');
   }
 
-  // The inspector orbit is owned entirely by CSS transforms. Keep these
-  // lifecycle helpers callable so existing open/close paths stay unchanged.
+  // GSAP is the primary angle driver: it tweens --bl-ring-angle on the panel
+  // (reliable inside the closed shadow root). The comet-ring-js class tells
+  // the CSS to skip its own keyframe spin so the two never fight. Without
+  // GSAP (or under reduced motion) the CSS keyframe fallback takes over.
   function startInspectorRingTween() {
     stopInspectorRingTween();
+    if (!inspPanel || inspPanel.hidden || isReducedMotion()) return;
+    if (!gsapReady || typeof gsapLib === 'undefined') return;
+    try {
+      inspPanel.classList.add('comet-ring-js');
+      inspectorRingTween = gsapLib.to(inspPanel, {
+        '--bl-ring-angle': '360deg',
+        duration: 9,
+        repeat: -1,
+        ease: 'none',
+      });
+    } catch (err) {
+      diagLog('error', 'startInspectorRingTween failed: ' + (err && err.message ? err.message : String(err)));
+      inspPanel.classList.remove('comet-ring-js');
+    }
   }
 
   function syncInspectorRingAnimation() {
     try {
-      stopInspectorRingTween();
+      if (!inspPanel || inspPanel.hidden) {
+        stopInspectorRingTween();
+        return;
+      }
+      startInspectorRingTween();
     } catch (err) {
       diagLog('error', 'syncInspectorRingAnimation failed: ' + (err && err.message ? err.message : String(err)));
     }
@@ -1250,7 +1503,10 @@
       gsapSet(sentToastEl, { clearProps: 'opacity,transform,x,y,scale' });
     };
     if (isReducedMotion() || !gsapReady) {
-      gsapSet(sentToastEl, { opacity: 1, xPercent: -50, y: 0, scale: 1 });
+      // Opacity only: the base rule already centers via translateX(-50%), and
+      // the no-GSAP fallback cannot express xPercent (it would drop the
+      // centering translate). Clear stale inline transforms from a prior toast.
+      gsapSet(sentToastEl, { opacity: 1, clearProps: 'transform,x,y,scale' });
       sentToastTimer = setTimeout(() => {
         sentToastTimer = 0;
         finishHide();
@@ -1507,6 +1763,24 @@
     return s.length > CHIP_MAX ? s.slice(0, CHIP_MAX) + '…' : s;
   }
 
+  // Hover chip label: tag#id chip plus the queue badge while element mode is
+  // active and the hover box is showing. A hovered element that is already
+  // committed shows its own queue number (E<n>); any other element shows the
+  // total queued count, so the queue length is always visible while picking.
+  function hoverChipLabel(el) {
+    let label = chipFromEl(el);
+    if (!state.elementMode || !state.elements.length) return label;
+    const qi = state.elements.findIndex((en) => en.el === el);
+    if (qi !== -1) {
+      const en = state.elements[qi];
+      const num = en.descriptor && en.descriptor.index != null ? en.descriptor.index : qi + 1;
+      label += ' · E' + num;
+    } else {
+      label += ' · ' + state.elements.length + ' queued';
+    }
+    return label;
+  }
+
   function describeElement(el) {
     const tag = el.tagName.toLowerCase();
     const r = el.getBoundingClientRect();
@@ -1689,7 +1963,7 @@
         overwrite: 'auto',
       });
     }
-    if (hlEl.style.display !== 'none') hlChip.textContent = chipFromEl(hoveredEl);
+    if (hlEl.style.display !== 'none') hlChip.textContent = hoverChipLabel(hoveredEl);
     // Stronger unambiguous box (element mode only); tracks live rect.
     applyHoverOutlineBox(target);
   }
@@ -2145,10 +2419,10 @@
       return;
     }
 
-    // Plain click always makes this the single active element. Clicking a
-    // selected element keeps its descriptor and enters edit mode.
+    // Plain click makes this the active element for editing. Clicking an
+    // already-committed element keeps the whole queue and enters edit mode;
+    // the committed selection list always persists (queue-first model).
     if (existingIdx !== -1) {
-      if (state.elements.length > 1) selectOnly(existingIdx);
       const idx = state.elements.findIndex((en) => en.descriptor.cssPath === d.cssPath);
       openChat(d, el, true, idx);
       return;
@@ -2157,7 +2431,8 @@
       if (inspInput) inspInput.focus(); // same pending element -> just refocus
       return;
     }
-    if (state.elements.length) clearCommittedSelections();
+    // New element pick: keep every committed selection. openChat drops only
+    // the previous NEW pending outline, so the queue never disappears.
     d.index = state.nextIndex++;
     openChat(d, el, false, -1);
   }
@@ -4263,7 +4538,8 @@
   }
 
   /* ---------------- toolbar ---------------- */
-  function applyMode() {
+  function applyMode(opts) {
+    const o = opts || {};
     canvas.style.pointerEvents = state.annotateOn ? 'all' : 'none';
     canvas.classList.toggle('active', state.annotateOn || state.elementMode);
     toolbar.querySelector('[data-act="annotate"]').classList.toggle('active', state.annotateOn);
@@ -4271,24 +4547,26 @@
     if (modePill) {
       const verticalDock = state.toolbarDock === 'left' || state.toolbarDock === 'right';
       const pct = state.elementMode ? 100 : 0;
+      const finalTransform = verticalDock
+        ? { xPercent: 0, yPercent: pct, x: 0, y: 0 }
+        : { yPercent: 0, xPercent: pct, x: 0, y: 0 };
       gsapKill(modePill);
-      if (isReducedMotion() || !gsapReady) {
-        modePill.style.transform = verticalDock
-          ? ('translateY(' + pct + '%)')
-          : ('translateX(' + pct + '%)');
+      if (o.instant || isReducedMotion() || !gsapReady) {
+        if (gsapReady) {
+          gsapSet(modePill, finalTransform);
+        } else {
+          modePill.style.transform = verticalDock
+            ? ('translateY(' + pct + '%)')
+            : ('translateX(' + pct + '%)');
+        }
       } else {
         // Same 155ms timing as the CSS transition; Apple HIG ease.
         // Side-docked toolbars stack the mode toggle vertically.
-        gsapSet(modePill, verticalDock
-          ? { xPercent: 0, yPercent: pct, x: 0, y: 0 }
-          : { yPercent: 0, xPercent: pct, x: 0, y: 0 });
         gsapLib.to(modePill, Object.assign({
           duration: 0.155,
           ease: EASE.apple,
           overwrite: true,
-        }, verticalDock
-          ? { yPercent: pct, xPercent: 0 }
-          : { xPercent: pct, yPercent: 0 }));
+        }, finalTransform));
       }
     }
     updateSelectionPulse();
@@ -4426,6 +4704,8 @@
 
   /* ---- send energy pulse (comet-send-pulse) ---- */
   let sendPulseEl = null;
+  let sendBusy = false; // in-flight guard: one annotate round-trip at a time
+  let sendHideDoneTimer = 0; // display:none step of the send-away collapse
 
   // Radiate a subtle energy ring from the center of the Send button while
   // the annotation round-trip is in flight. The ring is anchored to the
@@ -4492,6 +4772,36 @@
     }
   }
 
+  // Re-kick the in-flight ring once the capture-hide lifts: the host hide
+  // (element sends) covered the ring's first radiation, and the toolbar
+  // layout may have shifted under it, so re-anchor to the button's current
+  // center and run the ring once more, fully visible. Failure keeps the
+  // quick fade-out path (endSendPulse(false)) instead of a re-radiation.
+  function restartSendPulse(button) {
+    const el = sendPulseEl;
+    if (!el || !el.parentNode || !button || isReducedMotion()) return;
+    const r = button.getBoundingClientRect();
+    el.style.left = Math.round(r.left + r.width / 2) + 'px';
+    el.style.top = Math.round(r.top + r.height / 2) + 'px';
+    el.classList.remove('comet-send-pulse-run', 'comet-send-pulse-fail');
+    void el.offsetWidth;
+    el.classList.add('comet-send-pulse-run');
+    if (gsapReady) {
+      gsapKill(el);
+      gsapLib.fromTo(el,
+        { opacity: 0.9, scale: 0.15 },
+        {
+          opacity: 0,
+          scale: 15,
+          duration: 0.65,
+          ease: EASE.md3Emphasized,
+          overwrite: true,
+        });
+    } else {
+      playMotion(el, 'comet-send-pulse-run', 650);
+    }
+  }
+
   /* ---- send button hide/show (comet-send-away) ---- */
   function sendButtonEl() {
     return toolbar && toolbar.querySelector ? toolbar.querySelector('.comet-send') : null;
@@ -4512,7 +4822,9 @@
     b.classList.remove('comet-send-away');
     void b.offsetWidth;
     b.classList.add('comet-send-away');
-    setTimeout(() => {
+    if (sendHideDoneTimer) clearTimeout(sendHideDoneTimer);
+    sendHideDoneTimer = setTimeout(() => {
+      sendHideDoneTimer = 0;
       if (b.classList.contains('comet-send-away')) b.style.display = 'none';
     }, 260);
   }
@@ -4521,6 +4833,7 @@
   // (endStroke / updateCount). Cancels any pending collapse.
   function showSendButton() {
     if (sendHideTimer) { clearTimeout(sendHideTimer); sendHideTimer = 0; }
+    if (sendHideDoneTimer) { clearTimeout(sendHideDoneTimer); sendHideDoneTimer = 0; }
     const b = sendButtonEl();
     if (!b) return;
     b.style.display = '';
@@ -4528,6 +4841,8 @@
   }
 
   async function send(button) {
+    if (sendBusy) return; // one annotate round-trip at a time
+    sendBusy = true;
     if (button) playMotion(button, 'send-press', 100);
     startSendPulse(button);
     let label = '';
@@ -4572,7 +4887,10 @@
     // animating uninterrupted.
     try {
       if (captureRect && host && host.parentNode) {
-        host.style.visibility = 'hidden';
+        // Hide ONLY the tool chrome (toolbar, chip, hover box, canvas) so the
+        // capture shows the bare page element. The inspector stays visible:
+        // the user watches it while the queued note sends.
+        host.classList.add('comet-capturing');
         overlayHidden = true;
         // Flush the hide to the compositor BEFORE the SW captures: the SW
         // runs captureVisibleTab on message receipt, and without waiting for
@@ -4595,8 +4913,12 @@
         'latencyMs=' + (Date.now() - sendStartMs) + ' error=sendMessage threw');
     }
     try {
-      if (overlayHidden && host) host.style.visibility = '';
+      if (overlayHidden && host) host.classList.remove('comet-capturing');
     } catch (_) { /* ok */ }
+    // The capture-hide covered the ring's first radiation (element sends):
+    // re-kick it from the button's current center so the success moment shows
+    // a full, aligned ring. Failure keeps the quick fade-out path instead.
+    if (ok && overlayHidden) restartSendPulse(button);
     if (ok) {
       // Success: clear the status slot so it collapses (status:empty) and the
       // toolbar gap closes; the confirmation lives in the top-center toast.
@@ -4625,6 +4947,7 @@
       sendFeedback(button, false);
       endSendPulse(false);
     }
+    sendBusy = false;
   }
 
   function onToolbarClick(e) {
@@ -4653,32 +4976,46 @@
   }
 
   /* ---------------- drag (toolbar handle + collapsed chip) ---------------- */
+  function renderToolbarDrag() {
+    toolbarDragRaf = 0;
+    if (!drag || !drag.surface) return;
+    drag.surface.style.transform = 'translate3d(' + drag.dx + 'px,' + drag.dy + 'px,0)';
+  }
+
   function startDrag(e) {
     if (e.button !== 0 && e.pointerType === 'mouse') return; // left button only
     e.preventDefault();
-    const target = e.currentTarget; // ⋮⋮ handle or the chip itself
+    const target = e.currentTarget; // drag handle or the chip itself
     try { target.setPointerCapture(e.pointerId); } catch (_) { /* ok */ }
-    // Undock on drag start so the surface returns to floating layout while
-    // moving: remove the dock classes (the .comet-dock-left/right column
-    // layout reverts to row) and keep the current docked top-left as the
-    // float start, so the drag continues exactly where the toolbar was.
-    const prevDock = state.toolbarDock;
+
+    // Cancel delayed placement and keep the rendered dock class while moving.
+    // A side-docked toolbar therefore stays vertical until the drop decides
+    // whether to morph into a horizontal float or remain side-docked.
+    toolbarDockLayoutToken += 1;
+    stopToolbarOrientationMorph();
+    const prevDock = state.toolbarDock || toolbarRenderedDock();
     if (prevDock) {
       state.toolbarDock = null;
-      clearToolbarDockClasses();
       saveTabState({ toolbarDock: null });
     }
-    gsapKill(toolbar);
-    if (toolbar) gsapSet(toolbar, { clearProps: 'transform,x,y,scale' });
+
+    const surface = state.collapsed && chipEl ? chipEl : toolbar;
+    if (!surface) return;
+    gsapKill(surface);
+    gsapSet(surface, { clearProps: 'transform,x,y,scale,scaleX,scaleY' });
+    surface.classList.add('comet-toolbar-dragging');
     const base = state.position || defaultPosition();
     drag = {
       target,
+      surface,
       pointerId: e.pointerId,
       startX: e.clientX,
       startY: e.clientY,
       baseX: base.x,
       baseY: base.y,
-      prevDock: prevDock || null, // restored by endDrag when the surface never moved
+      dx: 0,
+      dy: 0,
+      prevDock: prevDock || null,
       moved: false,
     };
     lastDragPersist = 0;
@@ -4687,38 +5024,64 @@
 
   function onDragMove(e) {
     if (!drag || e.pointerId !== drag.pointerId) return;
-    const dx = e.clientX - drag.startX;
-    const dy = e.clientY - drag.startY;
-    if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
-    applyPosition(drag.baseX + dx, drag.baseY + dy); // live position update
+    e.preventDefault();
+    drag.dx = e.clientX - drag.startX;
+    drag.dy = e.clientY - drag.startY;
+    if (Math.abs(drag.dx) + Math.abs(drag.dy) > 4) drag.moved = true;
+
+    // Pointer state is exact and unclamped. One compositor transform is
+    // coalesced per frame; viewport clamping happens only after pointerup.
+    state.position = {
+      x: drag.baseX + drag.dx,
+      y: drag.baseY + drag.dy,
+    };
+    if (!toolbarDragRaf && typeof requestAnimationFrame === 'function') {
+      toolbarDragRaf = requestAnimationFrame(renderToolbarDrag);
+    } else if (typeof requestAnimationFrame !== 'function') {
+      renderToolbarDrag();
+    }
+
     const now = Date.now();
     if (now - lastDragPersist >= DRAG_PERSIST_MS) {
       lastDragPersist = now;
-      saveTabState({ position: state.position, toolbarDock: state.toolbarDock });
+      saveTabState({ position: state.position, toolbarDock: null });
     }
   }
 
   function endDrag(e) {
     if (!drag || (e.pointerId !== undefined && e.pointerId !== drag.pointerId)) return;
+    const activeDrag = drag;
     try {
-      if (drag.target.hasPointerCapture(drag.pointerId)) {
-        drag.target.releasePointerCapture(drag.pointerId);
+      if (activeDrag.target.hasPointerCapture(activeDrag.pointerId)) {
+        activeDrag.target.releasePointerCapture(activeDrag.pointerId);
       }
     } catch (_) { /* ok */ }
-    drag.target.classList.remove('dragging');
-    if (drag.moved && drag.target === chipEl) suppressChipClick = true;
-    const moved = drag.moved;
-    const prevDock = drag.prevDock || null;
+
+    if (toolbarDragRaf) {
+      cancelAnimationFrame(toolbarDragRaf);
+      toolbarDragRaf = 0;
+    }
+    writeToolbarPosition(
+      activeDrag.baseX + activeDrag.dx,
+      activeDrag.baseY + activeDrag.dy
+    );
+    gsapKill(activeDrag.surface);
+    gsapSet(activeDrag.surface, { clearProps: 'transform,x,y,scale,scaleX,scaleY' });
+    activeDrag.surface.classList.remove('comet-toolbar-dragging');
+    activeDrag.target.classList.remove('dragging');
+
+    if (activeDrag.moved && activeDrag.target === chipEl) suppressChipClick = true;
+    const moved = activeDrag.moved;
+    const prevDock = activeDrag.prevDock || null;
     drag = null;
     if (moved) {
-      // Drop near an edge re-snaps with the DOCK_EDGE_PX threshold; the
-      // animated snap keeps the docked pin motion (chip included).
+      // Edge drops snap with the existing travel tween. A free drop still
+      // enters setToolbarDock so a retained vertical class can FLIP to row.
       const side = detectToolbarDock();
       if (side) setToolbarDock(side, { animate: true, persist: true });
-      else saveTabState({ position: state.position, toolbarDock: null });
+      else setToolbarDock(null, { animate: true, persist: true });
     } else if (prevDock) {
-      // A plain click on the handle must not undock the toolbar: restore the
-      // dock exactly as it was (classes + state agree again).
+      // A plain click on the handle keeps the prior dock and orientation.
       setToolbarDock(prevDock, { animate: false, persist: true });
     } else {
       saveTabState({ position: state.position, toolbarDock: state.toolbarDock });
@@ -4735,6 +5098,15 @@
 
   function teardownHost() {
     stopInspectorRingTween();
+    toolbarDockLayoutToken += 1;
+    stopToolbarOrientationMorph();
+    if (toolbarDragRaf) {
+      cancelAnimationFrame(toolbarDragRaf);
+      toolbarDragRaf = 0;
+    }
+    if (toolbar) gsapKill(toolbar);
+    if (chipEl) gsapKill(chipEl);
+    drag = null;
     diagDetach();
     if (host && host.parentNode) {
       try { host.parentNode.removeChild(host); } catch (_) { /* ok */ }
@@ -4776,6 +5148,9 @@
     sentToastTimer = 0;
     if (sendHideTimer) clearTimeout(sendHideTimer);
     sendHideTimer = 0;
+    if (sendHideDoneTimer) clearTimeout(sendHideDoneTimer);
+    sendHideDoneTimer = 0;
+    sendBusy = false;
     if (collapseTimer) clearTimeout(collapseTimer);
     collapseTimer = 0;
     if (revealPulseTimer) clearTimeout(revealPulseTimer);
@@ -4855,6 +5230,8 @@
     window.removeEventListener('mousedown', onPageMouseDown, true);
     window.removeEventListener('click', onPageClick, true);
     window.removeEventListener('keydown', onKeyDown, true);
+    window.removeEventListener('pointerup', endDrag);
+    window.removeEventListener('mouseup', endDrag);
     document.removeEventListener('scroll', repositionAll, true);
     window.removeEventListener('resize', onWindowResize);
     window.removeEventListener('orientationchange', onWindowResize);
@@ -4903,7 +5280,7 @@
   }
 
   // Idempotent re-injection (popup master switch ON / browserlinkToggle true).
-  function reinject() {
+  async function reinject() {
     if (exitTimer) {
       clearTimeout(exitTimer);
       exitTimer = 0;
@@ -4914,7 +5291,7 @@
       updateMotionPreference();
       buildUI();
       bindEvents();
-      injectShadowStyles();
+      await injectShadowStyles();
       diagAttach();
       window.__hermesAnnotateInjected = true;
       window.__browserlinkInjected = true;
@@ -5057,6 +5434,9 @@
 
     toolbar = document.createElement('div');
     toolbar.className = 'comet-toolbar';
+    // Hide the unstyled/default-position frame. setToolbarDock reveals only
+    // after shadow CSS, dock reflow, and final centering have completed.
+    toolbar.style.visibility = 'hidden';
     toolbar.setAttribute('role', 'toolbar');
     toolbar.setAttribute('aria-label', 'Browserlink - Browser Annotate & Connect');
     toolbar.innerHTML =
@@ -5096,6 +5476,7 @@
     chipEl.setAttribute('aria-label', 'Restore Browserlink toolbar');
     chipEl.title = 'Restore Browserlink toolbar';
     chipEl.style.display = 'none';
+    chipEl.style.visibility = 'hidden';
     const chipDot = document.createElement('span');
     chipDot.className = 'comet-chip-dot';
     chipEl.appendChild(chipDot);
@@ -5398,10 +5779,16 @@
     dragHandle.addEventListener('pointermove', onDragMove);
     dragHandle.addEventListener('pointerup', endDrag);
     dragHandle.addEventListener('pointercancel', endDrag);
+    dragHandle.addEventListener('lostpointercapture', endDrag);
     chipEl.addEventListener('pointerdown', startDrag);
     chipEl.addEventListener('pointermove', onDragMove);
     chipEl.addEventListener('pointerup', endDrag);
     chipEl.addEventListener('pointercancel', endDrag);
+    chipEl.addEventListener('lostpointercapture', endDrag);
+    // Safety net: a capture that is lost or an up that lands elsewhere must
+    // never leave the toolbar glued to the cursor.
+    window.addEventListener('pointerup', endDrag);
+    window.addEventListener('mouseup', endDrag);
     chipEl.addEventListener('click', onChipClick);
     canvas.addEventListener('pointerdown', pointerDown);
     canvas.addEventListener('pointermove', pointerMove);
@@ -5506,7 +5893,7 @@
       }
       buildUI();
       bindEvents();
-      injectShadowStyles();
+      await injectShadowStyles();
       restoreTabState(st);
       diagAttach();
       const health = diagHealth(true);

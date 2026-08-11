@@ -104,6 +104,8 @@ export function storeAnnotation(payload: JsonObject): string {
 
   for (const key of Object.keys(payload)) delete payload[key];
   Object.assign(payload, stored);
+  // Stable id for adapter idempotency and error logs.
+  (payload as Record<string, unknown>).id = path.basename(jsonPath, ".json");
   return jsonPath;
 }
 

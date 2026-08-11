@@ -9,6 +9,10 @@ export const VERSION = "2.2.0";
 export const SCREENSHOT_PREFIX = "data:image/png;base64,";
 export const MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024;
 
+// Keep the text part well below the API server request-body cap; the image
+// part is gated separately by MAX_IMAGE_PART_BYTES in the Hermes adapter.
+export const MAX_MESSAGE_TEXT_LENGTH = 20_000;
+
 export const ALLOWED_EDIT_KEYS = new Set([
   "width",
   "height",
@@ -39,6 +43,8 @@ export type JsonValue =
 export type JsonObject = Record<string, unknown>;
 
 export interface AnnotationPayload {
+  /** Optional stable id used for adapter idempotency. */
+  id?: string;
   source: string;
   url: string;
   title?: string;
@@ -138,6 +144,36 @@ export function atomicWriteBytes(filePath: string, data: Buffer): void {
       // ignore cleanup
     }
     throw err;
+  }
+}
+
+export function errorLogPath(): string {
+  return path.join(dataDir(), "browserlink-error.log");
+}
+
+interface ErrorLogEntry {
+  ts: string;
+  adapter: string;
+  annotationId: string | null;
+  sessionId: string | null;
+  error: string;
+}
+
+export function logError(entry: Omit<ErrorLogEntry, "ts">): void {
+  const line: ErrorLogEntry = {
+    ts: new Date().toISOString(),
+    adapter: entry.adapter,
+    annotationId: entry.annotationId || null,
+    sessionId: entry.sessionId || null,
+    error: entry.error,
+  };
+  try {
+    const logPath = errorLogPath();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, `${JSON.stringify(line)}\n`, "utf8");
+  } catch {
+    // Last-resort: if we can't write the error log, still emit to stderr.
+    console.warn("failed to write error log:", line);
   }
 }
 
