@@ -102,7 +102,10 @@ function blobToDataUrl(blob) {
 }
 
 // Crop a captured tab screenshot to the element capture rect (CSS px * dpr).
-// Falls back to the full image on any failure so annotation never blocks.
+// When a crop rect was requested but the crop fails or yields nothing, return
+// null so the caller omits the screenshot entirely: the full uncropped bitmap
+// would include the tool overlay and must never be stored. Screenshot failure
+// is never fatal to the annotation POST.
 async function cropDataUrl(dataUrl, rect) {
   try {
     if (!rect || typeof rect !== 'object') return dataUrl;
@@ -115,15 +118,25 @@ async function cropDataUrl(dataUrl, rect) {
     const bitmap = await createImageBitmap(blob);
     const cw = Math.min(sw, Math.max(0, bitmap.width - sx));
     const ch = Math.min(sh, Math.max(0, bitmap.height - sy));
-    if (cw < 1 || ch < 1) return dataUrl;
+    if (cw < 1 || ch < 1) {
+      console.warn('[browserlink] crop rect outside captured bitmap; screenshot omitted', {
+        rect: rect, bitmapWidth: bitmap.width, bitmapHeight: bitmap.height,
+      });
+      return null;
+    }
     const canvas = new OffscreenCanvas(Math.round(cw), Math.round(ch));
     const ctx = canvas.getContext('2d');
-    if (!ctx) return dataUrl;
+    if (!ctx) {
+      console.warn('[browserlink] OffscreenCanvas 2d context unavailable; screenshot omitted');
+      return null;
+    }
     ctx.drawImage(bitmap, sx, sy, cw, ch, 0, 0, cw, ch);
     const outBlob = await canvas.convertToBlob({ type: 'image/png' });
     return await blobToDataUrl(outBlob);
-  } catch (_) {
-    return dataUrl;
+  } catch (err) {
+    console.warn('[browserlink] crop failed; screenshot omitted',
+      err && err.message ? err.message : String(err));
+    return null;
   }
 }
 
@@ -140,7 +153,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (typeof dataUrl === 'string' && dataUrl) {
           // v1.6.2: crop to the selected element(s) so the screenshot shows
           // only the element, not the whole page (or the tool overlay).
-          payload.screenshot = await cropDataUrl(dataUrl, payload.captureRect);
+          // cropDataUrl returns null when a crop was requested but failed, so
+          // a UI-polluted full-page image is never stored.
+          const cropped = await cropDataUrl(dataUrl, payload.captureRect);
+          if (typeof cropped === 'string' && cropped) {
+            payload.screenshot = cropped;
+          }
         }
       } catch (_) { /* proceed without screenshot */ }
 

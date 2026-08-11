@@ -16,6 +16,8 @@
         "<all_urls>"
       ],
       "js": [
+        "gsap.min.js",
+        "CustomEase.min.js",
         "content.js"
       ],
       "css": [

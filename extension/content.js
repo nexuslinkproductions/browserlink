@@ -1,4 +1,4 @@
-/* Browserlink — Browser Annotate & Connect — content script (MV3). SPEC v1.2.
+/* Browserlink - Browser Annotate & Connect - content script (MV3). SPEC v1.2.
  *
  * Attaches ONE closed ShadowRoot to document.documentElement containing:
  *   - a floating top-right toolbar [⏻ power | − collapse | ⋮⋮ drag handle |
@@ -26,9 +26,12 @@
  *     Original computed/inline values are tracked for per-row Reset and
  *     panel "Reset all". Hover/focus on a row draws a property hint on the
  *     overlay canvas. Edited rows get an accent marker; the footer shows
- *     "N edits" + Reset all + the instruction textarea + Send. Send payload
- *     elements gain "edits": {property: desiredValue} (non-empty edits only).
- *     The panel closes on deselection, mode switch to Annotate, and exit/power.
+ *     "N edits" + Reset all + the instruction textarea. Notes queue into
+ *     state.elements (Enter/Add); the toolbar Send is the only sender.
+ *     Selection rows show a muted note preview when an instruction is set.
+ *     Send payload elements gain "edits": {property: desiredValue}
+ *     (non-empty edits only). The panel closes on deselection, mode switch
+ *     to Annotate, and exit/power.
  *
  * Modes:
  *   Annotate -> canvas pointer-events: all; pointerdown/move/up with
@@ -59,7 +62,7 @@
  * Send -> chrome.runtime.sendMessage({type:"annotate", payload}) with the
  * spec payload {source, url, title, viewport, label, strokes, elements};
  * elements[] entries carry "edits": {property: desiredValue} when edited.
- * status shows "sent ✓" or "bridge offline"; strokes, elements and all
+ * status shows "bridge offline" on failure; success clears the status (the
  * markers are cleared only after a successful send.
  *
  * The page DOM is NEVER touched beyond appending the shadow host.
@@ -74,7 +77,6 @@
   /* ---------------- spec constants ---------------- */
   const COLORS = ['#ff5252', '#4a9eff', '#ffd166', '#35c759']; // red blue yellow green
   const WIDTHS = [2, 4, 8];
-  const BRIDGE_OK = 'sent ✓';
   const BRIDGE_OFFLINE = 'bridge offline';
   const MAX_TEXT = 200;
   const MAX_INSTR = 500;
@@ -85,11 +87,16 @@
   const CHIP_MAX = 40;
   const POS_PAD = 12;              // viewport inset for toolbar/chip/inspector
   const DRAG_PERSIST_MS = 120;     // throttle for live position persistence
+  const DOCK_EDGE_PX = 64;         // proximity threshold for toolbar edge docking
+  // Edge inset for a docked toolbar/chip (clamped 10-25px per design spec).
+  const DOCK_GAP_PX = Math.min(25, Math.max(10, 14));
 
   /* ---------------- state ---------------- */
   const state = {
-    annotateOn: false,   // draw mode
+    annotateOn: true,    // draw mode is the default selection on start
     elementMode: false,  // element pick mode (mutually exclusive with annotate)
+    annotNote: '',       // legacy last committed note ('note' payload back-compat)
+    annotNotes: [],      // committed annotation note queue (chat card note mode)
     color: COLORS[0],
     width: WIDTHS[1],
     strokes: [],         // [{color, width, points:[[nx,ny],...]}]
@@ -98,12 +105,16 @@
     nextIndex: 1,        // selection numbering (1-based)
     capturedPointerId: null, // active canvas pointer capture (released on exit)
     collapsed: false,    // toolbar minimized to the 48px chip
+    modeBeforeCollapse: null, // 'annotate'|'element'|null, restored when the chip expands
     position: null,      // {x, y} top-left of toolbar/chip (viewport px)
+    toolbarDock: null,   // toolbar edge dock: 'left'|'right'|'bottom'|null (null = floating)
     activeIndex: -1,     // index in elements currently bound to the inspector
     collapsedCats: {},   // { Text: true, Layout: false, ... } inspector category collapse
+    dock: null,          // inspector edge dock: 'left'|'top'|'right'|'bottom'|null (null = floating popup)
+    inspSize: null,      // {w, h} inspector panel size from the corner resize handle
   };
 
-  // Element inspector: {el, descriptor} — descriptor is the object that
+  // Element inspector: {el, descriptor} - descriptor is the object that
   // receives "edits" so committed elements keep their edits.
   const inspector = { el: null, descriptor: null };
   // Per-property originals for Reset: Map<prop, {value, wasInline, kind}>
@@ -130,6 +141,7 @@
   let ctx = null;
   let statusEl = null;
   let countEl = null;
+  let noteCountEl = null; // toolbar chip: queued annotation notes count
   let selLayer = null;       // fixed inset-0 layer holding highlight + outlines
   let hlEl = null;
   let hlChip = null;
@@ -141,22 +153,31 @@
   let chipEl = null;         // 48px collapsed chip
   let dragHandle = null;     // ⋮⋮ toolbar handle
   let inspPanel = null;      // element inspector panel
+  let inspDragHandle = null; // ⋮⋮ inspector header drag handle (floating mode only)
+  let inspDockEl = null;     // 4-way dock control in the inspector header
+  let inspDrag = null;       // active inspector drag {pointerId,startX,startY,baseX,baseY,moved}
   let inspRows = null;
   let inspCountEl = null;
   let inspInput = null;
-  let inspSend = null;
+  let inspAddEl = null;         // footer Add button (commits the pending element)
+  let inspGlowEl = null;        // cursor glow layer inside the inspector
+  let inspResizeHandle = null;  // bottom-right corner resize handle
+  let inspResize = null;        // active inspector resize {pointerId,startX,startY,baseW,baseH}
   let inspSelectionCountEl = null;
   let inspSelectionList = null;
   let modeToggle = null;
   let modePill = null;
-  let toastEl = null;
-  let toastTimer = 0;
+  let sentToastEl = null;
+  let sentToastTimer = 0;
+  let sendHideTimer = 0; // delayed Send-button collapse after a successful send
   const rafPending = { v: false };
 
   // Motion is deliberately centralized so reduced-motion also disables the
   // JavaScript loops (not only the CSS transitions in overlay.css).
   let reducedMotion = false;
   let motionMedia = null;
+  let inspectorRingPropertyRegistered = false;
+  let inspectorRingTween = null;
   let collapseTimer = 0;
   let exitTimer = 0;
   let hoverTargetRect = null;
@@ -167,10 +188,245 @@
   let lastSelectionCount = -1;
 
   /* ---------------- drag + per-tab persistence ---------------- */
-  let drag = null;             // {target, pointerId, startX, startY, baseX, baseY, moved}
+  let drag = null;             // {target, pointerId, startX, startY, baseX, baseY, prevDock, moved}
   let suppressChipClick = false; // chip click right after a drag = restore, not drag
   let lastDragPersist = 0;
   let messagesBound = false;   // chrome.runtime.onMessage registered once
+
+  /* ---------------- diagnostics (window.__browserlinkDiag) ----------------
+   * Agnostic live diagnostics: a ring buffer of events, a lazy JSON snapshot,
+   * console helpers, init health checks (D-1..D-6), and a Ctrl+Shift+D overlay
+   * panel inside the shadow root. Nothing here depends on Hermes specifics and
+   * nothing runs on the hot path; the dump builds lazily on demand. */
+  const DIAG_RING_MAX = 50;
+  const diagRing = [];
+  let diagPanel = null;           // comet-diag overlay (inside the shadow root)
+  let diagPanelOpen = false;
+  let diagLastCaptureRect = null; // last send() capture rect, for the snapshot
+  let diagErrorHandler = null;
+  let diagRejectionHandler = null;
+  let diagKeyHandler = null;
+
+  function diagLog(code, msg, data) {
+    const entry = { t: new Date().toISOString(), code: String(code), msg: String(msg) };
+    if (data !== undefined) entry.data = data;
+    diagRing.push(entry);
+    if (diagRing.length > DIAG_RING_MAX) diagRing.splice(0, diagRing.length - DIAG_RING_MAX);
+    return entry;
+  }
+
+  function diagClearLog() {
+    diagRing.length = 0;
+    return diagRing.length;
+  }
+
+  function diagHealthChecks() {
+    return [
+      { code: 'D-1', name: 'host attached', ok: !!(host && host.parentNode) },
+      { code: 'D-2', name: 'shadow root', ok: !!(shadow && toolbar && toolbar.parentNode === shadow) },
+      { code: 'D-3', name: 'canvas + 2d ctx', ok: !!(canvas && canvas.parentNode && ctx && typeof ctx.drawImage === 'function') },
+      { code: 'D-4', name: 'refs (toolbar/chat/inspector)', ok: !!(toolbar && chatCard && inspPanel && selLayer && inspRows && inspInput) },
+      { code: 'D-5', name: 'gsap loaded', ok: gsapReady === true },
+      { code: 'D-6', name: 'runtime listener bound', ok: messagesBound === true },
+    ];
+  }
+
+  // Run the health checks; optionally log each failure to the ring (init).
+  function diagHealth(logFailures) {
+    const checks = diagHealthChecks();
+    let failed = 0;
+    for (const c of checks) {
+      if (!c.ok) {
+        failed += 1;
+        if (logFailures) diagLog(c.code, c.name + ' FAILED');
+      }
+    }
+    return { ok: failed === 0, failed: failed, checks: checks };
+  }
+
+  function diagRectOf(el) {
+    if (!el) return null;
+    try {
+      const r = el.getBoundingClientRect();
+      return {
+        x: Math.round(r.left),
+        y: Math.round(r.top),
+        w: Math.round(r.width),
+        h: Math.round(r.height),
+        visible: !el.hidden && (el.style ? el.style.display !== 'none' : true),
+      };
+    } catch (_) { return null; }
+  }
+
+  function diagVersion() {
+    try {
+      if (chrome.runtime && typeof chrome.runtime.getManifest === 'function') {
+        const m = chrome.runtime.getManifest();
+        if (m && m.version) return String(m.version);
+      }
+    } catch (_) { /* manifest unavailable */ }
+    return 'unknown';
+  }
+
+  // Lazy JSON snapshot of tool state. Nothing is cached; callers pay the cost
+  // only when they ask (diag(), dump(), or the overlay panel).
+  function diagDump() {
+    return {
+      tool: 'browserlink',
+      version: diagVersion(),
+      ready: !!(host && host.parentNode),
+      injected: !!window.__browserlinkInjected,
+      gsapReady: gsapReady,
+      reducedMotion: !!reducedMotion,
+      dpr: Number(window.devicePixelRatio) || 1,
+      viewport: { w: window.innerWidth, h: window.innerHeight },
+      mode: {
+        annotateOn: state.annotateOn,
+        elementMode: state.elementMode,
+        collapsed: state.collapsed,
+        toolbarDock: state.toolbarDock,
+        inspectorDock: state.dock,
+      },
+      rects: {
+        host: diagRectOf(host),
+        toolbar: diagRectOf(toolbar),
+        inspector: diagRectOf(inspPanel),
+        chat: diagRectOf(chatCard),
+      },
+      elements: {
+        count: state.elements.length,
+        queue: state.elements.map((en) => ({
+          selector: (en.descriptor && en.descriptor.cssPath) ? en.descriptor.cssPath : '',
+          tag: (en.descriptor && en.descriptor.tag) ? en.descriptor.tag : '',
+          instructionLen: (en.descriptor && en.descriptor.instruction) ? en.descriptor.instruction.length : 0,
+        })),
+      },
+      annotNote: state.annotNote || '',
+      annotNotes: state.annotNotes.length,
+      strokes: state.strokes.length,
+      captureRect: diagLastCaptureRect,
+      canvasCtx: !!(canvas && ctx),
+      messagesBound: messagesBound,
+      health: diagHealth(false),
+      log: diagRing.slice(),
+    };
+  }
+
+  // Console print: JSON snapshot plus a compact log tail.
+  function diagPrint() {
+    const d = diagDump();
+    console.log('[browserlink diag] snapshot');
+    console.log(JSON.stringify(d, null, 2));
+    console.log('[browserlink diag] health ' + (d.health.ok ? 'OK' : 'FAILED'));
+    console.log('[browserlink diag] log tail (' + d.log.length + ' entries)');
+    d.log.slice(-20).forEach((e) => {
+      console.log('  ' + e.t + ' [' + e.code + '] ' + e.msg
+        + (e.data ? ' ' + JSON.stringify(e.data) : ''));
+    });
+  }
+
+  function diagCopyToClipboard() {
+    try {
+      const text = JSON.stringify(diagDump(), null, 2);
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(text).catch(() => { /* clipboard blocked */ });
+      }
+    } catch (_) { /* clipboard unavailable */ }
+  }
+
+  function diagRenderPanel() {
+    if (!diagPanel) return;
+    const body = diagPanel.querySelector('.comet-diag-body');
+    if (body) body.textContent = JSON.stringify(diagDump(), null, 2);
+  }
+
+  function diagOpenPanel() {
+    if (!diagPanel) return;
+    diagPanel.hidden = false;
+    diagPanelOpen = true;
+    diagRenderPanel();
+    const closeBtn = diagPanel.querySelector('.comet-diag-close');
+    if (closeBtn && typeof closeBtn.focus === 'function') closeBtn.focus();
+  }
+
+  function diagClosePanel() {
+    if (diagPanel) diagPanel.hidden = true;
+    diagPanelOpen = false;
+  }
+
+  function diagTogglePanel() {
+    if (diagPanelOpen) diagClosePanel();
+    else diagOpenPanel();
+  }
+
+  // Ctrl+Shift+D toggles the overlay; Escape closes it. Capture phase so the
+  // hotkey wins over page shortcuts while the panel is open.
+  function onDiagKeyDown(e) {
+    if (e.key === 'Escape' && diagPanelOpen) {
+      e.preventDefault();
+      e.stopPropagation();
+      diagClosePanel();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'D' || e.key === 'd')) {
+      e.preventDefault();
+      e.stopPropagation();
+      diagTogglePanel();
+    }
+  }
+
+  function diagAttach() {
+    if (!diagErrorHandler) {
+      diagErrorHandler = (ev) => {
+        diagLog('error', (ev && ev.message) ? String(ev.message) : 'window error', {
+          source: (ev && ev.filename) ? String(ev.filename) : '',
+          line: (ev && ev.lineno != null) ? ev.lineno : null,
+          col: (ev && ev.colno != null) ? ev.colno : null,
+        });
+      };
+      window.addEventListener('error', diagErrorHandler);
+    }
+    if (!diagRejectionHandler) {
+      diagRejectionHandler = (ev) => {
+        const r = ev && ev.reason;
+        diagLog('error', 'unhandledrejection: ' + ((r && r.message) ? r.message : String(r)));
+      };
+      window.addEventListener('unhandledrejection', diagRejectionHandler);
+    }
+    if (!diagKeyHandler) {
+      diagKeyHandler = onDiagKeyDown;
+      window.addEventListener('keydown', diagKeyHandler, true);
+    }
+  }
+
+  function diagDetach() {
+    if (diagErrorHandler) {
+      window.removeEventListener('error', diagErrorHandler);
+      diagErrorHandler = null;
+    }
+    if (diagRejectionHandler) {
+      window.removeEventListener('unhandledrejection', diagRejectionHandler);
+      diagRejectionHandler = null;
+    }
+    if (diagKeyHandler) {
+      window.removeEventListener('keydown', diagKeyHandler, true);
+      diagKeyHandler = null;
+    }
+    diagPanel = null;
+    diagPanelOpen = false;
+  }
+
+  if (typeof window !== 'undefined') {
+    window.__browserlinkDiag = {
+      dump: diagDump,
+      diag: diagPrint,
+      clearLog: diagClearLog,
+      health: () => diagHealth(true),
+      log: (code, msg, data) => diagLog(code, msg, data),
+      get ready() { return !!(host && host.parentNode); },
+      get logEntries() { return diagRing.slice(); },
+    };
+  }
 
   // Per-tab chrome.storage.session state (key "browserlink:<tabId>").
   // tabId is learned from message senders (popup/SW forwards carry
@@ -210,7 +466,9 @@
     });
   }
 
-  /* ---------------- toolbar position / collapse ---------------- */
+  /* ---------------- toolbar position / collapse / edge dock ---------------- */
+  const TOOLBAR_DOCK_SIDES = ['left', 'right', 'bottom'];
+
   // Size of the currently visible control surface (toolbar or collapsed chip).
   function currentSurfaceSize() {
     const el = state.collapsed ? chipEl : toolbar;
@@ -248,74 +506,446 @@
       chipEl.style.top = t;
       chipEl.style.right = 'auto';
     }
-    positionInspector(); // inspector hangs below the toolbar
+  }
+
+  function clearToolbarDockClasses() {
+    if (!toolbar) return;
+    TOOLBAR_DOCK_SIDES.forEach((side) => {
+      toolbar.classList.remove('comet-dock-' + side);
+    });
+  }
+
+  function applyToolbarDockClasses(side) {
+    if (!toolbar) return;
+    clearToolbarDockClasses();
+    if (TOOLBAR_DOCK_SIDES.indexOf(side) !== -1) {
+      toolbar.classList.add('comet-dock-' + side);
+    }
+  }
+
+  // Centered edge pin for the current surface size (toolbar or chip).
+  function dockedToolbarPosition(side) {
+    const s = currentSurfaceSize();
+    const w = s.w || (state.collapsed ? 48 : 320);
+    const h = s.h || (state.collapsed ? 48 : 48);
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    if (side === 'left') {
+      return clampPos(DOCK_GAP_PX, Math.round((vh - h) / 2), w, h);
+    }
+    if (side === 'right') {
+      return clampPos(vw - w - DOCK_GAP_PX, Math.round((vh - h) / 2), w, h);
+    }
+    if (side === 'bottom') {
+      return clampPos(Math.round((vw - w) / 2), vh - h - DOCK_GAP_PX, w, h);
+    }
+    return state.position || defaultPosition();
+  }
+
+  // Pick a dock edge from the dragged surface's nearest edge, or null to stay
+  // floating. Tests the surface EDGE (not its center) against DOCK_EDGE_PX so
+  // the snap threshold is reachable even for the wide floating toolbar; a
+  // center-based test could never trigger left/right docking once the toolbar
+  // is wider than ~2x the threshold.
+  function detectToolbarDock() {
+    const s = currentSurfaceSize();
+    const w = s.w || 1;
+    const h = s.h || 1;
+    const p = state.position || defaultPosition();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    if (p.x <= DOCK_EDGE_PX) return 'left';
+    if (p.x + w >= vw - DOCK_EDGE_PX) return 'right';
+    if (p.y + h >= vh - DOCK_EDGE_PX) return 'bottom';
+    return null;
+  }
+
+  function animateToolbarDockTo(target, onDone) {
+    if (!toolbar) {
+      if (typeof onDone === 'function') onDone();
+      return;
+    }
+    const from = state.position || defaultPosition();
+    applyPosition(from.x, from.y);
+    if (isReducedMotion() || !gsapReady) {
+      applyPosition(target.x, target.y);
+      if (typeof onDone === 'function') onDone();
+      return;
+    }
+    const dx = target.x - from.x;
+    const dy = target.y - from.y;
+    gsapKill(toolbar);
+    gsapSet(toolbar, { x: 0, y: 0, scale: 1, opacity: 1 });
+    gsapLib.to(toolbar, {
+      x: dx,
+      y: dy,
+      scale: 1.03,
+      duration: 0.18,
+      ease: EASE.md3Emphasized,
+      overwrite: true,
+      onUpdate: () => {
+        if (chipEl && state.collapsed) {
+          chipEl.style.left = toolbar.style.left;
+          chipEl.style.top = toolbar.style.top;
+        }
+      },
+      onComplete: () => {
+        applyPosition(target.x, target.y);
+        gsapSet(toolbar, { x: 0, y: 0 });
+        gsapLib.to(toolbar, {
+          scale: 1,
+          duration: 0.14,
+          ease: EASE.spring,
+          overwrite: true,
+          onComplete: () => {
+            gsapSet(toolbar, { clearProps: 'transform,scale,x,y' });
+            if (typeof onDone === 'function') onDone();
+          },
+        });
+      },
+    });
+  }
+
+  // Snap / animate the main toolbar to an edge (or float). Persists toolbarDock.
+  function setToolbarDock(side, opts) {
+    const o = opts || {};
+    const next = TOOLBAR_DOCK_SIDES.indexOf(side) !== -1 ? side : null;
+    const prev = state.toolbarDock;
+    state.toolbarDock = next;
+    diagLog('dock', 'toolbar=' + (next || 'float'));
+    applyToolbarDockClasses(next);
+    const place = () => {
+      if (next) {
+        const target = dockedToolbarPosition(next);
+        if (o.animate && prev !== next) animateToolbarDockTo(target);
+        else applyPosition(target.x, target.y);
+      } else if (state.position) {
+        applyPosition(state.position.x, state.position.y);
+      } else {
+        const d = defaultPosition();
+        applyPosition(d.x, d.y);
+      }
+    };
+    // Layout class change can alter size; place after the browser reflows.
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(place);
+    } else {
+      place();
+    }
+    if (o.persist !== false) saveTabState({ toolbarDock: next, position: state.position });
+  }
+
+  function clearToolbarFoldProps() {
+    if (!toolbar) return;
+    gsapKill(toolbar);
+    gsapSet(toolbar, {
+      clearProps: 'transform,opacity,filter,scale,x,y,transformOrigin',
+    });
+    toolbar.style.pointerEvents = '';
+    toolbar.classList.remove('is-collapsing', 'is-restoring', 'comet-fold-out');
+  }
+
+  // Fold origin near the power button (top-left of the bar in LTR layouts).
+  function foldOriginTowardPower() {
+    if (!toolbar) return '12px 50%';
+    const powerBtn = toolbar.querySelector('[data-act="power"]');
+    if (!powerBtn) return '12px 50%';
+    const tb = toolbar.getBoundingClientRect();
+    const pb = powerBtn.getBoundingClientRect();
+    const ox = Math.round(pb.left + pb.width / 2 - tb.left);
+    const oy = Math.round(pb.top + pb.height / 2 - tb.top);
+    return ox + 'px ' + oy + 'px';
   }
 
   function setCollapsed(on) {
-    if (on === state.collapsed && !collapseTimer) return;
+    if (!toolbar) return;
+    if (on === state.collapsed && !collapseTimer && !toolbar.classList.contains('is-collapsing')
+        && !toolbar.classList.contains('is-restoring')) return;
+    const wasCollapsed = state.collapsed;
     if (collapseTimer) {
       clearTimeout(collapseTimer);
       collapseTimer = 0;
     }
+    clearToolbarFoldProps();
+    if (on && !wasCollapsed) {
+      state.modeBeforeCollapse = state.annotateOn ? 'annotate' : (state.elementMode ? 'element' : null);
+      setAnnotate(false);
+      setElementMode(false);
+      if (chatCard) chatCard.hidden = true;
+    }
     state.collapsed = on;
+    if (!on && wasCollapsed) {
+      const modeToRestore = state.modeBeforeCollapse;
+      state.modeBeforeCollapse = null;
+      if (modeToRestore === 'annotate') setAnnotate(true, { showCard: false });
+      else if (modeToRestore === 'element') setElementMode(true);
+      if (chatCard) chatCard.hidden = true;
+    }
+    const placeSurface = () => {
+      if (state.toolbarDock) {
+        const target = dockedToolbarPosition(state.toolbarDock);
+        applyPosition(target.x, target.y);
+      } else if (state.position) {
+        applyPosition(state.position.x, state.position.y);
+      } else {
+        const d = defaultPosition();
+        applyPosition(d.x, d.y);
+      }
+    };
+
     if (on) {
       closeInspector();
-      if (isReducedMotion()) {
+      if (isReducedMotion() || !gsapReady) {
         toolbar.style.display = 'none';
-        if (chipEl) chipEl.style.display = '';
-      } else {
-        toolbar.classList.add('is-collapsing');
-        toolbar.style.pointerEvents = 'none';
         if (chipEl) {
           chipEl.style.display = '';
           chipEl.classList.remove('is-chip-enter');
-          void chipEl.offsetWidth;
-          chipEl.classList.add('is-chip-enter');
         }
+        placeSurface();
+      } else {
+        toolbar.classList.add('is-collapsing');
+        toolbar.style.pointerEvents = 'none';
+        const origin = foldOriginTowardPower();
+        gsapSet(toolbar, { transformOrigin: origin });
+        // Premium fold: scale + translate toward power, fade, soft blur.
+        gsapExit(toolbar, {
+          duration: 0.26,
+          ease: EASE.md3Accelerate,
+          to: {
+            opacity: 0,
+            scale: 0.9,
+            x: -10,
+            y: -4,
+            filter: 'blur(2px)',
+          },
+          onComplete: () => {
+            toolbar.style.display = 'none';
+            toolbar.style.pointerEvents = '';
+            toolbar.classList.remove('is-collapsing');
+            gsapSet(toolbar, {
+              clearProps: 'transform,opacity,filter,scale,x,y,transformOrigin',
+            });
+            if (chipEl) {
+              chipEl.style.display = '';
+              chipEl.classList.add('is-chip-enter');
+              gsapSpring(chipEl, {
+                duration: 0.24,
+                from: { opacity: 0, scale: 0.82, y: 4 },
+                to: { opacity: 1, scale: 1, y: 0 },
+                onComplete: () => {
+                  if (chipEl) chipEl.classList.remove('is-chip-enter');
+                  gsapSet(chipEl, { clearProps: 'transform,opacity,scale,x,y' });
+                },
+              });
+            }
+            placeSurface();
+            collapseTimer = 0;
+          },
+        });
+        // Safety: if GSAP stalls, still hide after the fold window.
         collapseTimer = setTimeout(() => {
+          if (!toolbar || !state.collapsed) return;
+          if (toolbar.style.display === 'none') return;
           toolbar.style.display = 'none';
           toolbar.style.pointerEvents = '';
           toolbar.classList.remove('is-collapsing');
-          if (chipEl) chipEl.classList.remove('is-chip-enter');
+          clearToolbarFoldProps();
+          if (chipEl) {
+            chipEl.style.display = '';
+            chipEl.classList.remove('is-chip-enter');
+          }
+          placeSurface();
           collapseTimer = 0;
-          if (state.position) applyPosition(state.position.x, state.position.y);
-        }, 200);
+        }, 420);
       }
     } else {
-      if (isReducedMotion()) {
+      if (isReducedMotion() || !gsapReady) {
         toolbar.style.display = '';
         if (chipEl) chipEl.style.display = 'none';
+        placeSurface();
       } else {
-        toolbar.style.display = '';
-        toolbar.classList.remove('is-restoring');
-        void toolbar.offsetWidth;
-        toolbar.classList.add('is-restoring');
-        if (chipEl) chipEl.style.display = 'none';
+        const hideChipThenFoldOut = () => {
+          toolbar.style.display = '';
+          toolbar.classList.add('is-restoring', 'comet-fold-out');
+          placeSurface();
+          const origin = foldOriginTowardPower();
+          gsapSet(toolbar, {
+            transformOrigin: origin,
+            opacity: 0,
+            scale: 0.9,
+            x: -8,
+            y: -3,
+            filter: 'blur(2px)',
+          });
+          gsapEnter(toolbar, {
+            duration: 0.28,
+            ease: EASE.spring,
+            from: {
+              opacity: 0,
+              scale: 0.9,
+              x: -8,
+              y: -3,
+              filter: 'blur(2px)',
+            },
+            to: {
+              opacity: 1,
+              scale: 1,
+              x: 0,
+              y: 0,
+              filter: 'blur(0px)',
+            },
+            onComplete: () => {
+              toolbar.classList.remove('is-restoring', 'comet-fold-out');
+              gsapSet(toolbar, {
+                clearProps: 'transform,opacity,filter,scale,x,y,transformOrigin',
+              });
+              collapseTimer = 0;
+            },
+          });
+          const kids = Array.prototype.slice.call(
+            toolbar.querySelectorAll('.comet-btn, .comet-mode-toggle, .comet-swatch, .comet-width, .comet-count, .status, .comet-drag')
+          );
+          if (kids.length) {
+            gsapStaggerIn(kids, {
+              duration: 0.2,
+              stagger: 0.025,
+              delay: 0.04,
+              from: { opacity: 0, y: 6, scale: 0.96 },
+              to: { opacity: 1, y: 0, scale: 1 },
+            });
+          }
+        };
+        if (chipEl && chipEl.style.display !== 'none') {
+          chipEl.classList.remove('is-chip-enter');
+          gsapExit(chipEl, {
+            duration: 0.16,
+            ease: EASE.md3Accelerate,
+            to: { opacity: 0, scale: 0.86, y: 3 },
+            onComplete: () => {
+              if (chipEl) {
+                chipEl.style.display = 'none';
+                gsapSet(chipEl, { clearProps: 'transform,opacity,scale,x,y' });
+              }
+              hideChipThenFoldOut();
+            },
+          });
+        } else {
+          if (chipEl) chipEl.style.display = 'none';
+          hideChipThenFoldOut();
+        }
         collapseTimer = setTimeout(() => {
-          toolbar.classList.remove('is-restoring');
+          if (!toolbar || state.collapsed) return;
+          toolbar.classList.remove('is-restoring', 'comet-fold-out');
+          clearToolbarFoldProps();
           collapseTimer = 0;
-        }, 200);
+        }, 480);
       }
     }
-    if (state.position) applyPosition(state.position.x, state.position.y);
-    else { const d = defaultPosition(); applyPosition(d.x, d.y); }
+    placeSurface();
     saveTabState({ collapsed: on });
   }
 
-  // Inspector panel hangs below the toolbar, clamped to the viewport.
-  function positionInspector() {
-    if (!inspPanel || inspPanel.hidden || !toolbar) return;
-    const r = toolbar.getBoundingClientRect();
+  // ---- inspector placement: floating popup near the element, or docked ----
+  // The inspector no longer hangs below the toolbar. When free it is a
+  // floating popup near the selected element (draggable via the header
+  // handle); when docked it snaps to a viewport edge with POS_PAD inset.
+  const INSP_DIRS = ['left', 'top', 'right', 'bottom'];
+
+  // Anchor side for the fold animations: dock edge when docked, else the
+  // viewport side the selected element sits in (dominant axis wins).
+  function inspDirection() {
+    if (state.dock) return state.dock;
+    const el = inspector.el;
+    if (!el) return 'bottom';
+    let r = null;
+    try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+    if (!r || !r.width || !r.height) return 'bottom';
+    const cx = (r.left + r.right) / 2;
+    const cy = (r.top + r.bottom) / 2;
+    const dx = Math.abs(cx / window.innerWidth - 0.5);
+    const dy = Math.abs(cy / window.innerHeight - 0.5);
+    if (dx >= dy) return cx < window.innerWidth / 2 ? 'left' : 'right';
+    return cy < window.innerHeight / 2 ? 'top' : 'bottom';
+  }
+
+  // Set the directional class (comet-insp-from-*) that picks the fold origin.
+  function setInspDirection(dir) {
+    if (!inspPanel) return;
+    INSP_DIRS.forEach((d) => inspPanel.classList.remove('comet-insp-from-' + d));
+    if (INSP_DIRS.indexOf(dir) !== -1) inspPanel.classList.add('comet-insp-from-' + dir);
+    inspPanel.dataset.inspDir = dir || '';
+  }
+
+  // Dock to a viewport edge: POS_PAD inset, centered on the other axis via
+  // measured offsets (no transform centering - transforms belong to the fold
+  // animations, and a transform on the panel would fight their keyframes).
+  function applyDock() {
+    if (!inspPanel || !state.dock) return;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
     const iw = inspPanel.offsetWidth || 320;
     const ih = inspPanel.offsetHeight || 0;
-    const left = Math.min(Math.max(POS_PAD, r.left), Math.max(POS_PAD, window.innerWidth - iw - POS_PAD));
-    let top = r.bottom + 8;
-    if (top + ih > window.innerHeight - POS_PAD) {
-      top = Math.max(POS_PAD, window.innerHeight - ih - POS_PAD);
+    const side = state.dock;
+    inspPanel.style.left = 'auto';
+    inspPanel.style.right = 'auto';
+    inspPanel.style.top = 'auto';
+    inspPanel.style.bottom = 'auto';
+    if (side === 'left' || side === 'right') {
+      inspPanel.style.top = Math.max(POS_PAD, Math.round((vh - ih) / 2)) + 'px';
+      inspPanel.style[side] = POS_PAD + 'px';
+    } else {
+      inspPanel.style.left = Math.max(POS_PAD, Math.round((vw - iw) / 2)) + 'px';
+      inspPanel.style[side] = POS_PAD + 'px';
     }
+    inspPanel.classList.add('comet-insp-docked');
+    INSP_DIRS.forEach((d) => inspPanel.classList.toggle('comet-insp-docked-' + d, d === side));
+  }
+
+  // Floating placement: sit beside the selected element (roomier side wins),
+  // offset toward the viewport center so the popup never sits on top of the
+  // element it describes, then clamp to the viewport. Not pinned to the
+  // click point - the element rect is the anchor.
+  function positionInspector() {
+    if (!inspPanel || inspPanel.hidden) return;
+    if (state.dock) { applyDock(); return; }
+    inspPanel.classList.remove('comet-insp-docked');
+    const el = inspector.el;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const iw = inspPanel.offsetWidth || 320;
+    const ih = inspPanel.offsetHeight || 0;
+    const pad = POS_PAD + 8; // breathing room around the element
+    let r = null;
+    if (el) { try { r = el.getBoundingClientRect(); } catch (_) { r = null; } }
+    let left = Math.round((vw - iw) / 2);
+    let top = Math.max(POS_PAD, Math.round((vh - ih) / 2));
+    if (r && r.width > 1 && r.height > 1) {
+      const roomR = vw - (r.right + pad);
+      const roomL = r.left - pad;
+      const roomB = vh - (r.bottom + pad);
+      const roomT = r.top - pad;
+      const useHoriz = Math.max(roomR, roomL) >= Math.min(iw, vw * 0.55)
+        || Math.max(roomT, roomB) < ih * 0.8;
+      if (useHoriz) {
+        left = roomR >= roomL ? r.right + pad : r.left - pad - iw;
+        top = r.top + (r.height - ih) / 2;
+      } else {
+        top = roomB >= roomT ? r.bottom + pad : r.top - pad - ih;
+        left = r.left + (r.width - iw) / 2;
+      }
+      // Nudge toward the viewport center so a near-center element is never
+      // fully covered by its own popup.
+      const cxp = Math.max(0, Math.min(1, (left + iw / 2) / vw));
+      const cyp = Math.max(0, Math.min(1, (top + ih / 2) / vh));
+      left += (0.5 - cxp) * iw * 0.25;
+      top += (0.5 - cyp) * ih * 0.25;
+    }
+    left = Math.round(Math.min(Math.max(left, POS_PAD), Math.max(POS_PAD, vw - iw - POS_PAD)));
+    top = Math.round(Math.min(Math.max(top, POS_PAD), Math.max(POS_PAD, vh - ih - POS_PAD)));
     inspPanel.style.left = left + 'px';
     inspPanel.style.top = top + 'px';
     inspPanel.style.right = 'auto';
+    inspPanel.style.bottom = 'auto';
   }
 
   /* ---------------- helpers ---------------- */
@@ -327,6 +957,20 @@
     if (!statusEl) return;
     statusEl.textContent = text;
     statusEl.className = 'status' + (cls ? ' ' + cls : '');
+  }
+
+  function registerInspectorRingProperty() {
+    inspectorRingPropertyRegistered = false;
+    if (typeof CSS === 'undefined' || typeof CSS.registerProperty !== 'function') return;
+    inspectorRingPropertyRegistered = true;
+    try {
+      CSS.registerProperty({
+        name: '--bl-ring-angle',
+        syntax: '<angle>',
+        inherits: false,
+        initialValue: '0deg',
+      });
+    } catch (_) { /* already registered for this document */ }
   }
 
   function updateMotionPreference() {
@@ -346,6 +990,7 @@
             startHoverLoop();
             updateSelectionPulse();
           }
+          syncInspectorRingAnimation();
         });
       }
     } catch (_) { /* matchMedia unavailable */ }
@@ -370,28 +1015,316 @@
     }
   }
 
-  function showToast(text) {
-    if (!toastEl) return;
-    if (toastTimer) clearTimeout(toastTimer);
-    toastEl.textContent = text || 'Sent';
-    toastEl.hidden = false;
-    toastEl.classList.remove('visible', 'leaving');
-    if (isReducedMotion()) {
-      toastEl.classList.add('visible');
-    } else {
-      void toastEl.offsetWidth;
-      toastEl.classList.add('visible');
+  /* ---------------- GSAP motion helpers (Premium / Apple-grade) ----------
+   * GSAP + CustomEase are injected before this script (manifest content_scripts).
+   * Helpers build fromTo/to tweens with signature easings. When
+   * prefers-reduced-motion is on, helpers gsap.set final state and skip tweens.
+   * CSS keyframes remain as fallbacks; GSAP inline styles win when active. */
+  const gsapLib = (typeof window !== 'undefined' && window.gsap) ? window.gsap : null;
+  const CustomEaseLib = (typeof window !== 'undefined' && window.CustomEase) ? window.CustomEase : null;
+  let gsapReady = false;
+  const EASE = {
+    apple: 'power2.out',
+    md3Emphasized: 'power3.out',
+    md3Accelerate: 'power2.in',
+    spring: 'back.out(1.4)',
+    hig: 'power2.inOut',
+  };
+  if (gsapLib) {
+    try {
+      if (CustomEaseLib && typeof gsapLib.registerPlugin === 'function') {
+        gsapLib.registerPlugin(CustomEaseLib);
+      }
+      if (CustomEaseLib && typeof CustomEaseLib.create === 'function') {
+        EASE.apple = CustomEaseLib.create('blApple', '0.25,0.1,0.25,1');
+        EASE.md3Emphasized = CustomEaseLib.create('blMd3Emphasized', '0.05,0.7,0.1,1');
+        EASE.md3Accelerate = CustomEaseLib.create('blMd3Accelerate', '0.3,0,1,1');
+        EASE.spring = CustomEaseLib.create('blSpring', '0.34,1.56,0.64,1');
+        EASE.hig = CustomEaseLib.create('blHig', '0.25,0.1,0.25,1');
+      }
+      gsapReady = true;
+    } catch (_) {
+      gsapReady = !!gsapLib;
     }
-    toastTimer = setTimeout(() => {
-      toastEl.classList.remove('visible');
-      if (!isReducedMotion()) toastEl.classList.add('leaving');
-      setTimeout(() => {
-        if (!toastEl) return;
-        toastEl.hidden = true;
-        toastEl.classList.remove('leaving');
-      }, isReducedMotion() ? 0 : 150);
-      toastTimer = 0;
-    }, 1800);
+  }
+
+  function gsapKill(el) {
+    if (gsapReady && el) gsapLib.killTweensOf(el);
+  }
+
+  function gsapSet(el, vars) {
+    if (!el || !vars) return;
+    if (gsapReady) gsapLib.set(el, vars);
+    else {
+      if (vars.opacity != null) el.style.opacity = String(vars.opacity);
+      if (vars.x != null || vars.y != null || vars.scale != null || vars.scaleX != null || vars.scaleY != null) {
+        const xv = vars.x;
+        const yv = vars.y;
+        const tx = xv != null ? 'translateX(' + (typeof xv === 'number' ? xv + 'px' : xv) + ')' : '';
+        const ty = yv != null ? 'translateY(' + (typeof yv === 'number' ? yv + 'px' : yv) + ')' : '';
+        const sx = vars.scaleX != null ? vars.scaleX : (vars.scale != null ? vars.scale : 1);
+        const sy = vars.scaleY != null ? vars.scaleY : (vars.scale != null ? vars.scale : 1);
+        const sc = (vars.scale != null || vars.scaleX != null || vars.scaleY != null)
+          ? 'scale(' + sx + ',' + sy + ')' : '';
+        el.style.transform = [tx, ty, sc].filter(Boolean).join(' ') || 'none';
+      }
+      if (vars.clearProps) {
+        String(vars.clearProps).split(',').forEach((p) => {
+          try { el.style.removeProperty(p.trim()); } catch (_) { /* ok */ }
+        });
+      }
+    }
+  }
+
+  function stopInspectorRingTween() {
+    if (!inspectorRingTween) return;
+    try { inspectorRingTween.kill(); } catch (_) { /* ok */ }
+    inspectorRingTween = null;
+  }
+
+  // Primary angle driver for closed-shadow reliability: GSAP tweens the
+  // registered (or unregistered) custom property on the host while CSS owns
+  // the masked conic + breathe. CSS comet-ring-spin remains the no-GSAP
+  // fallback when document-level @property registration succeeded.
+  function startInspectorRingTween() {
+    stopInspectorRingTween();
+    if (!inspPanel || inspPanel.hidden || isReducedMotion()) return;
+    if (!gsapReady || !gsapLib || typeof gsapLib.to !== 'function') return;
+    inspPanel.classList.add('comet-ring-js');
+    inspPanel.style.setProperty('--bl-ring-angle', '0deg');
+    // The custom-property tween is the one unguarded runtime call in the
+    // openInspector chain; a GSAP parse failure must degrade to a static
+    // ring, never crash element picking (crash surfaced at the
+    // openInspector call inside openChat).
+    try {
+      inspectorRingTween = gsapLib.to(inspPanel, {
+        '--bl-ring-angle': '360deg',
+        duration: 14,
+        repeat: -1,
+        ease: 'none',
+      });
+    } catch (err) {
+      inspectorRingTween = null;
+      inspPanel.classList.remove('comet-ring-js');
+      inspPanel.style.setProperty('--bl-ring-angle', '0deg');
+      diagLog('error', 'ring tween failed: ' + (err && err.message ? err.message : String(err)));
+    }
+  }
+
+  function syncInspectorRingAnimation() {
+    try {
+      stopInspectorRingTween();
+      if (!inspPanel || inspPanel.hidden) return;
+      if (isReducedMotion()) {
+        inspPanel.classList.remove('comet-ring-js');
+        inspPanel.style.setProperty('--bl-ring-angle', '0deg');
+        return;
+      }
+      if (gsapReady) {
+        startInspectorRingTween();
+        return;
+      }
+      // No GSAP: rely on CSS @keyframes spin when document-level registration
+      // succeeded; otherwise freeze a static angle (still shows ambient ::after).
+      inspPanel.classList.remove('comet-ring-js');
+      if (inspectorRingPropertyRegistered) {
+        inspPanel.style.removeProperty('--bl-ring-angle');
+        return;
+      }
+      inspPanel.style.setProperty('--bl-ring-angle', '0deg');
+    } catch (err) {
+      diagLog('error', 'syncInspectorRingAnimation failed: ' + (err && err.message ? err.message : String(err)));
+    }
+  }
+
+  // Entrance: ease-out / MD3 Emphasized. Reduced motion -> instant final state.
+  function gsapEnter(el, opts) {
+    if (!el) return null;
+    const o = opts || {};
+    const duration = (o.duration != null ? o.duration : 0.34);
+    const ease = o.ease || EASE.md3Emphasized;
+    const from = Object.assign({ opacity: 0, y: 10, scale: 0.96 }, o.from || {});
+    const to = Object.assign({ opacity: 1, x: 0, y: 0, scale: 1, scaleX: 1, scaleY: 1 }, o.to || {});
+    gsapKill(el);
+    if (isReducedMotion() || !gsapReady) {
+      gsapSet(el, Object.assign({}, to, o.set || {}));
+      if (typeof o.onComplete === 'function') o.onComplete();
+      return null;
+    }
+    return gsapLib.fromTo(el, from, Object.assign({}, to, {
+      duration,
+      ease,
+      delay: o.delay || 0,
+      overwrite: true,
+      onComplete: o.onComplete,
+    }));
+  }
+
+  // Exit: 65-75% of entrance duration, ease-in / MD3 Accelerate.
+  function gsapExit(el, opts) {
+    if (!el) return null;
+    const o = opts || {};
+    const duration = (o.duration != null ? o.duration : 0.24);
+    const ease = o.ease || EASE.md3Accelerate;
+    const to = Object.assign({ opacity: 0, y: -8, scale: 0.96 }, o.to || {});
+    gsapKill(el);
+    if (isReducedMotion() || !gsapReady) {
+      gsapSet(el, Object.assign({}, to, o.set || {}));
+      if (typeof o.onComplete === 'function') o.onComplete();
+      return null;
+    }
+    return gsapLib.to(el, Object.assign({}, to, {
+      duration,
+      ease,
+      delay: o.delay || 0,
+      overwrite: true,
+      onComplete: o.onComplete,
+    }));
+  }
+
+  // Spring pop (toast / success) with slight overshoot.
+  function gsapSpring(el, opts) {
+    if (!el) return null;
+    const o = opts || {};
+    const duration = (o.duration != null ? o.duration : 0.3);
+    const ease = o.ease || EASE.spring;
+    const from = Object.assign({ opacity: 0, scale: 0.85, y: -6 }, o.from || {});
+    const to = Object.assign({ opacity: 1, scale: 1, y: 0 }, o.to || {});
+    gsapKill(el);
+    if (isReducedMotion() || !gsapReady) {
+      gsapSet(el, Object.assign({}, to, o.set || {}));
+      if (typeof o.onComplete === 'function') o.onComplete();
+      return null;
+    }
+    return gsapLib.fromTo(el, from, Object.assign({}, to, {
+      duration,
+      ease,
+      delay: o.delay || 0,
+      overwrite: true,
+      onComplete: o.onComplete,
+    }));
+  }
+
+  function gsapStaggerIn(els, opts) {
+    const list = Array.isArray(els) ? els.filter(Boolean) : [];
+    if (!list.length) return null;
+    const o = opts || {};
+    const duration = (o.duration != null ? o.duration : 0.22);
+    const stagger = (o.stagger != null ? o.stagger : 0.025);
+    const ease = o.ease || EASE.md3Emphasized;
+    const from = Object.assign({ opacity: 0, y: 8 }, o.from || {});
+    const to = Object.assign({ opacity: 1, y: 0 }, o.to || {});
+    list.forEach((el) => gsapKill(el));
+    if (isReducedMotion() || !gsapReady) {
+      list.forEach((el) => gsapSet(el, to));
+      if (typeof o.onComplete === 'function') o.onComplete();
+      return null;
+    }
+    return gsapLib.fromTo(list, from, Object.assign({}, to, {
+      duration,
+      ease,
+      stagger,
+      delay: o.delay || 0,
+      overwrite: true,
+      onComplete: o.onComplete,
+    }));
+  }
+
+  // Inspector fold open: directional scale+translate+opacity, ~340ms, MD3
+  // Emphasized with slight overshoot. Direction comes from comet-insp-from-*.
+  function gsapInspectorOpen(el, dir) {
+    if (!el) return null;
+    const d = dir || 'bottom';
+    const from = { opacity: 0, x: 0, y: 0, scaleX: 1, scaleY: 1, filter: 'drop-shadow(0 0 0 rgba(74,158,255,0))' };
+    if (d === 'left') { from.x = -26; from.scaleX = 0.3; from.scaleY = 0.92; }
+    else if (d === 'right') { from.x = 26; from.scaleX = 0.3; from.scaleY = 0.92; }
+    else if (d === 'top') { from.y = -26; from.scaleY = 0.3; from.scaleX = 0.92; }
+    else { from.y = 26; from.scaleY = 0.3; from.scaleX = 0.92; }
+    gsapKill(el);
+    if (isReducedMotion() || !gsapReady) {
+      gsapSet(el, { opacity: 1, x: 0, y: 0, scaleX: 1, scaleY: 1, clearProps: 'filter' });
+      return null;
+    }
+    const tl = gsapLib.timeline({ overwrite: true });
+    tl.fromTo(el, from, {
+      opacity: 1,
+      x: d === 'left' ? 4 : (d === 'right' ? -4 : 0),
+      y: d === 'top' ? 4 : (d === 'bottom' ? -4 : 0),
+      scaleX: d === 'left' || d === 'right' ? 1.04 : 1,
+      scaleY: d === 'top' || d === 'bottom' ? 1.04 : 1,
+      filter: 'drop-shadow(0 0 13px rgba(74,158,255,0.33))',
+      duration: 0.2,
+      ease: EASE.md3Emphasized,
+    }).to(el, {
+      x: 0, y: 0, scaleX: 1, scaleY: 1,
+      filter: 'drop-shadow(0 0 0 rgba(74,158,255,0))',
+      duration: 0.14,
+      ease: EASE.apple,
+      onComplete: () => { try { gsapLib.set(el, { clearProps: 'filter' }); } catch (_) { /* ok */ } },
+    });
+    return tl;
+  }
+
+  // Inspector fold close: reverse toward anchor, ~70% duration, ease-in.
+  function gsapInspectorClose(el, dir, onComplete) {
+    if (!el) return null;
+    const d = dir || 'bottom';
+    const to = { opacity: 0, x: 0, y: 0, scaleX: 1, scaleY: 1 };
+    if (d === 'left') { to.x = -18; to.scaleX = 0.35; to.scaleY = 0.94; }
+    else if (d === 'right') { to.x = 18; to.scaleX = 0.35; to.scaleY = 0.94; }
+    else if (d === 'top') { to.y = -18; to.scaleY = 0.35; to.scaleX = 0.94; }
+    else { to.y = 18; to.scaleY = 0.35; to.scaleX = 0.94; }
+    return gsapExit(el, {
+      duration: 0.24,
+      ease: EASE.md3Accelerate,
+      to,
+      onComplete,
+    });
+  }
+
+  // Top-center send confirmation toast: pops in (scale/fade), holds ~1.4s,
+  // then slides up and vanishes. Independent of the toolbar/status slot.
+  function showSentToast(text) {
+    if (!sentToastEl) return;
+    if (sentToastTimer) clearTimeout(sentToastTimer);
+    gsapKill(sentToastEl);
+    sentToastEl.textContent = text || 'Sent ✓';
+    sentToastEl.hidden = false;
+    sentToastEl.classList.remove('comet-sent-in', 'comet-sent-out');
+    // Keep comet-sent-* classes for CSS compatibility; GSAP drives transform/opacity.
+    sentToastEl.classList.add('comet-sent-in');
+    const finishHide = () => {
+      if (!sentToastEl) return;
+      sentToastEl.hidden = true;
+      sentToastEl.classList.remove('comet-sent-in', 'comet-sent-out');
+      gsapSet(sentToastEl, { clearProps: 'opacity,transform,x,y,scale' });
+    };
+    if (isReducedMotion() || !gsapReady) {
+      gsapSet(sentToastEl, { opacity: 1, xPercent: -50, y: 0, scale: 1 });
+      sentToastTimer = setTimeout(() => {
+        sentToastTimer = 0;
+        finishHide();
+      }, 1400);
+      return;
+    }
+    // Pop in ~300ms spring, hold 1.4s, slide up + fade ~200ms.
+    gsapSpring(sentToastEl, {
+      duration: 0.3,
+      from: { opacity: 0, xPercent: -50, y: -6, scale: 0.85 },
+      to: { opacity: 1, xPercent: -50, y: 0, scale: 1 },
+    });
+    sentToastTimer = setTimeout(() => {
+      sentToastTimer = 0;
+      if (!sentToastEl) return;
+      sentToastEl.classList.remove('comet-sent-in');
+      sentToastEl.classList.add('comet-sent-out');
+      gsapExit(sentToastEl, {
+        duration: 0.2,
+        ease: EASE.md3Accelerate,
+        to: { opacity: 0, xPercent: -50, y: -12, scale: 1 },
+        onComplete: finishHide,
+      });
+    }, 1400);
   }
 
   function sendFeedback(button, ok) {
@@ -406,7 +1339,7 @@
         setTimeout(() => { if (b) b.textContent = old || 'Send'; }, isReducedMotion() ? 0 : 400);
       }
     }
-    if (ok) showToast('Sent');
+    if (ok) showSentToast('Sent ✓');
   }
 
   function updateCount() {
@@ -414,6 +1347,7 @@
     const n = state.elements.length;
     countEl.textContent = n === 1 ? '1 element' : n + ' elements';
     updateSelectionUI();
+    showSendButton(); // elements exist again -> bring the Send button back
   }
 
   /* ---------------- canvas ---------------- */
@@ -548,6 +1482,7 @@
     state.capturedPointerId = null;
     if (s.points.length >= 2) state.strokes.push(s); // spec: min 2 points
     redraw();
+    showSendButton(); // new stroke -> Send button returns
   }
 
   /* ---------------- element mode: hit resolution ---------------- */
@@ -568,18 +1503,29 @@
 
   // Nearest meaningful element under the cursor: skip elements without
   // id/class/role/name/href (walk up max MAX_PARENT_WALK parents), never
-  // html/body, never the extension's own shadow host or anything inside it.
+  // html/body, never the extension's own shadow UI. Our UI lives in a CLOSED
+  // shadow root, so host.contains() cannot see inside it (closed shadow
+  // boundaries are opaque to light-tree traversal); getRootNode() returns the
+  // ShadowRoot for our elements and document for page elements, which is the
+  // reliable exclusion. If nothing meaningful is found in the walk, fall back
+  // to the raw hit element (DevTools-style) so hover always works over plain
+  // page content.
   function resolveMeaningful(hit) {
     if (!hit || hit.nodeType !== 1) return null;
-    if (host && host.contains(hit)) return null; // our own shadow subtree
+    if (hit.getRootNode() !== document) return null; // inside our closed shadow root
+    if (host && host.contains(hit)) return null;     // host itself / light-tree children
     let el = hit;
     for (let i = 0; i <= MAX_PARENT_WALK; i++) {
-      if (!el || el.nodeType !== 1) return null;
-      if (el === document.documentElement || el === document.body) return null;
+      if (!el || el.nodeType !== 1) break;           // walked off the tree
+      if (el === document.documentElement || el === document.body) break; // never html/body
       if (hasMeaning(el)) return el;
       el = el.parentElement;
     }
-    return null;
+    // No meaningful element within MAX_PARENT_WALK: fall back to the deepest
+    // page element under the cursor (never html/body, never our own UI), so
+    // hover always works over plain page content.
+    if (hit === document.documentElement || hit === document.body) return null;
+    return hit;
   }
 
   function cssPath(el) {
@@ -668,7 +1614,9 @@
 
   function applyHoverBox(box) {
     if (!hlEl || !box) return;
-    hlEl.style.display = '';
+    // Must be an explicit visible value: stylesheet defaults to display:none,
+    // so clearing the inline style (`''`) keeps the box hidden forever.
+    hlEl.style.display = 'block';
     hlEl.style.left = box.left + 'px';
     hlEl.style.top = box.top + 'px';
     hlEl.style.width = box.width + 'px';
@@ -679,7 +1627,7 @@
   // lerped hlEl; recomputed from live rect, invalidated on scroll/resize.
   function applyHoverOutlineBox(box) {
     if (!hoverBoxEl || !box) return;
-    hoverBoxEl.style.display = '';
+    hoverBoxEl.style.display = 'block';
     hoverBoxEl.style.left = box.left + 'px';
     hoverBoxEl.style.top = box.top + 'px';
     hoverBoxEl.style.width = box.width + 'px';
@@ -692,6 +1640,13 @@
 
   function positionHoverOutlineBox() {
     if (!hoverBoxEl) return;
+    if (mouse && pointOverUi(mouse.x, mouse.y)) {
+      // Cursor over extension UI: never draw the red hover box, even when
+      // hoveredEl is stale (panel opened or scrolled under the cursor
+      // between ticks). Mirrors the hoverTick guard on every draw path.
+      hideHoverOutlineBox();
+      return;
+    }
     if (!state.elementMode || !hoveredEl) {
       hideHoverOutlineBox();
       return;
@@ -725,38 +1680,35 @@
     return a + (b - a) * t;
   }
 
-  // The highlight is an overlay, so its visual box can ease without causing
-  // page layout. This is the one rAF-driven DOM effect requested by the spec.
+  // Hover highlight stays glued to the cursor/target: no laggy box lerp.
+  // Optional subtle opacity fade-in on first show (~80ms) only.
   function startHoverLerp() {
-    if (isReducedMotion() || hoverLerpRaf || !hoverTargetRect) return;
-    const from = hoverVisualRect || hoverTargetRect;
-    const started = nowMs();
-    const tick = () => {
-      hoverLerpRaf = 0;
-      if (isReducedMotion() || !state.elementMode || !hoverTargetRect) return;
-      const t = clamp01((nowMs() - started) / 100);
-      const eased = 1 - Math.pow(1 - t, 3); // ease-out
-      hoverVisualRect = {
-        left: lerp(from.left, hoverTargetRect.left, eased),
-        top: lerp(from.top, hoverTargetRect.top, eased),
-        width: lerp(from.width, hoverTargetRect.width, eased),
-        height: lerp(from.height, hoverTargetRect.height, eased),
-      };
-      applyHoverBox(hoverVisualRect);
-      if (t < 1) hoverLerpRaf = requestAnimationFrame(tick);
-      else if (hoverVisualRect !== hoverTargetRect) {
-        hoverVisualRect = Object.assign({}, hoverTargetRect);
-      }
-    };
-    hoverLerpRaf = requestAnimationFrame(tick);
+    // Intentionally no-op: owner wants the hover box glued, not lagged.
+    cancelHoverLerp();
   }
 
   function positionHover() {
     if (!hlEl) return;
+    if (mouse && pointOverUi(mouse.x, mouse.y)) {
+      // Cursor over extension UI: never draw the hover highlight here,
+      // even if hoveredEl is stale (panel opened / scrolled under the
+      // cursor between ticks, or a scroll/resize fired before the next
+      // hoverTick). Mirrors the hoverTick guard on every draw path.
+      cancelHoverLerp();
+      hoverTargetRect = null;
+      hoverVisualRect = null;
+      if (gsapReady) gsapKill(hlEl);
+      hlEl.style.opacity = '';
+      hlEl.style.display = 'none';
+      hideHoverOutlineBox();
+      return;
+    }
     if (!state.elementMode || !hoveredEl) {
       cancelHoverLerp();
       hoverTargetRect = null;
       hoverVisualRect = null;
+      if (gsapReady) gsapKill(hlEl);
+      hlEl.style.opacity = '';
       hlEl.style.display = 'none';
       hideHoverOutlineBox();
       return;
@@ -768,21 +1720,24 @@
       cancelHoverLerp();
       hoverTargetRect = null;
       hoverVisualRect = null;
+      if (gsapReady) gsapKill(hlEl);
+      hlEl.style.opacity = '';
       hlEl.style.display = 'none';
       hideHoverOutlineBox();
       return;
     }
+    const firstShow = !hoverVisualRect;
     hoverTargetRect = target;
-    if (isReducedMotion()) {
-      cancelHoverLerp();
-      hoverVisualRect = Object.assign({}, target);
-      applyHoverBox(hoverVisualRect);
-    } else {
-      if (!hoverVisualRect) {
-        hoverVisualRect = Object.assign({}, target);
-        applyHoverBox(hoverVisualRect);
-      }
-      startHoverLerp();
+    hoverVisualRect = Object.assign({}, target);
+    // Instant follow (glued): never animate left/top/width/height.
+    applyHoverBox(hoverVisualRect);
+    if (firstShow && !isReducedMotion() && gsapReady) {
+      gsapLib.fromTo(hlEl, { opacity: 0 }, {
+        opacity: 1,
+        duration: 0.08,
+        ease: EASE.apple,
+        overwrite: 'auto',
+      });
     }
     if (hlEl.style.display !== 'none') hlChip.textContent = chipFromEl(hoveredEl);
     // Stronger unambiguous box (element mode only); tracks live rect.
@@ -810,6 +1765,31 @@
     // rAF-throttled hover-box recompute on scroll/resize (element mode only).
     scheduleHoverOutlineBox();
     if (hintProp) scheduleRedraw();
+    // Keep Size & Position readout glued to the live element rect.
+    updateInspectorMetrics();
+    // Floating inspector follows its element on scroll; docked panels are
+    // viewport-anchored and skip this.
+    if (inspPanel && !inspPanel.hidden && !state.dock) positionInspector();
+  }
+
+  // Suppression guard for our own UI surfaces. The host element is
+  // pointer-events:none, so elementFromPoint() over the inspector panel,
+  // toolbar, chip, chat card or toast resolves the PAGE element BEHIND the
+  // UI. When the cursor sits inside any visible UI rect, the hover highlight
+  // must not draw (and clicks must not select) that page element. Hidden
+  // surfaces (hidden attribute or display:none) report a zero-size rect and
+  // are skipped, so only what the user can actually see suppresses hover.
+  function pointOverUi(x, y) {
+    const uiSurfaces = [inspPanel, toolbar, chatCard, chipEl, sentToastEl];
+    for (let i = 0; i < uiSurfaces.length; i++) {
+      const el = uiSurfaces[i];
+      if (!el || el.hidden) continue;
+      let r = null;
+      try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+      if (!r || r.width < 1 || r.height < 1) continue;
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return true;
+    }
+    return false;
   }
 
   // rAF loop while element mode is active: re-resolve the hovered element
@@ -820,25 +1800,41 @@
       stopHoverLoop();
       return;
     }
-    if (isReducedMotion()) {
+    // Any throw in hit-testing / layout would otherwise kill the rAF loop
+    // permanently; keep the loop alive and clear hover on failure.
+    try {
       if (mouseDirty && mouse) {
         mouseDirty = false;
-        let hit = null;
-        try { hit = document.elementFromPoint(mouse.x, mouse.y); } catch (_) { hit = null; }
-        hoveredEl = resolveMeaningful(hit);
+        if (pointOverUi(mouse.x, mouse.y)) {
+          // Cursor is over one of our own surfaces (inspector, toolbar,
+          // chip, chat card, toast): the host is pointer-events:none, so
+          // elementFromPoint() would resolve the PAGE element behind the
+          // UI. Never highlight the element behind our own panel. Both
+          // hover boxes hide together (the outline box can otherwise stay
+          // visible with display:block over the panel).
+          hoveredEl = null;
+          if (hlEl) {
+            hlEl.style.opacity = '';
+            hlEl.style.display = 'none';
+          }
+          if (hoverBoxEl) hoverBoxEl.style.display = 'none';
+        } else {
+          let hit = null;
+          try { hit = document.elementFromPoint(mouse.x, mouse.y); } catch (_) { hit = null; }
+          try { hoveredEl = resolveMeaningful(hit); } catch (_) { hoveredEl = null; }
+        }
       }
-      positionHover();
-      positionSelections();
-      return;
+      try { positionHover(); } catch (_) {
+        if (hlEl) hlEl.style.display = 'none';
+        hideHoverOutlineBox();
+      }
+      try { positionSelections(); } catch (_) { /* keep outlines sticky on next tick */ }
+    } catch (_) {
+      hoveredEl = null;
+      if (hlEl) hlEl.style.display = 'none';
+      hideHoverOutlineBox();
     }
-    if (mouseDirty && mouse) {
-      mouseDirty = false;
-      let hit = null;
-      try { hit = document.elementFromPoint(mouse.x, mouse.y); } catch (_) { hit = null; }
-      hoveredEl = resolveMeaningful(hit);
-    }
-    positionHover();
-    positionSelections();
+    if (isReducedMotion()) return;
     hoverLoopRaf = requestAnimationFrame(hoverTick);
   }
 
@@ -898,27 +1894,50 @@
     }
     lastSelectionCount = n;
     inspSelectionList.innerHTML = '';
+    const rows = [];
     state.elements.forEach((en, i) => {
       const row = document.createElement('div');
       row.className = 'comet-selection-row' + (i === state.activeIndex ? ' active' : '');
       row.dataset.selectionIndex = String(i);
-      row.style.setProperty('--row-delay', Math.min(i * 30, 200) + 'ms');
+      // Keep --row-delay for CSS fallback; GSAP drives the stagger when ready.
+      row.style.setProperty('--row-delay', Math.min(i * 25, 200) + 'ms');
       const main = document.createElement('button');
       main.type = 'button';
       main.className = 'comet-selection-main';
       main.dataset.selectionAction = 'activate';
-      main.textContent = selectionLabel(en);
-      main.title = 'Edit ' + selectionLabel(en);
+      const label = selectionLabel(en);
+      const labelSpan = document.createElement('span');
+      labelSpan.className = 'comet-selection-label';
+      labelSpan.textContent = label;
+      main.appendChild(labelSpan);
+      const note = String((en.descriptor && en.descriptor.instruction) || '').replace(/\s+/g, ' ').trim();
+      if (note) {
+        const noteSpan = document.createElement('span');
+        noteSpan.className = 'comet-selection-note';
+        noteSpan.textContent = note.length > 40 ? note.slice(0, 40) + '…' : note;
+        main.appendChild(noteSpan);
+      }
+      main.title = 'Edit ' + label;
       const remove = document.createElement('button');
       remove.type = 'button';
       remove.className = 'comet-selection-remove';
       remove.dataset.selectionAction = 'remove';
       remove.textContent = '×';
-      remove.title = 'Remove ' + selectionLabel(en);
+      remove.title = 'Remove ' + label;
       row.appendChild(main);
       row.appendChild(remove);
       inspSelectionList.appendChild(row);
+      rows.push(row);
     });
+    // Stagger reveal 25ms with slight y-offset (Premium / MD3 Emphasized).
+    if (rows.length) {
+      gsapStaggerIn(rows, {
+        duration: 0.22,
+        stagger: 0.025,
+        from: { opacity: 0, y: 8 },
+        to: { opacity: 1, y: 0 },
+      });
+    }
   }
 
   function removeOutlineWithFade(outline) {
@@ -958,6 +1977,7 @@
     } else if (state.activeIndex > index) {
       state.activeIndex -= 1;
     }
+    syncInspAdd();
     updateCount();
     updateSelectionPulse();
   }
@@ -973,6 +1993,7 @@
     }
     if (chatCard) chatCard.hidden = true;
     closeInspector();
+    syncInspAdd();
     updateCount();
     updateSelectionPulse();
   }
@@ -1005,22 +2026,34 @@
       state.activeIndex = -1;
     }
     pending = { descriptor, el, isEdit, editIndex, outlineEl };
-    chatHead.textContent = chipFromEl(el) + (isEdit ? ' — edit instruction' : '');
+    chatHead.textContent = chipFromEl(el) + (isEdit ? ' - edit instruction' : '');
     chatInput.value = isEdit ? (state.elements[editIndex].descriptor.instruction || '') : '';
-    chatCard.hidden = false;
-    chatInput.focus();
+    // Element instructions live in the inspector, not the bottom-right chat
+    // card (the card is annotate-note only). The panel opens below via
+    // openInspector; focus its instruction field.
     positionSelections();
     // v1.1: inspector is bound to the committed descriptor, so edits remain
     // per element when a different selection becomes active.
     const inspDesc = isEdit ? state.elements[editIndex].descriptor : descriptor;
-    openInspector(el, inspDesc);
+    // A panel failure must never break element picking: log via the diag ring
+    // and continue the focus/selection flow so the next click still works.
+    try {
+      openInspector(el, inspDesc);
+    } catch (err) {
+      diagLog('error', 'openInspector failed: ' + (err && err.message ? err.message : String(err)));
+    }
     if (inspInput) inspInput.value = inspDesc.instruction || '';
+    if (inspInput) inspInput.focus();
+    syncInspAdd();
     updateSelectionUI();
   }
 
   function addChat() {
     if (!pending) return;
-    const instr = chatInput.value.trim().slice(0, MAX_INSTR);
+    // The instruction field is the inspector textarea in element mode (the
+    // chat card is annotate-note only); fall back to the card input.
+    const src = (inspInput && inspPanel && !inspPanel.hidden) ? inspInput : chatInput;
+    const instr = String(src.value || '').trim().slice(0, MAX_INSTR);
     let committedIndex = pending.editIndex;
     if (pending.isEdit) {
       state.elements[pending.editIndex].descriptor.instruction = instr;
@@ -1036,9 +2069,10 @@
       state.activeIndex = committedIndex;
     }
     pending = null;
-    chatInput.value = '';
+    if (chatInput) chatInput.value = '';
     if (inspInput) inspInput.value = state.elements[committedIndex].descriptor.instruction || '';
-    chatInput.focus(); // stays open for the next element
+    if (inspInput) inspInput.focus(); // inspector stays open for the next element
+    syncInspAdd();
     updateCount();
     updateSelectionPulse();
   }
@@ -1050,8 +2084,65 @@
     }
     pending = null;
     chatCard.hidden = true;
-    chatInput.value = '';
+    if (chatInput) chatInput.value = '';
+    if (inspInput) inspInput.value = '';
+    syncInspAdd();
     closeInspector(); // deselection closes the inspector
+  }
+
+  /* ---- annotate-mode note card (not bound to any element) ---- */
+  // The bottom-right chat card doubles as a scratchpad while the ANNOTATE
+  // tool is active: notes queue into state.annotNote (Enter / Add) and ship
+  // with the payload as `note`. Element-mode behavior (pending) is untouched.
+  function showAnnotNoteCard() {
+    if (!chatCard) return;
+    chatHead.textContent = 'Annotation note';
+    chatInput.placeholder = 'Your thoughts/instructions for this annotation…';
+    chatInput.value = state.annotNotes.join('\n'); // re-shows the committed notes
+    chatCard.classList.add('comet-chat-note');
+    chatCard.hidden = false;
+    // Premium pop: layered scale + slide + opacity (MD3 Emphasized, 240ms).
+    // Reduced motion -> gsapEnter snaps straight to the final state.
+    gsapEnter(chatCard, {
+      duration: 0.24,
+      ease: EASE.md3Emphasized,
+      from: { opacity: 0, y: 14, scale: 0.96 },
+      to: { opacity: 1, y: 0, scale: 1 },
+    });
+    chatInput.focus();
+  }
+
+  function hideAnnotNoteCard() {
+    if (!chatCard) return;
+    chatCard.hidden = true;
+    chatCard.classList.remove('comet-chat-note');
+    chatInput.value = ''; // discard the uncommitted draft, keep the committed queue
+    chatInput.placeholder = 'Your thoughts/instructions for this element…';
+  }
+
+  function commitAnnotNote() {
+    if (!state.annotateOn || state.elementMode) return;
+    if (!chatCard || chatCard.hidden) return;
+    const text = chatInput.value.trim().slice(0, MAX_INSTR);
+    if (text) {
+      state.annotNote = text; // legacy last note ('note' payload back-compat)
+      state.annotNotes.push(text);
+      // Keep the queue in sync with what send() ships (slice(0, 20)).
+      if (state.annotNotes.length > 20) state.annotNotes.splice(0, state.annotNotes.length - 20);
+    }
+    chatInput.value = '';
+    chatInput.focus(); // stays open for the next note (queue-first)
+    updateNoteCount();
+  }
+
+  // Toolbar chip showing how many annotation notes are queued. Notes ship
+  // ONLY via the toolbar Send button; the inspector Add button never sends.
+  function updateNoteCount() {
+    if (!noteCountEl) return;
+    const n = state.annotNotes.length;
+    noteCountEl.hidden = n === 0;
+    noteCountEl.textContent = n === 1 ? '📝 1 note' : '📝 ' + n + ' notes';
+    if (n > 0) showSendButton(); // queued notes are sendable even with no strokes/elements
   }
 
   function onMouseMove(e) {
@@ -1067,6 +2158,7 @@
   function onPageMouseDown(e) {
     if (!state.elementMode) return;
     if (e.composedPath().indexOf(host) !== -1) return; // interaction inside our UI
+    if (pointOverUi(e.clientX, e.clientY)) return;     // over our own UI surface
     e.preventDefault();
     e.stopPropagation();
   }
@@ -1074,6 +2166,7 @@
   function onPageClick(e) {
     if (!state.elementMode) return;
     if (e.composedPath().indexOf(host) !== -1) return; // click inside our UI
+    if (pointOverUi(e.clientX, e.clientY)) return;     // over our own UI surface
     // Picker semantics: the page must not react to selection clicks.
     e.preventDefault();
     e.stopPropagation();
@@ -1111,7 +2204,7 @@
       return;
     }
     if (pending && pending.descriptor.cssPath === d.cssPath) {
-      chatInput.focus(); // same pending element -> just refocus
+      if (inspInput) inspInput.focus(); // same pending element -> just refocus
       return;
     }
     if (state.elements.length) clearCommittedSelections();
@@ -1132,17 +2225,44 @@
   }
 
   function onKeyDown(e) {
-    if (!state.elementMode) return;
-    if (chatCard && !chatCard.hidden) {
+    const path = e.composedPath();
+    const fromUi = path.indexOf(host) !== -1;
+    const fromChatInput = !!chatInput && path.indexOf(chatInput) !== -1;
+    const fromInspInput = !!inspInput && path.indexOf(inspInput) !== -1;
+    const chatEnter = fromChatInput && e.key === 'Enter' && !e.shiftKey;
+    const inspEnter = fromInspInput && e.key === 'Enter' && !e.shiftKey;
+    // Events from inspector controls must reach their real shadow-DOM target.
+    // Only Escape and the Enter shortcuts (chat card / inspector instruction
+    // field) are global actions.
+    if (fromUi && e.key !== 'Escape' && !chatEnter && !inspEnter) return;
+
+    // Annotate note mode: the card is bound to the note, not to an element.
+    if (state.annotateOn && !state.elementMode && chatCard && !chatCard.hidden) {
       if (e.key === 'Escape') {
         e.preventDefault();
-        cancelChat();
+        hideAnnotNoteCard();
         return;
       }
-      if (e.key === 'Enter' && !e.shiftKey && e.target === chatInput) {
+      if (chatEnter) {
         e.preventDefault();
-        addChat();
+        commitAnnotNote();
+        return;
       }
+    }
+    if (!state.elementMode) return;
+    // Element mode: instructions live in the inspector instruction field.
+    // Enter commits the pending element (Shift+Enter inserts a newline and
+    // never commits; Enter with no pending element does nothing either).
+    // Escape cancels the pending element and closes the inspector.
+    if (inspEnter || chatEnter) {
+      if (!pending) return;
+      e.preventDefault();
+      addChat();
+      return;
+    }
+    if (e.key === 'Escape' && pending && (fromInspInput || fromChatInput)) {
+      e.preventDefault();
+      cancelChat();
     }
   }
 
@@ -1154,10 +2274,26 @@
   ];
   const FONT_WEIGHTS = ['100', '200', '300', '400', '500', '600', '700', '800', '900'];
   const DISPLAY_VALUES = ['block', 'inline', 'inline-block', 'flex', 'grid', 'none'];
-  const TEXT_HINT_PROPS = new Set(['fontSize', 'fontWeight', 'fontFamily', 'lineHeight', 'color']);
+  const TEXT_HINT_PROPS = new Set(['fontSize', 'fontWeight', 'fontFamily', 'lineHeight', 'letterSpacing', 'color', 'textAlign', 'textTransform', 'textDecoration', 'fontStyle']);
   const UNDERLINE_HINT_PROPS = new Set(['text', 'href']);
   const TEXT_ALIGN_VALUES = ['left', 'center', 'right', 'justify'];
+  const TEXT_TRANSFORM_VALUES = ['none', 'uppercase', 'lowercase', 'capitalize'];
   const TEXT_TRANSFORM_CYCLE = ['uppercase', 'lowercase', 'capitalize', 'none'];
+  const TEXT_DECORATION_VALUES = ['none', 'underline', 'line-through'];
+  const FONT_STYLE_VALUES = ['normal', 'italic'];
+  const TEXT_PROP_LABELS = {
+    text: 'Content',
+    fontFamily: 'Font',
+    fontWeight: 'Weight',
+    fontSize: 'Size',
+    lineHeight: 'Leading',
+    letterSpacing: 'Tracking',
+    textAlign: 'Align',
+    fontStyle: 'Style',
+    textTransform: 'Case',
+    textDecoration: 'Decor',
+    color: 'Color',
+  };
   const INLINE_TAGS = new Set([
     'SPAN', 'A', 'STRONG', 'EM', 'B', 'I', 'U', 'LABEL', 'CODE', 'SMALL', 'BIG',
     'ABBR', 'CITE', 'DFN', 'KBD', 'SAMP', 'VAR', 'MARK', 'TIME', 'Q', 'SUB', 'SUP',
@@ -1166,9 +2302,9 @@
   // Inspector category grouping (v1.6). Each property maps to exactly one bucket.
   const CAT_ORDER = ['Text', 'Layout', 'Appearance', 'Other'];
   const CAT_TEXT = new Set([
-    'fontSize', 'fontFamily', 'fontWeight', 'lineHeight', 'color', 'textAlign',
-    'textTransform', 'letterSpacing', 'wordSpacing', 'whiteSpace', 'textDecoration',
-    'fontStyle', 'textShadow', 'verticalAlign',
+    'text', 'fontSize', 'fontFamily', 'fontWeight', 'lineHeight', 'letterSpacing',
+    'color', 'textAlign', 'textTransform', 'textDecoration', 'fontStyle',
+    'wordSpacing', 'whiteSpace', 'textShadow', 'verticalAlign',
   ]);
   const CAT_LAYOUT = new Set([
     'display', 'position', 'width', 'height', 'margin', 'padding', 'flex',
@@ -1205,6 +2341,308 @@
         header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
       }
     }
+  }
+
+  // Append a collapsible inspector category (header + body). Returns the body.
+  function appendInspectorCategory(cat) {
+    const collapsed = isCatCollapsed(cat);
+    const header = document.createElement('button');
+    header.type = 'button';
+    header.className = 'comet-insp-cat-header' + (collapsed ? ' is-collapsed' : '');
+    header.dataset.cat = cat;
+    header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    header.title = (collapsed ? 'Expand ' : 'Collapse ') + cat;
+    const chev = document.createElement('span');
+    chev.className = 'comet-insp-cat-chevron';
+    chev.setAttribute('aria-hidden', 'true');
+    chev.textContent = '▸';
+    const lab = document.createElement('span');
+    lab.className = 'comet-insp-cat-label';
+    lab.textContent = cat;
+    header.appendChild(chev);
+    header.appendChild(lab);
+    header.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleCatCollapse(cat);
+    });
+    const body = document.createElement('div');
+    body.className = 'comet-insp-cat-body';
+    body.dataset.cat = cat;
+    body.hidden = collapsed;
+    inspRows.appendChild(header);
+    inspRows.appendChild(body);
+    return body;
+  }
+
+  // Compact CSS selector for copy (prefer #id, else tag.class, else cssPath).
+  function cssSelector(el) {
+    if (!el || el.nodeType !== 1) return '';
+    try {
+      if (el.id && typeof el.id === 'string' && /^[A-Za-z][\w-]*$/.test(el.id)) {
+        return '#' + el.id;
+      }
+    } catch (_) { /* ok */ }
+    const tag = (el.tagName || '').toLowerCase();
+    let cls = '';
+    try { cls = el.getAttribute('class') || ''; } catch (_) {
+      try { cls = el.className || ''; } catch (__) { cls = ''; }
+    }
+    if (typeof cls === 'string') {
+      const tokens = cls.trim().split(/\s+/).filter((c) => c && /^[A-Za-z_-][\w-]*$/.test(c));
+      if (tokens.length) return tag + '.' + tokens.slice(0, 3).join('.');
+    }
+    return cssPath(el);
+  }
+
+  function copyTextToClipboard(text) {
+    const s = String(text == null ? '' : text);
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      return navigator.clipboard.writeText(s).then(() => true).catch(() => copyTextExecCommand(s));
+    }
+    return Promise.resolve(copyTextExecCommand(s));
+  }
+
+  function copyTextExecCommand(text) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+      document.documentElement.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      if (ta.parentNode) ta.parentNode.removeChild(ta);
+      return ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function flashCopyButton(btn) {
+    if (!btn) return;
+    const prev = btn.textContent;
+    btn.classList.add('is-copied');
+    btn.textContent = 'Copied!';
+    setTimeout(() => {
+      btn.classList.remove('is-copied');
+      btn.textContent = prev;
+    }, 900);
+  }
+
+  function bindCopyButton(btn, getText) {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const text = typeof getText === 'function' ? getText() : getText;
+      Promise.resolve(copyTextToClipboard(text)).then((ok) => {
+        if (ok !== false) flashCopyButton(btn);
+      }).catch(() => { /* silent */ });
+    });
+  }
+
+  let revealPulseTimer = 0;
+  function revealElementOnPage(el) {
+    if (!el || !el.isConnected) return;
+    try {
+      el.scrollIntoView({
+        behavior: isReducedMotion() ? 'auto' : 'smooth',
+        block: 'center',
+        inline: 'nearest',
+      });
+    } catch (_) {
+      try { el.scrollIntoView(true); } catch (__) { /* ok */ }
+    }
+    // Prefer pulsing the existing selection outline; otherwise create a temp ring.
+    let outline = null;
+    const entry = state.elements.find((en) => en.el === el);
+    if (entry && entry.outlineEl) outline = entry.outlineEl;
+    if (pending && pending.el === el && pending.outlineEl) outline = pending.outlineEl;
+    if (revealPulseTimer) {
+      clearTimeout(revealPulseTimer);
+      revealPulseTimer = 0;
+    }
+    if (outline) {
+      outline.classList.remove('comet-el-reveal-pulse');
+      void outline.offsetWidth;
+      if (!isReducedMotion()) outline.classList.add('comet-el-reveal-pulse');
+      revealPulseTimer = setTimeout(() => {
+        revealPulseTimer = 0;
+        if (outline) outline.classList.remove('comet-el-reveal-pulse');
+      }, isReducedMotion() ? 0 : 700);
+      return;
+    }
+    // Temporary outline when the element is not yet in the selection list.
+    if (!selLayer || isReducedMotion()) return;
+    let r = null;
+    try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+    if (!r || r.width < 1 || r.height < 1) return;
+    const tmp = document.createElement('div');
+    tmp.className = 'comet-el comet-el-reveal-pulse';
+    placeRect(tmp, r);
+    selLayer.appendChild(tmp);
+    revealPulseTimer = setTimeout(() => {
+      revealPulseTimer = 0;
+      if (tmp.parentNode) tmp.parentNode.removeChild(tmp);
+    }, 700);
+  }
+
+  const COMPUTED_STYLE_KEYS = [
+    'display', 'position', 'color', 'background-color', 'font-size',
+    'padding', 'margin', 'border', 'border-radius', 'opacity', 'z-index', 'box-shadow',
+  ];
+
+  function readComputedStyleMap(el) {
+    const out = {};
+    if (!el) return out;
+    let cs = null;
+    try { cs = window.getComputedStyle(el); } catch (_) { cs = null; }
+    if (!cs) return out;
+    COMPUTED_STYLE_KEYS.forEach((key) => {
+      try { out[key] = cs.getPropertyValue(key) || ''; } catch (_) { out[key] = ''; }
+    });
+    return out;
+  }
+
+  function formatRectReadout(el) {
+    let r = null;
+    try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+    const sx = window.scrollX || window.pageXOffset || 0;
+    const sy = window.scrollY || window.pageYOffset || 0;
+    if (!r) {
+      return { x: '-', y: '-', w: '-', h: '-', scroll: '-' };
+    }
+    const round1 = (n) => (Math.round(n * 10) / 10).toFixed(1);
+    return {
+      x: round1(r.left),
+      y: round1(r.top),
+      w: round1(r.width),
+      h: round1(r.height),
+      scroll: round1(sx) + ', ' + round1(sy),
+    };
+  }
+
+  function updateInspectorMetrics() {
+    if (!inspRows || !inspector.el) return;
+    const grid = inspRows.querySelector('.comet-insp-metrics');
+    if (!grid) return;
+    const vals = formatRectReadout(inspector.el);
+    grid.querySelectorAll('[data-metric]').forEach((cell) => {
+      const key = cell.dataset.metric;
+      if (key && vals[key] != null) cell.textContent = vals[key];
+    });
+  }
+
+  function appendDevtoolCategories(el) {
+    if (!el || !inspRows) return;
+
+    // ---- Selectors: copy path / selector + reveal on page ----
+    const selBody = appendInspectorCategory('Selectors');
+    const path = cssPath(el);
+    const selector = cssSelector(el);
+
+    const pathRow = document.createElement('div');
+    pathRow.className = 'comet-insp-dev-row';
+    const pathLab = document.createElement('span');
+    pathLab.className = 'comet-insp-label';
+    pathLab.textContent = 'CSS path';
+    const pathVal = document.createElement('code');
+    pathVal.className = 'comet-insp-mono';
+    pathVal.textContent = path;
+    pathVal.title = path;
+    const pathCopy = document.createElement('button');
+    pathCopy.type = 'button';
+    pathCopy.className = 'comet-insp-copy';
+    pathCopy.textContent = 'Copy';
+    pathCopy.title = 'Copy CSS path';
+    bindCopyButton(pathCopy, () => path);
+    pathRow.appendChild(pathLab);
+    pathRow.appendChild(pathVal);
+    pathRow.appendChild(pathCopy);
+    selBody.appendChild(pathRow);
+
+    const selRow = document.createElement('div');
+    selRow.className = 'comet-insp-dev-row';
+    const selLab = document.createElement('span');
+    selLab.className = 'comet-insp-label';
+    selLab.textContent = 'Selector';
+    const selVal = document.createElement('code');
+    selVal.className = 'comet-insp-mono';
+    selVal.textContent = selector;
+    selVal.title = selector;
+    const selCopy = document.createElement('button');
+    selCopy.type = 'button';
+    selCopy.className = 'comet-insp-copy';
+    selCopy.textContent = 'Copy';
+    selCopy.title = 'Copy CSS selector';
+    bindCopyButton(selCopy, () => selector);
+    selRow.appendChild(selLab);
+    selRow.appendChild(selVal);
+    selRow.appendChild(selCopy);
+    selBody.appendChild(selRow);
+
+    const revealRow = document.createElement('div');
+    revealRow.className = 'comet-insp-dev-row comet-insp-dev-row-actions';
+    const revealBtn = document.createElement('button');
+    revealBtn.type = 'button';
+    revealBtn.className = 'comet-insp-reveal';
+    revealBtn.textContent = 'Reveal on page';
+    revealBtn.title = 'Scroll to element and pulse its outline';
+    revealBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      revealElementOnPage(el);
+    });
+    revealRow.appendChild(revealBtn);
+    selBody.appendChild(revealRow);
+
+    // ---- Computed: compact 2-col read-only grid ----
+    const compBody = appendInspectorCategory('Computed');
+    const compGrid = document.createElement('div');
+    compGrid.className = 'comet-insp-computed';
+    const cmap = readComputedStyleMap(el);
+    COMPUTED_STYLE_KEYS.forEach((key) => {
+      const cell = document.createElement('div');
+      cell.className = 'comet-insp-computed-cell';
+      const k = document.createElement('span');
+      k.className = 'comet-insp-computed-key';
+      k.textContent = key;
+      const v = document.createElement('span');
+      v.className = 'comet-insp-computed-val';
+      v.textContent = cmap[key] || '-';
+      v.title = cmap[key] || '';
+      cell.appendChild(k);
+      cell.appendChild(v);
+      compGrid.appendChild(cell);
+    });
+    compBody.appendChild(compGrid);
+
+    // ---- Size & Position: live getBoundingClientRect + scroll ----
+    const metricsBody = appendInspectorCategory('Size & Position');
+    const metrics = document.createElement('div');
+    metrics.className = 'comet-insp-metrics';
+    const vals = formatRectReadout(el);
+    [
+      ['x', 'X'],
+      ['y', 'Y'],
+      ['w', 'W'],
+      ['h', 'H'],
+      ['scroll', 'Scroll'],
+    ].forEach(([key, label]) => {
+      const cell = document.createElement('div');
+      cell.className = 'comet-insp-metric' + (key === 'scroll' ? ' comet-insp-metric-wide' : '');
+      const k = document.createElement('span');
+      k.className = 'comet-insp-metric-key';
+      k.textContent = label;
+      const v = document.createElement('span');
+      v.className = 'comet-insp-metric-val';
+      v.dataset.metric = key;
+      v.textContent = vals[key];
+      cell.appendChild(k);
+      cell.appendChild(v);
+      metrics.appendChild(cell);
+    });
+    metricsBody.appendChild(metrics);
   }
 
   function parsePx(v) {
@@ -1346,7 +2784,35 @@
   function mapTextDecoration(v) {
     const s = String(v || '').trim().toLowerCase();
     if (!s || s === 'none') return 'none';
-    return s.indexOf('underline') !== -1 ? 'underline' : 'none';
+    if (s.indexOf('line-through') !== -1 || s.indexOf('linethrough') !== -1) return 'line-through';
+    if (s.indexOf('underline') !== -1) return 'underline';
+    return 'none';
+  }
+
+  function parseLetterSpacing(v) {
+    const s = String(v || '').trim().toLowerCase();
+    if (!s || s === 'normal') return 0;
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
+  }
+
+  function elementHasEditableText(el) {
+    if (!el) return false;
+    try {
+      const tag = String(el.tagName || '').toUpperCase();
+      if (tag === 'IMG' || tag === 'SVG' || tag === 'VIDEO' || tag === 'AUDIO' ||
+          tag === 'CANVAS' || tag === 'IFRAME' || tag === 'OBJECT' || tag === 'EMBED' ||
+          tag === 'HR' || tag === 'BR' || tag === 'SOURCE' || tag === 'TRACK' ||
+          tag === 'AREA' || tag === 'MAP' || tag === 'PICTURE') {
+        // AREA can still have href; text controls stay hidden.
+        return false;
+      }
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+      const text = readEditableText(el);
+      return !!(text && String(text).trim() !== '');
+    } catch (_) {
+      return false;
+    }
   }
 
   function nextTextTransform(v) {
@@ -1408,6 +2874,28 @@
         prop: 'lineHeight', kind: 'slider', min: 0.8, max: 3.0, step: 0.05, unit: '',
         numeric: lh, current: String(cs.lineHeight),
       });
+      const ls = parseLetterSpacing(cs.letterSpacing);
+      out.push({
+        prop: 'letterSpacing', kind: 'slider', min: -2, max: 20, step: 0.1, unit: 'px',
+        numeric: ls, current: String(cs.letterSpacing),
+      });
+      out.push({
+        prop: 'textAlign', kind: 'select', options: TEXT_ALIGN_VALUES,
+        current: cs.textAlign, value: mapTextAlign(cs.textAlign),
+      });
+      out.push({
+        prop: 'fontStyle', kind: 'select', options: FONT_STYLE_VALUES,
+        current: cs.fontStyle, value: mapFontStyle(cs.fontStyle),
+      });
+      out.push({
+        prop: 'textTransform', kind: 'select', options: TEXT_TRANSFORM_VALUES,
+        current: cs.textTransform, value: mapTextTransform(cs.textTransform),
+      });
+      out.push({
+        prop: 'textDecoration', kind: 'select', options: TEXT_DECORATION_VALUES,
+        current: cs.textDecoration || cs.textDecorationLine,
+        value: mapTextDecoration(cs.textDecorationLine || cs.textDecoration),
+      });
       out.push({
         prop: 'color', kind: 'color', current: cs.color, value: rgbToHex(cs.color),
       });
@@ -1435,7 +2923,16 @@
     }
     let text = readEditableText(el);
     if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT);
-    out.push({ prop: 'text', kind: 'textarea', current: text, value: text, max: MAX_TEXT });
+    // Hide text content + typography controls for non-text elements (img, svg, ...).
+    // Layout/Appearance rows still render; Text category only appears when useful.
+    if (elementHasEditableText(el) || (text && String(text).length > 0)) {
+      out.push({ prop: 'text', kind: 'textarea', current: text, value: text, max: MAX_TEXT });
+    } else {
+      // Strip typography props already pushed when the element has no text.
+      for (let i = out.length - 1; i >= 0; i--) {
+        if (CAT_TEXT.has(out[i].prop) && out[i].prop !== 'href') out.splice(i, 1);
+      }
+    }
     try {
       if (el.tagName === 'A' || el.tagName === 'AREA') {
         const href = el.getAttribute('href') || el.href || '';
@@ -1452,11 +2949,17 @@
   }
 
   function formatManipValue(prop, numeric, unit) {
+    const value = Number(numeric);
+    const safe = Number.isFinite(value) ? value : 0;
     if (prop === 'lineHeight') {
-      const n = Math.round(Number(numeric) * 100) / 100;
+      const n = Math.round(safe * 100) / 100;
       return String(n);
     }
-    return Math.round(Number(numeric)) + (unit || 'px');
+    if (prop === 'letterSpacing') {
+      const n = Math.round(safe * 100) / 100;
+      return String(n) + (unit || 'px');
+    }
+    return String(Math.round(safe)) + (unit || 'px');
   }
 
   function captureOriginals(el) {
@@ -1499,7 +3002,7 @@
     }
     // Also capture formatting baselines used by the text toolbar so Reset all
     // can restore fontStyle / textDecoration / textAlign / textTransform.
-    const fmtProps = ['fontStyle', 'textDecoration', 'textAlign', 'textTransform'];
+    const fmtProps = ['fontStyle', 'textDecoration', 'textAlign', 'textTransform', 'letterSpacing'];
     for (const prop of fmtProps) {
       if (inspectorOriginals.has(prop)) continue;
       const inline = readInlineStyle(el, prop);
@@ -1580,6 +3083,7 @@
     } else if (control.type === 'range') {
       let n;
       if (prop === 'lineHeight') n = parseFloat(String(display));
+      else if (prop === 'letterSpacing') n = parseLetterSpacing(display);
       else n = parsePx(display);
       control.value = String(Number.isFinite(n) ? n : control.min);
       if (valEl) valEl.textContent = formatManipValue(prop, control.value, control.dataset.unit || '');
@@ -1589,6 +3093,14 @@
       control.value = mapFontWeight(display);
     } else if (prop === 'fontFamily') {
       control.value = firstFontFamily(display);
+    } else if (prop === 'textAlign') {
+      control.value = mapTextAlign(display);
+    } else if (prop === 'fontStyle') {
+      control.value = mapFontStyle(display);
+    } else if (prop === 'textTransform') {
+      control.value = mapTextTransform(display);
+    } else if (prop === 'textDecoration') {
+      control.value = mapTextDecoration(display);
     } else {
       control.value = display;
     }
@@ -1631,6 +3143,7 @@
       : null;
 
     if (p.kind === 'slider') {
+      wrap.classList.add('comet-insp-slider-control');
       const inp = document.createElement('input');
       inp.type = 'range';
       inp.className = 'comet-insp-slider';
@@ -1726,12 +3239,10 @@
       return wrap;
     }
 
-    // Multiline text editor (v1.5): formatting toolbar + auto-grow textarea.
-    // Enter inserts newlines (default textarea behavior); applyLiveText renders
-    // them via <br> for inline elements or textContent + white-space:pre-line.
+    // Multiline text editor: content textarea. Typography controls live in the
+    // grouped Text panel (Character/Paragraph style) below this row.
+    // Enter inserts newlines; applyLiveText renders via <br> or pre-line.
     wrap.className = 'comet-insp-control comet-insp-text-editor';
-    const toolbar = buildTextFormatToolbar(edits);
-    wrap.appendChild(toolbar);
 
     const ta = document.createElement('textarea');
     ta.className = 'comet-insp-textarea';
@@ -1782,100 +3293,87 @@
     }
   }
 
-  // Formatting toolbar above the textarea: Bold / Italic / Underline,
-  // alignment segmented control, and textTransform cycle. All buttons write
-  // element.style live and record into the edits payload.
+  // Premium Text panel helpers (Character / Paragraph), Adobe + Figma pattern:
+  // compact labeled rows, segmented controls for align/style/case/decoration.
+  // All writes go through applyLive + recordEdit.
+  function buildSegmentedControl(prop, values, labels, titles, current) {
+    const group = document.createElement('div');
+    group.className = 'comet-insp-seg';
+    group.setAttribute('role', 'group');
+    group.setAttribute('aria-label', prop);
+    group.dataset.inspSeg = prop;
+    values.forEach((v) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'comet-insp-seg-btn' + (current === v ? ' active' : '');
+      b.dataset.inspFmt = prop;
+      if (prop === 'textAlign') b.dataset.alignValue = v;
+      else if (prop === 'textTransform') b.dataset.transformValue = v;
+      else {
+        b.dataset.onValue = v;
+        b.dataset.offValue = values[0];
+      }
+      b.setAttribute('aria-pressed', current === v ? 'true' : 'false');
+      b.title = (titles && titles[v]) || String(v);
+      b.textContent = (labels && labels[v]) || String(v);
+      group.appendChild(b);
+    });
+    return group;
+  }
+
   function buildTextFormatToolbar(edits) {
     const bar = document.createElement('div');
-    bar.className = 'comet-insp-fmt';
+    bar.className = 'comet-insp-fmt comet-insp-fmt-compact';
     bar.setAttribute('role', 'toolbar');
     bar.setAttribute('aria-label', 'Text formatting');
 
-    const fwBase = mapFontWeight(edits.fontWeight != null ? edits.fontWeight : readFormatBaseline('fontWeight'));
     const fsBase = mapFontStyle(edits.fontStyle != null ? edits.fontStyle : readFormatBaseline('fontStyle'));
     const tdBase = mapTextDecoration(edits.textDecoration != null ? edits.textDecoration : readFormatBaseline('textDecoration'));
     const taBase = mapTextAlign(edits.textAlign != null ? edits.textAlign : readFormatBaseline('textAlign'));
     const ttBase = mapTextTransform(edits.textTransform != null ? edits.textTransform : readFormatBaseline('textTransform'));
 
-    function mkToggle(label, title, prop, onValue, offValue, isOn) {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'comet-insp-fmt-btn' + (isOn ? ' active' : '');
-      b.dataset.inspFmt = prop;
-      b.dataset.onValue = onValue;
-      b.dataset.offValue = offValue;
-      b.setAttribute('aria-pressed', isOn ? 'true' : 'false');
-      b.title = title;
-      b.textContent = label;
-      return b;
-    }
-
-    bar.appendChild(mkToggle('B', 'Bold (fontWeight 700/400)', 'fontWeight', '700', '400',
-      fmtActive(edits, 'fontWeight', '700', '400', fwBase === '700' ? '700' : '400')));
-    bar.appendChild(mkToggle('I', 'Italic (fontStyle italic/normal)', 'fontStyle', 'italic', 'normal',
-      fmtActive(edits, 'fontStyle', 'italic', 'normal', fsBase)));
-    bar.appendChild(mkToggle('U', 'Underline (textDecoration underline/none)', 'textDecoration', 'underline', 'none',
-      fmtActive(edits, 'textDecoration', 'underline', 'none', tdBase)));
-
-    const align = document.createElement('div');
-    align.className = 'comet-insp-fmt-align';
-    align.setAttribute('role', 'group');
-    align.setAttribute('aria-label', 'Text alignment');
-    const alignLabels = { left: 'L', center: 'C', right: 'R', justify: 'J' };
-    const alignTitles = {
-      left: 'Align left',
-      center: 'Align center',
-      right: 'Align right',
-      justify: 'Justify',
-    };
-    TEXT_ALIGN_VALUES.forEach((v) => {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'comet-insp-fmt-btn comet-insp-fmt-align-btn' + (taBase === v ? ' active' : '');
-      b.dataset.inspFmt = 'textAlign';
-      b.dataset.alignValue = v;
-      b.setAttribute('aria-pressed', taBase === v ? 'true' : 'false');
-      b.title = alignTitles[v];
-      b.textContent = alignLabels[v];
-      align.appendChild(b);
-    });
-    bar.appendChild(align);
-
-    const cycle = document.createElement('button');
-    cycle.type = 'button';
-    cycle.className = 'comet-insp-fmt-btn comet-insp-fmt-transform';
-    cycle.dataset.inspFmt = 'textTransform';
-    cycle.dataset.transformValue = ttBase;
-    cycle.title = 'Cycle textTransform (uppercase / lowercase / capitalize / none)';
-    cycle.textContent = ttBase === 'uppercase' ? 'AA'
-      : ttBase === 'lowercase' ? 'aa'
-        : ttBase === 'capitalize' ? 'Aa'
-          : 'off';
-    bar.appendChild(cycle);
+    bar.appendChild(buildSegmentedControl(
+      'fontStyle', FONT_STYLE_VALUES,
+      { normal: 'Aa', italic: 'I' },
+      { normal: 'Normal', italic: 'Italic' },
+      fsBase
+    ));
+    bar.appendChild(buildSegmentedControl(
+      'textDecoration', TEXT_DECORATION_VALUES,
+      { none: '-', underline: 'U', 'line-through': 'S' },
+      { none: 'None', underline: 'Underline', 'line-through': 'Strikethrough' },
+      tdBase
+    ));
+    bar.appendChild(buildSegmentedControl(
+      'textAlign', TEXT_ALIGN_VALUES,
+      { left: 'L', center: 'C', right: 'R', justify: 'J' },
+      { left: 'Align left', center: 'Align center', right: 'Align right', justify: 'Justify' },
+      taBase
+    ));
+    bar.appendChild(buildSegmentedControl(
+      'textTransform', TEXT_TRANSFORM_VALUES,
+      { none: 'off', uppercase: 'AA', lowercase: 'aa', capitalize: 'Aa' },
+      { none: 'None', uppercase: 'UPPERCASE', lowercase: 'lowercase', capitalize: 'Capitalize' },
+      ttBase
+    ));
     return bar;
   }
 
   function syncFormatToolbar(bar) {
     if (!bar) return;
     const edits = currentEdits();
-    const fw = mapFontWeight(edits.fontWeight != null ? edits.fontWeight : readFormatBaseline('fontWeight'));
     const fs = mapFontStyle(edits.fontStyle != null ? edits.fontStyle : readFormatBaseline('fontStyle'));
     const td = mapTextDecoration(edits.textDecoration != null ? edits.textDecoration : readFormatBaseline('textDecoration'));
     const ta = mapTextAlign(edits.textAlign != null ? edits.textAlign : readFormatBaseline('textAlign'));
     const tt = mapTextTransform(edits.textTransform != null ? edits.textTransform : readFormatBaseline('textTransform'));
 
-    bar.querySelectorAll('[data-insp-fmt="fontWeight"]').forEach((b) => {
-      const on = fw === '700' || parseInt(fw, 10) >= 600;
-      b.classList.toggle('active', on);
-      b.setAttribute('aria-pressed', on ? 'true' : 'false');
-    });
     bar.querySelectorAll('[data-insp-fmt="fontStyle"]').forEach((b) => {
-      const on = fs === 'italic';
+      const on = (b.dataset.onValue || '') === fs || (fs === 'italic' && b.dataset.onValue === 'italic');
       b.classList.toggle('active', on);
       b.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
     bar.querySelectorAll('[data-insp-fmt="textDecoration"]').forEach((b) => {
-      const on = td === 'underline';
+      const on = (b.dataset.onValue || '') === td;
       b.classList.toggle('active', on);
       b.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
@@ -1885,11 +3383,16 @@
       b.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
     bar.querySelectorAll('[data-insp-fmt="textTransform"]').forEach((b) => {
-      b.dataset.transformValue = tt;
-      b.textContent = tt === 'uppercase' ? 'AA'
-        : tt === 'lowercase' ? 'aa'
-          : tt === 'capitalize' ? 'Aa'
-            : 'off';
+      const on = (b.dataset.transformValue || b.dataset.onValue) === tt;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  }
+
+  function syncTextPanelSegments(root) {
+    if (!root) return;
+    root.querySelectorAll('.comet-insp-fmt, .comet-insp-seg').forEach((node) => {
+      syncFormatToolbar(node.closest('.comet-insp-fmt') || node);
     });
   }
 
@@ -1901,30 +3404,40 @@
     e.stopPropagation();
     const prop = btn.dataset.inspFmt;
     let value = '';
-    if (prop === 'fontWeight' || prop === 'fontStyle' || prop === 'textDecoration') {
-      const onValue = btn.dataset.onValue;
-      const offValue = btn.dataset.offValue;
-      const isOn = btn.classList.contains('active') || btn.getAttribute('aria-pressed') === 'true';
-      value = isOn ? offValue : onValue;
-    } else if (prop === 'textAlign') {
+    if (prop === 'textAlign') {
       value = btn.dataset.alignValue || 'left';
     } else if (prop === 'textTransform') {
-      const cur = btn.dataset.transformValue || readFormatBaseline('textTransform') || 'none';
-      value = nextTextTransform(cur);
+      // Segmented case control: pick the pressed value directly.
+      value = btn.dataset.transformValue || btn.dataset.onValue || 'none';
+    } else if (prop === 'fontStyle' || prop === 'textDecoration' || prop === 'fontWeight') {
+      // Segmented / toggle: pressing an active exclusive option keeps it; otherwise set onValue.
+      const onValue = btn.dataset.onValue;
+      const offValue = btn.dataset.offValue;
+      if (btn.closest('.comet-insp-seg')) {
+        value = onValue;
+      } else {
+        const isOn = btn.classList.contains('active') || btn.getAttribute('aria-pressed') === 'true';
+        value = isOn ? offValue : onValue;
+      }
     } else {
       return;
     }
     // Live style writes + edits payload (existing schema keys).
     applyLive(prop, value);
     recordEdit(prop, value);
-    // Keep the existing fontWeight select (if present) in sync when Bold toggles.
-    if (prop === 'fontWeight') {
-      const fwRow = inspRows && inspRows.querySelector('.comet-insp-row[data-prop="fontWeight"]');
-      const sel = fwRow && fwRow.querySelector('[data-insp-control]');
-      if (sel) sel.value = mapFontWeight(value);
+    // Keep matching select rows in sync when segmented controls change.
+    const row = inspRows && inspRows.querySelector('.comet-insp-row[data-prop="' + prop + '"]');
+    const sel = row && row.querySelector('[data-insp-control]');
+    if (sel && sel.tagName === 'SELECT') {
+      if (prop === 'fontWeight') sel.value = mapFontWeight(value);
+      else if (prop === 'fontStyle') sel.value = mapFontStyle(value);
+      else if (prop === 'textDecoration') sel.value = mapTextDecoration(value);
+      else if (prop === 'textAlign') sel.value = mapTextAlign(value);
+      else if (prop === 'textTransform') sel.value = mapTextTransform(value);
     }
-    const bar = btn.closest('.comet-insp-fmt');
-    syncFormatToolbar(bar);
+    const bar = btn.closest('.comet-insp-fmt') || btn.closest('.comet-insp-text-panel');
+    if (bar) syncTextPanelSegments(bar);
+    else syncFormatToolbar(btn.closest('.comet-insp-fmt'));
     if (hintProp === prop) scheduleRedraw();
   }
 
@@ -1975,54 +3488,239 @@
       body.dataset.cat = cat;
       body.hidden = collapsed;
 
-      items.forEach((p) => {
-        const row = document.createElement('div');
-        row.className = 'comet-insp-row' + (p.prop === 'text' ? ' comet-insp-row-text' : '');
-        row.dataset.prop = p.prop;
-        row.tabIndex = -1;
-        row.style.setProperty('--row-delay', Math.min(rowIndex * 30, 200) + 'ms');
-        rowIndex++;
+      if (cat === 'Text') {
+        // Premium Character + Paragraph grouping (Adobe/Figma pattern).
+        const panel = document.createElement('div');
+        panel.className = 'comet-insp-text-panel';
 
-        const propLab = document.createElement('span');
-        propLab.className = 'comet-insp-label';
-        propLab.textContent = p.prop;
-        propLab.title = p.prop;
+        const byProp = {};
+        items.forEach((p) => { byProp[p.prop] = p; });
 
-        const control = buildControl(p, edits);
+        const appendPropRow = (p, groupEl, labelOverride) => {
+          if (!p) return;
+          const row = document.createElement('div');
+          const rowClasses = ['comet-insp-row', 'comet-insp-text-field'];
+          if (p.prop === 'text') rowClasses.push('comet-insp-row-text');
+          if (p.kind === 'slider') rowClasses.push('comet-insp-row-slider');
+          else if (p.kind === 'select' || p.kind === 'fontFamily') rowClasses.push('comet-insp-row-select');
+          else if (p.kind === 'color') rowClasses.push('comet-insp-row-color');
+          row.className = rowClasses.join(' ');
+          row.dataset.prop = p.prop;
+          row.tabIndex = -1;
+          row.style.setProperty('--row-delay', Math.min(rowIndex * 30, 200) + 'ms');
+          rowIndex++;
 
-        // Re-apply stored edits live when reopening the inspector.
-        if (edits[p.prop] !== undefined && edits[p.prop] !== null && String(edits[p.prop]).trim() !== '') {
-          applyLive(p.prop, String(edits[p.prop]));
+          const propLab = document.createElement('span');
+          propLab.className = 'comet-insp-label';
+          const pretty = labelOverride || TEXT_PROP_LABELS[p.prop] || p.prop;
+          propLab.textContent = pretty;
+          propLab.title = p.prop;
+
+          const control = buildControl(p, edits);
+          if (edits[p.prop] !== undefined && edits[p.prop] !== null && String(edits[p.prop]).trim() !== '') {
+            applyLive(p.prop, String(edits[p.prop]));
+          }
+
+          const rst = document.createElement('button');
+          rst.type = 'button';
+          rst.className = 'comet-insp-reset';
+          rst.textContent = 'Reset';
+          rst.title = 'Reset ' + p.prop + ' to original';
+          rst.dataset.inspReset = '1';
+
+          row.appendChild(propLab);
+          row.appendChild(control);
+          row.appendChild(rst);
+          groupEl.appendChild(row);
+        };
+
+        // Content
+        if (byProp.text) {
+          const g = document.createElement('div');
+          g.className = 'comet-insp-text-group';
+          const gh = document.createElement('div');
+          gh.className = 'comet-insp-text-group-label';
+          gh.textContent = 'Content';
+          g.appendChild(gh);
+          appendPropRow(byProp.text, g, 'Text');
+          panel.appendChild(g);
         }
 
-        const rst = document.createElement('button');
-        rst.type = 'button';
-        rst.className = 'comet-insp-reset';
-        rst.textContent = 'Reset';
-        rst.title = 'Reset ' + p.prop + ' to original';
-        rst.dataset.inspReset = '1';
+        // Character: font / weight / size / leading / tracking / color
+        const char = document.createElement('div');
+        char.className = 'comet-insp-text-group';
+        const charLab = document.createElement('div');
+        charLab.className = 'comet-insp-text-group-label';
+        charLab.textContent = 'Character';
+        char.appendChild(charLab);
 
-        row.appendChild(propLab);
-        row.appendChild(control);
-        row.appendChild(rst);
-        body.appendChild(row);
-      });
+        const twin = document.createElement('div');
+        twin.className = 'comet-insp-text-twin';
+        ['fontFamily', 'fontWeight'].forEach((prop) => {
+          if (!byProp[prop]) return;
+          const cell = document.createElement('div');
+          cell.className = 'comet-insp-text-cell';
+          appendPropRow(byProp[prop], cell);
+          twin.appendChild(cell);
+        });
+        if (twin.childNodes.length) char.appendChild(twin);
+
+        const metrics = document.createElement('div');
+        metrics.className = 'comet-insp-text-metrics';
+        ['fontSize', 'lineHeight', 'letterSpacing'].forEach((prop) => {
+          if (!byProp[prop]) return;
+          const cell = document.createElement('div');
+          cell.className = 'comet-insp-text-cell';
+          appendPropRow(byProp[prop], cell);
+          metrics.appendChild(cell);
+        });
+        if (metrics.childNodes.length) char.appendChild(metrics);
+
+        if (byProp.color) appendPropRow(byProp.color, char);
+        panel.appendChild(char);
+
+        // Paragraph: align + style + case + decoration (segmented)
+        const para = document.createElement('div');
+        para.className = 'comet-insp-text-group';
+        const paraLab = document.createElement('div');
+        paraLab.className = 'comet-insp-text-group-label';
+        paraLab.textContent = 'Paragraph';
+        para.appendChild(paraLab);
+
+        // Hidden rows keep Reset/sync/edited-state wiring for segmented props.
+        ['textAlign', 'fontStyle', 'textTransform', 'textDecoration'].forEach((prop) => {
+          if (!byProp[prop]) return;
+          const row = document.createElement('div');
+          row.className = 'comet-insp-row comet-insp-row-seg';
+          row.dataset.prop = prop;
+          row.tabIndex = -1;
+          row.style.setProperty('--row-delay', Math.min(rowIndex * 30, 200) + 'ms');
+          rowIndex++;
+
+          const propLab = document.createElement('span');
+          propLab.className = 'comet-insp-label';
+          propLab.textContent = TEXT_PROP_LABELS[prop] || prop;
+          propLab.title = prop;
+
+          const wrap = document.createElement('div');
+          wrap.className = 'comet-insp-control';
+          // Keep a select as the canonical [data-insp-control] for Reset sync,
+          // visually replaced by the segmented control beside it.
+          const selWrap = buildControl(byProp[prop], edits);
+          selWrap.classList.add('comet-insp-seg-source');
+          wrap.appendChild(selWrap);
+
+          const edited = edits[prop] != null ? String(edits[prop]) : null;
+          let current = edited != null ? edited : byProp[prop].value;
+          if (prop === 'textAlign') current = mapTextAlign(current);
+          else if (prop === 'fontStyle') current = mapFontStyle(current);
+          else if (prop === 'textTransform') current = mapTextTransform(current);
+          else if (prop === 'textDecoration') current = mapTextDecoration(current);
+
+          let labels = null;
+          let titles = null;
+          let values = null;
+          if (prop === 'textAlign') {
+            values = TEXT_ALIGN_VALUES;
+            labels = { left: 'L', center: 'C', right: 'R', justify: 'J' };
+            titles = { left: 'Align left', center: 'Align center', right: 'Align right', justify: 'Justify' };
+          } else if (prop === 'fontStyle') {
+            values = FONT_STYLE_VALUES;
+            labels = { normal: 'Aa', italic: 'I' };
+            titles = { normal: 'Normal', italic: 'Italic' };
+          } else if (prop === 'textTransform') {
+            values = TEXT_TRANSFORM_VALUES;
+            labels = { none: 'off', uppercase: 'AA', lowercase: 'aa', capitalize: 'Aa' };
+            titles = { none: 'None', uppercase: 'UPPERCASE', lowercase: 'lowercase', capitalize: 'Capitalize' };
+          } else if (prop === 'textDecoration') {
+            values = TEXT_DECORATION_VALUES;
+            labels = { none: '-', underline: 'U', 'line-through': 'S' };
+            titles = { none: 'None', underline: 'Underline', 'line-through': 'Strikethrough' };
+          }
+          wrap.appendChild(buildSegmentedControl(prop, values, labels, titles, current));
+
+          if (edits[prop] !== undefined && edits[prop] !== null && String(edits[prop]).trim() !== '') {
+            applyLive(prop, String(edits[prop]));
+          }
+
+          const rst = document.createElement('button');
+          rst.type = 'button';
+          rst.className = 'comet-insp-reset';
+          rst.textContent = 'Reset';
+          rst.title = 'Reset ' + prop + ' to original';
+          rst.dataset.inspReset = '1';
+
+          row.appendChild(propLab);
+          row.appendChild(wrap);
+          row.appendChild(rst);
+          para.appendChild(row);
+        });
+        panel.appendChild(para);
+
+        // Any remaining Text-category props not covered above.
+        const covered = new Set([
+          'text', 'fontFamily', 'fontWeight', 'fontSize', 'lineHeight', 'letterSpacing',
+          'color', 'textAlign', 'fontStyle', 'textTransform', 'textDecoration',
+        ]);
+        items.forEach((p) => {
+          if (covered.has(p.prop)) return;
+          appendPropRow(p, panel);
+        });
+
+        body.appendChild(panel);
+      } else {
+        items.forEach((p) => {
+          const row = document.createElement('div');
+          row.className = 'comet-insp-row' + (p.prop === 'text' ? ' comet-insp-row-text' : '');
+          row.dataset.prop = p.prop;
+          row.tabIndex = -1;
+          row.style.setProperty('--row-delay', Math.min(rowIndex * 30, 200) + 'ms');
+          rowIndex++;
+
+          const propLab = document.createElement('span');
+          propLab.className = 'comet-insp-label';
+          propLab.textContent = p.prop;
+          propLab.title = p.prop;
+
+          const control = buildControl(p, edits);
+
+          // Re-apply stored edits live when reopening the inspector.
+          if (edits[p.prop] !== undefined && edits[p.prop] !== null && String(edits[p.prop]).trim() !== '') {
+            applyLive(p.prop, String(edits[p.prop]));
+          }
+
+          const rst = document.createElement('button');
+          rst.type = 'button';
+          rst.className = 'comet-insp-reset';
+          rst.textContent = 'Reset';
+          rst.title = 'Reset ' + p.prop + ' to original';
+          rst.dataset.inspReset = '1';
+
+          row.appendChild(propLab);
+          row.appendChild(control);
+          row.appendChild(rst);
+          body.appendChild(row);
+        });
+      }
 
       inspRows.appendChild(header);
       inspRows.appendChild(body);
     });
+    // Devtool readouts: Selectors (copy/reveal), Computed, Size & Position.
+    // Appended after editable property categories; Text category untouched.
+    appendDevtoolCategories(el);
     // Re-apply formatting toolbar edits (fontStyle/textDecoration/textAlign/
     // textTransform) that are not independent inspector rows.
-    ['fontStyle', 'textDecoration', 'textAlign', 'textTransform', 'fontWeight'].forEach((prop) => {
+    ['fontStyle', 'textDecoration', 'textAlign', 'textTransform', 'fontWeight', 'letterSpacing'].forEach((prop) => {
       if (edits[prop] !== undefined && edits[prop] !== null && String(edits[prop]).trim() !== '') {
         applyLive(prop, String(edits[prop]));
       }
     });
-    const textRow = inspRows.querySelector('.comet-insp-row[data-prop="text"]');
-    const bar = textRow && textRow.querySelector('.comet-insp-fmt');
-    if (bar) syncFormatToolbar(bar);
+    const textPanel = inspRows.querySelector('.comet-insp-text-panel');
+    if (textPanel) syncTextPanelSegments(textPanel);
     updateInspectorState();
     updateSelectionUI();
+    updateInspectorMetrics();
   }
 
   // Accent-marks edited rows and refreshes the "N edits" footer count.
@@ -2049,42 +3747,276 @@
       const v = edits[prop];
       if (v !== undefined && v !== null && String(v).trim() !== '') n++;
     });
-    // Mark the text row edited when any format toolbar prop is live-edited.
-    const textRow = inspRows.querySelector('.comet-insp-row[data-prop="text"]');
-    if (textRow) {
-      const fmtEdited = ['fontStyle', 'textDecoration', 'textAlign', 'textTransform']
-        .some((p) => edits[p] != null && String(edits[p]).trim() !== '');
-      if (fmtEdited) textRow.classList.add('edited');
-    }
+    // Segmented Paragraph props own their rows; no need to bleed onto Content.
     inspCountEl.textContent = n === 1 ? '1 edit' : n + ' edits';
   }
 
+  // Delayed-hide timer for the inspector exit animation (comet-insp-close).
+  let inspCloseTimer = 0;
+
   function openInspector(el, descriptor) {
     clearPropertyHint();
+    if (inspCloseTimer) {
+      clearTimeout(inspCloseTimer);
+      inspCloseTimer = 0;
+    }
     inspector.el = el;
     inspector.descriptor = descriptor;
     const selectedIndex = state.elements.findIndex((en) => en.descriptor === descriptor);
     if (selectedIndex !== -1) state.activeIndex = selectedIndex;
     captureOriginals(el);
     renderInspector();
+    // Anchor side for the fold: dock edge when docked, else the viewport side
+    // the selected element sits in. Enter/exit animate toward that side.
+    const dir = inspDirection();
+    setInspDirection(dir);
+    updateDockUI();
     inspPanel.hidden = false;
-    inspPanel.classList.remove('is-open');
-    if (!isReducedMotion()) {
+    diagLog('inspector', 'open');
+    if (state.dock) applyDock();
+    else positionInspector();
+    inspPanel.classList.remove('is-open', 'comet-insp-close', 'comet-insp-open');
+    gsapKill(inspPanel);
+    inspPanel.classList.add('is-open');
+    // Keep comet-insp-open class for CSS fallback; GSAP drives the fold.
+    if (!isReducedMotion() && gsapReady) {
+      inspPanel.classList.add('comet-insp-open');
+      gsapInspectorOpen(inspPanel, dir);
+      setTimeout(() => {
+        if (inspPanel) inspPanel.classList.remove('comet-insp-open');
+      }, 380);
+    } else if (!isReducedMotion()) {
       void inspPanel.offsetWidth;
-      inspPanel.classList.add('is-open');
+      playMotion(inspPanel, 'comet-insp-open', 280);
+    } else {
+      gsapSet(inspPanel, { opacity: 1, x: 0, y: 0, scaleX: 1, scaleY: 1 });
     }
-    positionInspector();
+    syncInspectorRingAnimation();
     updateSelectionUI();
   }
 
   function closeInspector() {
     clearPropertyHint();
+    stopInspectorRingTween();
+    if (revealPulseTimer) {
+      clearTimeout(revealPulseTimer);
+      revealPulseTimer = 0;
+    }
     inspector.el = null;
     inspector.descriptor = null;
     inspectorOriginals = new Map();
-    if (inspPanel) {
-      inspPanel.classList.remove('is-open');
+    diagLog('inspector', 'close');
+    if (!inspPanel) return;
+    if (inspCloseTimer) {
+      clearTimeout(inspCloseTimer);
+      inspCloseTimer = 0;
+    }
+    let closed = false;
+    const finishClose = () => {
+      if (closed) return;
+      closed = true;
+      if (inspCloseTimer) { clearTimeout(inspCloseTimer); inspCloseTimer = 0; }
+      if (inspPanel) {
+        inspPanel.classList.remove('comet-insp-close', 'comet-insp-open', 'is-open');
+        inspPanel.hidden = true;
+        gsapSet(inspPanel, { clearProps: 'opacity,transform,x,y,scale,scaleX,scaleY,filter' });
+      }
+    };
+    if (isReducedMotion() || inspPanel.hidden) {
+      gsapKill(inspPanel);
+      inspPanel.classList.remove('is-open', 'comet-insp-open', 'comet-insp-close');
       inspPanel.hidden = true;
+      return;
+    }
+    inspPanel.classList.remove('is-open', 'comet-insp-open');
+    // Close collapses back toward the anchor side (comet-insp-from-*).
+    if (!inspPanel.dataset.inspDir) setInspDirection(inspDirection());
+    const dir = inspPanel.dataset.inspDir || 'bottom';
+    inspPanel.classList.add('comet-insp-close');
+    gsapInspectorClose(inspPanel, dir, finishClose);
+    // Safety hide if GSAP unavailable / interrupted (~70% of 340ms open).
+    inspCloseTimer = setTimeout(finishClose, 280);
+  }
+
+  /* ---------------- inspector drag (floating mode only) + dock control ---- */
+  function startInspDrag(e) {
+    if (!inspPanel || state.dock) return; // docked panels snap to the edge and stay
+    if (e.button !== 0 && e.pointerType === 'mouse') return; // left button only
+    e.preventDefault();
+    const target = e.currentTarget;
+    try { target.setPointerCapture(e.pointerId); } catch (_) { /* ok */ }
+    inspDrag = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      baseX: parseInt(inspPanel.style.left, 10) || 0,
+      baseY: parseInt(inspPanel.style.top, 10) || 0,
+      moved: false,
+    };
+    inspPanel.classList.add('dragging');
+  }
+
+  function onInspDragMove(e) {
+    if (!inspDrag || e.pointerId !== inspDrag.pointerId) return;
+    const dx = e.clientX - inspDrag.startX;
+    const dy = e.clientY - inspDrag.startY;
+    if (Math.abs(dx) + Math.abs(dy) > 4) inspDrag.moved = true;
+    const iw = inspPanel.offsetWidth || 320;
+    const ih = inspPanel.offsetHeight || 0;
+    const p = clampPos(inspDrag.baseX + dx, inspDrag.baseY + dy, iw, ih);
+    inspPanel.style.left = p.x + 'px';
+    inspPanel.style.top = p.y + 'px';
+    inspPanel.style.right = 'auto';
+    inspPanel.style.bottom = 'auto';
+  }
+
+  function endInspDrag(e) {
+    if (!inspDrag || (e.pointerId !== undefined && e.pointerId !== inspDrag.pointerId)) return;
+    try {
+      if (inspDragHandle && inspDragHandle.hasPointerCapture(inspDrag.pointerId)) {
+        inspDragHandle.releasePointerCapture(inspDrag.pointerId);
+      }
+    } catch (_) { /* ok */ }
+    if (inspPanel) inspPanel.classList.remove('dragging');
+    inspDrag = null;
+  }
+
+  /* ---------------- inspector corner resize (size pulling) ---------------- */
+  // Dragging the bottom-right handle resizes the panel like a regular
+  // window. Inline width/height win over the CSS defaults; the flex column
+  // layout fills the box (rows flex:1, overflow-y auto). Clamped so the
+  // layout cannot break; size persists per tab via state.inspSize.
+  const INSP_MIN_W = 280;
+  const INSP_MIN_H = 240;
+
+  function inspMaxW() {
+    return Math.min(720, window.innerWidth - 48);
+  }
+
+  function inspMaxH() {
+    return Math.min(Math.floor(window.innerHeight * 0.9), 720);
+  }
+
+  function clampInspSize(w, h) {
+    const mw = inspMaxW();
+    const mh = inspMaxH();
+    return {
+      w: Math.max(INSP_MIN_W, Math.min(mw, Math.round(w))),
+      h: Math.max(INSP_MIN_H, Math.min(mh, Math.round(h))),
+    };
+  }
+
+  function applyInspSize(w, h) {
+    if (!inspPanel) return;
+    if (!Number.isFinite(w) || !Number.isFinite(h)) return;
+    const s = clampInspSize(w, h);
+    inspPanel.style.width = s.w + 'px';
+    inspPanel.style.height = s.h + 'px';
+    state.inspSize = { w: s.w, h: s.h };
+    saveTabState({ inspSize: state.inspSize });
+  }
+
+  function startInspResize(e) {
+    if (!inspPanel || !inspResizeHandle) return;
+    if (e.button !== 0 && e.pointerType === 'mouse') return; // left button only
+    e.preventDefault();
+    e.stopPropagation();
+    const target = e.currentTarget;
+    try { target.setPointerCapture(e.pointerId); } catch (_) { /* ok */ }
+    inspResize = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      baseW: inspPanel.offsetWidth || 320,
+      baseH: inspPanel.offsetHeight || 0,
+    };
+    inspPanel.classList.add('resizing');
+  }
+
+  function onInspResizeMove(e) {
+    if (!inspResize || e.pointerId !== inspResize.pointerId) return;
+    applyInspSize(
+      inspResize.baseW + (e.clientX - inspResize.startX),
+      inspResize.baseH + (e.clientY - inspResize.startY)
+    );
+  }
+
+  function endInspResize(e) {
+    if (!inspResize || (e.pointerId !== undefined && e.pointerId !== inspResize.pointerId)) return;
+    try {
+      if (inspResizeHandle && inspResizeHandle.hasPointerCapture(inspResize.pointerId)) {
+        inspResizeHandle.releasePointerCapture(inspResize.pointerId);
+      }
+    } catch (_) { /* ok */ }
+    if (inspPanel) inspPanel.classList.remove('resizing');
+    inspResize = null;
+  }
+
+  /* ---------------- inspector footer Add button + cursor glow ---------------- */
+  // The footer Add button commits the pending element (same as addChat).
+  // It is dimmed/ignored while nothing is pending.
+  function syncInspAdd() {
+    if (!inspAddEl) return;
+    const on = !!pending;
+    inspAddEl.disabled = !on;
+    inspAddEl.classList.toggle('is-disabled', !on);
+  }
+
+  // Subtle radial glow that follows the cursor inside the panel bounds.
+  // --cx/--cy are set on pointermove (panel-relative px); the layer is
+  // hidden on pointerleave and restored on pointerenter. It only follows
+  // the cursor (no animation), so it stays under reduced motion.
+  function onInspPointerMove(e) {
+    if (!inspGlowEl || !inspPanel) return;
+    const r = inspPanel.getBoundingClientRect();
+    inspGlowEl.style.setProperty('--cx', (e.clientX - r.left) + 'px');
+    inspGlowEl.style.setProperty('--cy', (e.clientY - r.top) + 'px');
+  }
+
+  function onInspPointerEnter() {
+    if (inspGlowEl) inspGlowEl.style.opacity = '1';
+  }
+
+  function onInspPointerLeave() {
+    if (inspGlowEl) inspGlowEl.style.opacity = '0';
+  }
+
+  // Reflect state.dock on the 4 dock buttons (aria-pressed + .active).
+  function updateDockUI() {
+    if (!inspDockEl) return;
+    const btns = inspDockEl.querySelectorAll('[data-dock]');
+    for (let i = 0; i < btns.length; i++) {
+      const on = btns[i].dataset.dock === state.dock;
+      btns[i].classList.toggle('active', on);
+      btns[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+  }
+
+  function onDockClick(e) {
+    const b = e.target && e.target.closest ? e.target.closest('[data-dock]') : null;
+    if (!b || !inspPanel) return;
+    const side = b.dataset.dock;
+    // Clicking the active dock again undocks back to the floating popup.
+    state.dock = state.dock === side ? null : side;
+    diagLog('dock', 'inspector=' + (state.dock || 'float'));
+    updateDockUI();
+    setInspDirection(inspDirection());
+    if (state.dock) applyDock();
+    else if (!inspPanel.hidden) positionInspector();
+    saveTabState({ panelDock: state.dock });
+    if (!isReducedMotion() && !inspPanel.hidden) {
+      // Fold the panel into place at its new anchor (GSAP when ready).
+      const dir = inspPanel.dataset.inspDir || inspDirection();
+      if (gsapReady) {
+        inspPanel.classList.remove('comet-insp-open');
+        inspPanel.classList.add('comet-insp-open');
+        gsapInspectorOpen(inspPanel, dir);
+        setTimeout(() => {
+          if (inspPanel) inspPanel.classList.remove('comet-insp-open');
+        }, 380);
+      } else {
+        playMotion(inspPanel, 'comet-insp-open', 220);
+      }
     }
   }
 
@@ -2117,11 +4049,11 @@
     if (prop === 'text' && control.tagName === 'TEXTAREA') autoGrowTextarea(control);
     applyLive(prop, v);
     recordEdit(prop, v);
-    // Keep Bold toolbar in sync when the fontWeight select changes.
-    if (prop === 'fontWeight') {
-      const textRow = inspRows && inspRows.querySelector('.comet-insp-row[data-prop="text"]');
-      const bar = textRow && textRow.querySelector('.comet-insp-fmt');
-      if (bar) syncFormatToolbar(bar);
+    // Keep segmented Paragraph controls in sync when matching selects change.
+    if (prop === 'fontWeight' || prop === 'fontStyle' || prop === 'textDecoration' ||
+        prop === 'textAlign' || prop === 'textTransform') {
+      const panel = inspRows && inspRows.querySelector('.comet-insp-text-panel');
+      if (panel) syncTextPanelSegments(panel);
     }
     if (hintProp === prop) scheduleRedraw();
   }
@@ -2136,6 +4068,8 @@
     const prop = row.dataset.prop;
     restoreProp(prop);
     syncRowControl(row, prop);
+    const panel = row.closest('.comet-insp-text-panel');
+    if (panel) syncTextPanelSegments(panel);
     playMotion(row, 'reset-flash', 200);
     updateInspectorState();
     if (hintProp === prop) scheduleRedraw();
@@ -2149,9 +4083,8 @@
       syncRowControl(row, row.dataset.prop);
       playMotion(row, 'reset-flash', 200);
     });
-    const textRow = inspRows.querySelector('.comet-insp-row[data-prop="text"]');
-    const bar = textRow && textRow.querySelector('.comet-insp-fmt');
-    if (bar) syncFormatToolbar(bar);
+    const textPanel = inspRows.querySelector('.comet-insp-text-panel');
+    if (textPanel) syncTextPanelSegments(textPanel);
     updateInspectorState();
     if (hintProp) scheduleRedraw();
   }
@@ -2376,6 +4309,7 @@
     inspector.descriptor.instruction = value;
     e.target.value = value;
     if (chatInput) chatInput.value = value;
+    updateSelectionUI();
   }
 
   /* ---------------- toolbar ---------------- */
@@ -2384,14 +4318,40 @@
     canvas.classList.toggle('active', state.annotateOn || state.elementMode);
     toolbar.querySelector('[data-act="annotate"]').classList.toggle('active', state.annotateOn);
     toolbar.querySelector('[data-act="element"]').classList.toggle('active', state.elementMode);
-    if (modePill) modePill.style.transform = state.elementMode ? 'translateX(100%)' : 'translateX(0)';
+    if (modePill) {
+      const verticalDock = state.toolbarDock === 'left' || state.toolbarDock === 'right';
+      const pct = state.elementMode ? 100 : 0;
+      gsapKill(modePill);
+      if (isReducedMotion() || !gsapReady) {
+        modePill.style.transform = verticalDock
+          ? ('translateY(' + pct + '%)')
+          : ('translateX(' + pct + '%)');
+      } else {
+        // Same 155ms timing as the CSS transition; Apple HIG ease.
+        // Side-docked toolbars stack the mode toggle vertically.
+        gsapSet(modePill, verticalDock
+          ? { xPercent: 0, yPercent: pct, x: 0, y: 0 }
+          : { yPercent: 0, xPercent: pct, x: 0, y: 0 });
+        gsapLib.to(modePill, Object.assign({
+          duration: 0.155,
+          ease: EASE.apple,
+          overwrite: true,
+        }, verticalDock
+          ? { yPercent: pct, xPercent: 0 }
+          : { xPercent: pct, yPercent: 0 }));
+      }
+    }
     updateSelectionPulse();
   }
 
-  function setAnnotate(on) {
+  function setAnnotate(on, opts) {
+    const o = opts || {};
     if (on) setElementMode(false);
     state.annotateOn = on;
+    if (on && o.showCard !== false) showAnnotNoteCard();
+    else hideAnnotNoteCard();
     applyMode();
+    diagLog('mode', 'annotate=' + (on ? 1 : 0) + ' element=' + (state.elementMode ? 1 : 0));
   }
 
   function setElementMode(on) {
@@ -2412,10 +4372,12 @@
     state.elementMode = on;
     if (on) {
       state.annotateOn = false;
+      hideAnnotNoteCard(); // note card is annotate-only; committed note kept
       startHoverLoop();
     }
     applyMode();
     updateSelectionPulse();
+    diagLog('mode', 'annotate=' + (state.annotateOn ? 1 : 0) + ' element=' + (on ? 1 : 0));
   }
 
   function toggleAnnotate() {
@@ -2512,8 +4474,112 @@
     return d;
   }
 
+  /* ---- send energy pulse (comet-send-pulse) ---- */
+  let sendPulseEl = null;
+
+  // Radiate a subtle energy ring from the center of the Send button while
+  // the annotation round-trip is in flight. The ring is anchored to the
+  // shadow root with position:fixed (viewport coords from getBoundingClientRect)
+  // so it can escape the button's overflow:hidden. Reduced motion skips it.
+  function startSendPulse(button) {
+    if (!button || !shadow || isReducedMotion()) return;
+    if (sendPulseEl && sendPulseEl.parentNode) {
+      gsapKill(sendPulseEl);
+      sendPulseEl.remove();
+    }
+    const r = button.getBoundingClientRect();
+    const el = document.createElement('span');
+    el.className = 'comet-send-pulse';
+    el.setAttribute('aria-hidden', 'true');
+    el.style.left = Math.round(r.left + r.width / 2) + 'px';
+    el.style.top = Math.round(r.top + r.height / 2) + 'px';
+    shadow.appendChild(el);
+    sendPulseEl = el;
+    // Keep ring visual + class for CSS fallback; GSAP drives scale/opacity (~650ms).
+    el.classList.add('comet-send-pulse-run');
+    if (gsapReady) {
+      gsapLib.fromTo(el,
+        { opacity: 0.9, scale: 0.15 },
+        {
+          opacity: 0,
+          scale: 15,
+          duration: 0.65,
+          ease: EASE.md3Emphasized,
+          overwrite: true,
+        });
+    } else {
+      playMotion(el, 'comet-send-pulse-run', 650);
+    }
+  }
+
+  // Success lets the ring finish radiating; failure fades it out quickly so
+  // it never reads as success.
+  function endSendPulse(ok) {
+    const el = sendPulseEl;
+    sendPulseEl = null;
+    if (!el || !el.parentNode) return;
+    if (ok) {
+      setTimeout(() => {
+        gsapKill(el);
+        if (el.parentNode) el.remove();
+      }, 720);
+    } else {
+      el.classList.remove('comet-send-pulse-run');
+      el.classList.add('comet-send-pulse-fail');
+      if (gsapReady) {
+        gsapKill(el);
+        gsapLib.to(el, {
+          opacity: 0,
+          scale: 1.6,
+          duration: 0.18,
+          ease: EASE.md3Accelerate,
+          overwrite: true,
+          onComplete: () => { if (el.parentNode) el.remove(); },
+        });
+      } else {
+        setTimeout(() => { if (el.parentNode) el.remove(); }, 240);
+      }
+    }
+  }
+
+  /* ---- send button hide/show (comet-send-away) ---- */
+  function sendButtonEl() {
+    return toolbar && toolbar.querySelector ? toolbar.querySelector('.comet-send') : null;
+  }
+
+  // Collapse the toolbar Send button away (scaleX/opacity/max-width -> 0,
+  // then display:none). Called 2.5s after a successful send: nothing is left
+  // to send, so the dead slot disappears with it.
+  function hideSendButton() {
+    const b = sendButtonEl();
+    if (!b) return;
+    if (sendHideTimer) { clearTimeout(sendHideTimer); sendHideTimer = 0; }
+    if (isReducedMotion()) {
+      b.classList.remove('comet-send-away');
+      b.style.display = 'none';
+      return;
+    }
+    b.classList.remove('comet-send-away');
+    void b.offsetWidth;
+    b.classList.add('comet-send-away');
+    setTimeout(() => {
+      if (b.classList.contains('comet-send-away')) b.style.display = 'none';
+    }, 260);
+  }
+
+  // Bring the Send button back whenever new strokes/elements exist
+  // (endStroke / updateCount). Cancels any pending collapse.
+  function showSendButton() {
+    if (sendHideTimer) { clearTimeout(sendHideTimer); sendHideTimer = 0; }
+    const b = sendButtonEl();
+    if (!b) return;
+    b.style.display = '';
+    b.classList.remove('comet-send-away');
+  }
+
   async function send(button) {
     if (button) playMotion(button, 'send-press', 100);
+    startSendPulse(button);
     let label = '';
     try {
       const got = await chrome.storage.local.get('contextLabel');
@@ -2525,12 +4591,24 @@
       title: document.title || '',
       viewport: { w: window.innerWidth, h: window.innerHeight },
       label: label.slice(0, MAX_TEXT),
+      // Committed annotation notes from the chat card note mode (annotate
+      // tool). 'note' stays for backward compatibility (queue joined, capped);
+      // 'notes' ships the full queue (each entry capped).
+      note: (state.annotNotes.length
+        ? state.annotNotes.join(' | ')
+        : state.annotNote || '').slice(0, MAX_TEXT),
+      notes: state.annotNotes.slice(0, 20).map((n) => String(n).slice(0, MAX_TEXT)),
       strokes: state.strokes.map((s) => ({ color: s.color, width: s.width, points: s.points })),
       // v1.4: every selected descriptor carries its own instruction + edits.
       elements: state.elements.map(descriptorForPayload),
     };
     const captureRect = computeCaptureRect(state.elements);
     if (captureRect) payload.captureRect = captureRect;
+    diagLastCaptureRect = captureRect;
+    const sendStartMs = Date.now();
+    diagLog('send:start', 'elements=' + state.elements.length
+      + ' strokes=' + state.strokes.length
+      + ' captureRect=' + (captureRect ? 'yes' : 'no'));
     setStatus('sending…', '');
     let ok = false;
     // Hide the tool overlay (toolbar, inspector, canvas, markers) so the
@@ -2538,23 +4616,47 @@
     // The SW captures before it responds, so restoring after the round-trip
     // is safe.
     let overlayHidden = false;
+    // Hide the tool overlay ONLY when an element-only screenshot is being
+    // captured (captureRect exists). For stroke-only sends there is no
+    // capture, so the overlay must NOT blink out and the send pulse keeps
+    // animating uninterrupted.
     try {
-      if (host && host.parentNode) {
+      if (captureRect && host && host.parentNode) {
         host.style.visibility = 'hidden';
         overlayHidden = true;
+        // Flush the hide to the compositor BEFORE the SW captures: the SW
+        // runs captureVisibleTab on message receipt, and without waiting for
+        // a paint it can capture the overlay still visible. A double rAF
+        // lands after the next compositor frame commit.
+        if (typeof requestAnimationFrame === 'function') {
+          await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        }
       }
     } catch (_) { /* overlay stays visible */ }
     try {
       const resp = await chrome.runtime.sendMessage({ type: 'annotate', payload });
       ok = !!(resp && resp.ok);
-    } catch (_) { ok = false; }
+      diagLog(ok ? 'send:ok' : 'send:fail',
+        'latencyMs=' + (Date.now() - sendStartMs)
+        + ' screenshot=' + (captureRect ? 'crop-requested' : 'n/a'));
+    } catch (_) {
+      ok = false;
+      diagLog('send:fail',
+        'latencyMs=' + (Date.now() - sendStartMs) + ' error=sendMessage threw');
+    }
     try {
       if (overlayHidden && host) host.style.visibility = '';
     } catch (_) { /* ok */ }
     if (ok) {
-      setStatus(BRIDGE_OK, 'ok');
+      // Success: clear the status slot so it collapses (status:empty) and the
+      // toolbar gap closes; the confirmation lives in the top-center toast.
+      setStatus('', '');
       sendFeedback(button, true);
+      endSendPulse(true);
       state.strokes = [];
+      state.annotNote = ''; // next batch starts with a clean note
+      state.annotNotes = []; // queued notes ship with the batch, then reset
+      updateNoteCount();
       const old = state.elements.slice();
       state.elements = [];
       state.activeIndex = -1;
@@ -2566,9 +4668,12 @@
       updateCount();
       updateSelectionPulse();
       redraw();
+      // Nothing left to send: let the button collapse away after 2.5s.
+      sendHideTimer = setTimeout(hideSendButton, 2500);
     } else {
       setStatus(BRIDGE_OFFLINE, 'err');
       sendFeedback(button, false);
+      endSendPulse(false);
     }
   }
 
@@ -2576,14 +4681,13 @@
     const btn = e.target && e.target.closest ? e.target.closest('[data-act]') : null;
     if (!btn) return;
     switch (btn.dataset.act) {
+      case 'power': fullExit(); break;
       case 'annotate': toggleAnnotate(); break;
       case 'element': toggleElement(); break;
       case 'color': cycleColor(); break;
       case 'undo': undo(); break;
       case 'clear': clearAll(); break;
       case 'send': send(btn); break;
-      case 'power': fullExit(); break;
-      case 'exit': fullExit(); break;
       case 'collapse':
         setCollapsed(!state.collapsed);
         break;
@@ -2604,6 +4708,18 @@
     e.preventDefault();
     const target = e.currentTarget; // ⋮⋮ handle or the chip itself
     try { target.setPointerCapture(e.pointerId); } catch (_) { /* ok */ }
+    // Undock on drag start so the surface returns to floating layout while
+    // moving: remove the dock classes (the .comet-dock-left/right column
+    // layout reverts to row) and keep the current docked top-left as the
+    // float start, so the drag continues exactly where the toolbar was.
+    const prevDock = state.toolbarDock;
+    if (prevDock) {
+      state.toolbarDock = null;
+      clearToolbarDockClasses();
+      saveTabState({ toolbarDock: null });
+    }
+    gsapKill(toolbar);
+    if (toolbar) gsapSet(toolbar, { clearProps: 'transform,x,y,scale' });
     const base = state.position || defaultPosition();
     drag = {
       target,
@@ -2612,6 +4728,7 @@
       startY: e.clientY,
       baseX: base.x,
       baseY: base.y,
+      prevDock: prevDock || null, // restored by endDrag when the surface never moved
       moved: false,
     };
     lastDragPersist = 0;
@@ -2627,7 +4744,7 @@
     const now = Date.now();
     if (now - lastDragPersist >= DRAG_PERSIST_MS) {
       lastDragPersist = now;
-      saveTabState({ position: state.position }); // throttled per-tab persist
+      saveTabState({ position: state.position, toolbarDock: state.toolbarDock });
     }
   }
 
@@ -2640,8 +4757,22 @@
     } catch (_) { /* ok */ }
     drag.target.classList.remove('dragging');
     if (drag.moved && drag.target === chipEl) suppressChipClick = true;
+    const moved = drag.moved;
+    const prevDock = drag.prevDock || null;
     drag = null;
-    saveTabState({ position: state.position }); // final persist
+    if (moved) {
+      // Drop near an edge re-snaps with the DOCK_EDGE_PX threshold; the
+      // animated snap keeps the docked pin motion (chip included).
+      const side = detectToolbarDock();
+      if (side) setToolbarDock(side, { animate: true, persist: true });
+      else saveTabState({ position: state.position, toolbarDock: null });
+    } else if (prevDock) {
+      // A plain click on the handle must not undock the toolbar: restore the
+      // dock exactly as it was (classes + state agree again).
+      setToolbarDock(prevDock, { animate: false, persist: true });
+    } else {
+      saveTabState({ position: state.position, toolbarDock: state.toolbarDock });
+    }
   }
 
   function onChipClick() {
@@ -2653,6 +4784,8 @@
   }
 
   function teardownHost() {
+    stopInspectorRingTween();
+    diagDetach();
     if (host && host.parentNode) {
       try { host.parentNode.removeChild(host); } catch (_) { /* ok */ }
     }
@@ -2677,20 +4810,26 @@
     chipEl = null;
     dragHandle = null;
     inspPanel = null;
+    inspDragHandle = null;
+    inspDockEl = null;
+    inspDrag = null;
     inspRows = null;
     inspCountEl = null;
     inspSelectionCountEl = null;
     inspSelectionList = null;
     inspResetAllBtn = null;
     inspInput = null;
-    inspSend = null;
     modeToggle = null;
     modePill = null;
-    toastEl = null;
-    if (toastTimer) clearTimeout(toastTimer);
-    toastTimer = 0;
+    sentToastEl = null;
+    if (sentToastTimer) clearTimeout(sentToastTimer);
+    sentToastTimer = 0;
+    if (sendHideTimer) clearTimeout(sendHideTimer);
+    sendHideTimer = 0;
     if (collapseTimer) clearTimeout(collapseTimer);
     collapseTimer = 0;
+    if (revealPulseTimer) clearTimeout(revealPulseTimer);
+    revealPulseTimer = 0;
     exitTimer = 0;
     inspectorOriginals = new Map();
     hintProp = null;
@@ -2705,7 +4844,10 @@
     // reinject (setCollapsed early-returns when the value is unchanged, so
     // the collapsed/position state must be reset here).
     state.collapsed = false;
+    state.modeBeforeCollapse = null;
     state.position = null;
+    state.toolbarDock = null;
+    state.dock = null;
     state.collapsedCats = {};
     window.__hermesAnnotateInjected = false;
     window.__browserlinkInjected = false;
@@ -2733,6 +4875,15 @@
     }
     drag = null;
     suppressChipClick = false;
+    if (inspDrag) {
+      try {
+        if (inspDragHandle && inspDragHandle.hasPointerCapture(inspDrag.pointerId)) {
+          inspDragHandle.releasePointerCapture(inspDrag.pointerId);
+        }
+      } catch (_) { /* ok */ }
+      if (inspPanel) inspPanel.classList.remove('dragging');
+    }
+    inspDrag = null;
 
     state.annotateOn = false;
     state.elementMode = false;
@@ -2762,14 +4913,42 @@
       chrome.storage.local.set({ toolEnabled: false }); // master switch stays off across refreshes
     } catch (_) { /* storage unavailable */ }
 
-    if (host && host.parentNode && !isReducedMotion()) {
-      host.classList.add('is-exiting');
-      exitTimer = setTimeout(() => {
-        exitTimer = 0;
-        teardownHost();
-      }, 120);
-    } else {
+    // Premium smooth-out: reverse of the toolbar entrance. The whole host
+    // (toolbar + chip + card) scales 0.98 -> 0.92 toward the toolbar's
+    // position while fading and blurring (~230ms, MD3 Accelerate); teardown
+    // runs only after the animation completes. Reduced motion / no GSAP ->
+    // instant teardown, unchanged behavior.
+    const doTeardown = () => {
+      exitTimer = 0;
       teardownHost();
+    };
+    if (host && host.parentNode && !isReducedMotion() && gsapReady) {
+      let origin = '50% 50%';
+      if (toolbar) {
+        try {
+          const tb = toolbar.getBoundingClientRect();
+          origin = Math.round(tb.left + tb.width / 2) + 'px ' +
+                   Math.round(tb.top + tb.height / 2) + 'px';
+        } catch (_) { /* keep center origin */ }
+      }
+      gsapKill(host);
+      gsapSet(host, { transformOrigin: origin });
+      host.style.transition = 'none'; // GSAP drives 1:1; host is removed after
+      if (toolbar) toolbar.style.pointerEvents = 'none';
+      exitTimer = 1; // guard: no double-run while the exit animation plays
+      gsapLib.fromTo(host,
+        { opacity: 1, scale: 0.98, filter: 'blur(0px)' },
+        {
+          opacity: 0,
+          scale: 0.92,
+          filter: 'blur(4px)',
+          duration: 0.23,
+          ease: EASE.md3Accelerate,
+          overwrite: true,
+          onComplete: doTeardown,
+        });
+    } else {
+      doTeardown();
     }
   }
 
@@ -2786,6 +4965,7 @@
       buildUI();
       bindEvents();
       injectShadowStyles();
+      diagAttach();
       window.__hermesAnnotateInjected = true;
       window.__browserlinkInjected = true;
       chrome.storage.session.get(tabStorageKey()).then((got) => {
@@ -2814,11 +4994,35 @@
       const d = defaultPosition();
       applyPosition(d.x, d.y);
     }
+    // Toolbar edge dock is per-tab (null = floating). Apply before collapse so
+    // the chip/toolbar land on the docked edge when restoring collapsed state.
+    // Default dock: first run (no saved dock) pins the toolbar to the LEFT
+    // edge, vertically centered with a DOCK_GAP_PX inset; a saved dock always
+    // wins over the default. Applied instantly (animate: false); drag
+    // re-docking keeps its animated snap via setToolbarDock(animate: true).
+    const tbDock = st && st.toolbarDock;
+    const dockSide = TOOLBAR_DOCK_SIDES.indexOf(tbDock) !== -1 ? tbDock : 'left';
+    setToolbarDock(
+      dockSide,
+      { animate: false, persist: false }
+    );
     setCollapsed(!!(st && st.collapsed));
+    // Inspector dock is per-tab view state (null = floating popup).
+    const dock = st && st.panelDock;
+    state.dock = ['left', 'top', 'right', 'bottom'].indexOf(dock) !== -1 ? dock : null;
+    updateDockUI();
     // Inspector category collapse is per-tab view state (default: all expanded).
     state.collapsedCats = (st && st.collapsedCats && typeof st.collapsedCats === 'object')
       ? Object.assign({}, st.collapsedCats)
       : {};
+    // Inspector corner-resize size is per-tab view state; clamp it to the
+    // current viewport (persisted value may predate a window resize).
+    const isz = st && st.inspSize;
+    if (inspPanel && isz && typeof isz.w === 'number' && typeof isz.h === 'number') {
+      applyInspSize(isz.w, isz.h);
+    } else {
+      state.inspSize = null;
+    }
   }
 
   // Messages from the popup (forwarded by the service worker) / background.
@@ -2854,16 +5058,43 @@
   function animateEntrance() {
     if (!host) return;
     host.classList.add('is-entering');
-    if (isReducedMotion()) {
+    const finishEntered = () => {
+      if (!host) return;
+      host.classList.remove('is-entering');
       host.classList.add('is-entered');
+    };
+    if (isReducedMotion() || !gsapReady) {
+      finishEntered();
+      if (toolbar) gsapSet(toolbar, { opacity: 1, y: 0, scale: 1 });
       return;
     }
-    setTimeout(() => {
-      if (host) {
-        host.classList.remove('is-entering');
-        host.classList.add('is-entered');
-      }
-    }, 0);
+    // Toolbar fades/scales in as one unit, then its interactive children
+    // stagger in 25-30ms each (Premium / MD3 Emphasized).
+    const kids = toolbar
+      ? Array.from(toolbar.children).filter((el) => el && el.nodeType === 1)
+      : [];
+    gsapEnter(host, {
+      duration: 0.22,
+      from: { opacity: 0, y: -6, scale: 1 },
+      to: { opacity: 1, y: 0, scale: 1 },
+      onComplete: finishEntered,
+    });
+    if (toolbar) {
+      gsapEnter(toolbar, {
+        duration: 0.28,
+        from: { opacity: 0, y: -8, scale: 0.98 },
+        to: { opacity: 1, y: 0, scale: 1 },
+      });
+    }
+    if (kids.length) {
+      gsapStaggerIn(kids, {
+        duration: 0.2,
+        stagger: 0.028,
+        delay: 0.08,
+        from: { opacity: 0, y: 6, scale: 0.96 },
+        to: { opacity: 1, y: 0, scale: 1 },
+      });
+    }
   }
 
   function buildUI() {
@@ -2877,15 +5108,15 @@
     toolbar = document.createElement('div');
     toolbar.className = 'comet-toolbar';
     toolbar.setAttribute('role', 'toolbar');
-    toolbar.setAttribute('aria-label', 'Browserlink — Browser Annotate & Connect');
+    toolbar.setAttribute('aria-label', 'Browserlink - Browser Annotate & Connect');
     toolbar.innerHTML =
       '<button type="button" data-act="power" class="comet-btn comet-power" title="Deactivate Browserlink (removes everything from this page)">⏻</button>' +
       '<button type="button" data-act="collapse" class="comet-btn comet-collapse" title="Collapse to a floating chip">−</button>' +
-      '<span class="comet-drag" data-act="drag" title="Drag to move">⋮⋮</span>' +
+      '<span class="comet-drag" data-act="drag" title="Drag to move. Drop near left, right, or bottom edge to dock.">⋮⋮</span>' +
       '<span class="comet-mode-toggle" role="group" aria-label="Mode">' +
       '  <span class="comet-mode-pill" aria-hidden="true"></span>' +
-      '  <button type="button" data-act="annotate" class="comet-btn comet-mode-btn" title="Toggle drawing">Annotate</button>' +
-      '  <button type="button" data-act="element" class="comet-btn comet-mode-btn" title="Element picker: hover to highlight, click to select + instruct">Element</button>' +
+      '  <button type="button" data-act="annotate" class="comet-btn comet-mode-btn" title="Toggle drawing" aria-label="Annotate">✎</button>' +
+      '  <button type="button" data-act="element" class="comet-btn comet-mode-btn" title="Element picker: hover to highlight, click to select + instruct" aria-label="Element">▣</button>' +
       '</span>' +
       '<button type="button" data-act="color" class="comet-swatch" title="Cycle color">' +
       '  <span class="dot" style="background:#ff5252"></span>' +
@@ -2899,11 +5130,11 @@
       '  <option value="8">8</option>' +
       '</select>' +
       '<span class="comet-count" data-act="count" title="Selected elements">0 elements</span>' +
-      '<button type="button" data-act="undo" class="comet-btn">Undo</button>' +
-      '<button type="button" data-act="clear" class="comet-btn">Clear</button>' +
-      '<button type="button" data-act="send" class="comet-btn comet-send">Send</button>' +
-      '<span class="status"></span>' +
-      '<button type="button" data-act="exit" class="comet-btn comet-exit" title="Exit Browserlink (removes everything from this page)">✕</button>';
+      '<span class="comet-note-count" data-act="count" title="Queued annotation notes" hidden></span>' +
+      '<button type="button" data-act="undo" class="comet-btn comet-icon-btn" title="Undo" aria-label="Undo">↩</button>' +
+      '<button type="button" data-act="clear" class="comet-btn comet-icon-btn" title="Clear" aria-label="Clear">✕</button>' +
+      '<button type="button" data-act="send" class="comet-btn comet-send comet-icon-btn" title="Send" aria-label="Send">➤</button>' +
+      '<span class="status"></span>';
     dragHandle = toolbar.querySelector('.comet-drag');
     modeToggle = toolbar.querySelector('.comet-mode-toggle');
     modePill = toolbar.querySelector('.comet-mode-pill');
@@ -2954,12 +5185,22 @@
       '  <button type="button" class="comet-btn comet-chat-add" data-chat="add">Add</button>' +
       '</div>';
 
-    // Element inspector panel (attached below the toolbar, max 320px wide).
+    // Element inspector panel: floating popup near the selected element
+    // (draggable via the header handle) or docked to a viewport edge.
     inspPanel = document.createElement('div');
     inspPanel.className = 'comet-inspector';
     inspPanel.hidden = true;
     inspPanel.innerHTML =
-      '<div class="comet-insp-head">Element inspector</div>' +
+      '<div class="comet-insp-head">' +
+      '  <span class="comet-insp-drag" title="Drag to move">⋮⋮</span>' +
+      '  <span class="comet-insp-title">Element inspector</span>' +
+      '  <span class="comet-dock" role="group" aria-label="Dock inspector to a screen edge">' +
+      '    <button type="button" class="comet-dock-btn" data-dock="left" title="Dock left">◀</button>' +
+      '    <button type="button" class="comet-dock-btn" data-dock="top" title="Dock top">▲</button>' +
+      '    <button type="button" class="comet-dock-btn" data-dock="right" title="Dock right">▶</button>' +
+      '    <button type="button" class="comet-dock-btn" data-dock="bottom" title="Dock bottom">▼</button>' +
+      '  </span>' +
+      '</div>' +
       '<div class="comet-selection-head"><span class="comet-selection-count">0 selected</span></div>' +
       '<div class="comet-selection-list"></div>' +
       '<div class="comet-insp-rows"></div>' +
@@ -2970,14 +5211,16 @@
       '  </div>' +
       '  <textarea class="comet-chat-input comet-insp-instr" rows="2" ' +
       ' placeholder="Your thoughts/instructions for this element…"></textarea>' +
-      '  <button type="button" class="comet-btn comet-send comet-insp-send">Send</button>' +
-      '</div>';
+      '  <button type="button" class="comet-btn comet-insp-add">Add</button>' +
+      '</div>' +
+      '<div class="comet-insp-glow" aria-hidden="true"></div>' +
+      '<div class="comet-insp-resize" title="Resize inspector"></div>';
 
-    toastEl = document.createElement('div');
-    toastEl.className = 'comet-toast';
-    toastEl.setAttribute('role', 'status');
-    toastEl.hidden = true;
-    toastEl.textContent = 'Sent';
+    sentToastEl = document.createElement('div');
+    sentToastEl.className = 'comet-sent-toast';
+    sentToastEl.setAttribute('aria-hidden', 'true');
+    sentToastEl.hidden = true;
+    sentToastEl.textContent = 'Sent ✓';
 
     shadow.appendChild(toolbar);
     shadow.appendChild(chipEl);
@@ -2987,7 +5230,28 @@
     shadow.appendChild(canvas);
     shadow.appendChild(chatCard);
     shadow.appendChild(inspPanel);
-    shadow.appendChild(toastEl);
+    shadow.appendChild(sentToastEl);
+
+    // Diagnostics overlay (Ctrl+Shift+D to toggle). Sits inside the shadow
+    // root so the host hide during capture hides it too. Hidden by default:
+    // closed it never blocks element picking.
+    diagPanel = document.createElement('div');
+    diagPanel.className = 'comet-diag';
+    diagPanel.hidden = true;
+    diagPanel.innerHTML =
+      '<div class="comet-diag-head">' +
+      '<span class="comet-diag-title">Browserlink diag</span>' +
+      '<button type="button" class="comet-diag-btn comet-diag-copy">Copy</button>' +
+      '<button type="button" class="comet-diag-btn comet-diag-close">Close</button>' +
+      '</div>' +
+      '<pre class="comet-diag-body"></pre>';
+    const diagCopyBtn = diagPanel.querySelector('.comet-diag-copy');
+    if (diagCopyBtn) diagCopyBtn.addEventListener('click', diagCopyToClipboard);
+    const diagCloseBtn = diagPanel.querySelector('.comet-diag-close');
+    if (diagCloseBtn) diagCloseBtn.addEventListener('click', diagClosePanel);
+    shadow.appendChild(diagPanel);
+    diagPanelOpen = false;
+
     ctx = canvas.getContext('2d');
 
     // ONE shadow host on the page; nothing else touches the page DOM.
@@ -2995,6 +5259,7 @@
 
     statusEl = toolbar.querySelector('.status');
     countEl = toolbar.querySelector('.comet-count');
+    noteCountEl = toolbar.querySelector('.comet-note-count');
     chatHead = chatCard.querySelector('.comet-chat-head');
     chatInput = chatCard.querySelector('.comet-chat-input');
     inspRows = inspPanel.querySelector('.comet-insp-rows');
@@ -3003,7 +5268,11 @@
     inspSelectionList = inspPanel.querySelector('.comet-selection-list');
     inspResetAllBtn = inspPanel.querySelector('.comet-insp-reset-all');
     inspInput = inspPanel.querySelector('.comet-insp-instr');
-    inspSend = inspPanel.querySelector('.comet-insp-send');
+    inspAddEl = inspPanel.querySelector('.comet-insp-add');
+    inspGlowEl = inspPanel.querySelector('.comet-insp-glow');
+    inspResizeHandle = inspPanel.querySelector('.comet-insp-resize');
+    inspDragHandle = inspPanel.querySelector('.comet-insp-drag');
+    inspDockEl = inspPanel.querySelector('.comet-dock');
     toolbar.querySelector('.comet-swatch .dot').classList.add('active');
     animateEntrance();
     updateCount();
@@ -3033,6 +5302,8 @@
         'border-radius:6px;padding:4px 10px;font:inherit;cursor:pointer;}' +
         '.comet-btn.active{background:#4a9eff;border-color:#4a9eff;color:#fff;}' +
         '.comet-btn.comet-send{background:#35c759;border-color:#35c759;color:#07130a;font-weight:600;}' +
+        '.comet-icon-btn{min-width:32px;width:32px;box-sizing:border-box;padding:4px 0;text-align:center;' +
+        'font-size:15px;line-height:1.15;letter-spacing:0;}' +
         '.comet-swatch{display:flex;gap:3px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.16);' +
         'border-radius:6px;padding:4px 6px;cursor:pointer;}' +
         '.comet-swatch .dot{width:10px;height:10px;border-radius:50%;border:1px solid rgba(0,0,0,.4);}' +
@@ -3075,6 +5346,8 @@
         '.comet-chat-actions{display:flex;justify-content:flex-end;gap:6px;}' +
         '.comet-chat-add{background:#4a9eff;border-color:#4a9eff;color:#fff;}' +
         '.comet-count{min-width:64px;text-align:center;font-size:12px;color:#9aa0a6;white-space:nowrap;}' +
+        '.comet-note-count{min-width:40px;text-align:center;font-size:12px;color:#9aa0a6;white-space:nowrap;}' +
+        '.comet-note-count[hidden]{display:none;}' +
         '.comet-chip{position:fixed;width:48px;height:48px;border-radius:50%;z-index:2147483647;' +
         'display:flex;align-items:center;justify-content:center;background:var(--bl-bg,rgba(16,18,24,.92));' +
         'border:1px solid var(--bl-border,rgba(255,255,255,.14));box-shadow:0 6px 24px rgba(0,0,0,.35);' +
@@ -3086,14 +5359,18 @@
         '.comet-drag:hover{background:rgba(255,255,255,.14);color:#e8eaed;}' +
         '.comet-chip.dragging,.comet-drag.dragging{cursor:grabbing;}' +
         '.comet-power:hover{background:#35c759;border-color:#35c759;color:#07130a;}' +
-        '.comet-exit:hover{background:#ff5252;border-color:#ff5252;color:#fff;}' +
         '.comet-inspector{position:fixed;z-index:2147483647;width:320px;max-width:calc(100vw - 24px);' +
         'max-height:60vh;display:flex;flex-direction:column;gap:8px;padding:10px;' +
         'background:var(--bl-bg,rgba(16,18,24,.95));border:1px solid var(--bl-border,rgba(255,255,255,.16));' +
         'border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.35);font:13px/1.4 system-ui;' +
         'color:var(--bl-text,#e8eaed);pointer-events:auto;user-select:none;}' +
         '.comet-inspector[hidden]{display:none;}' +
-        '.comet-insp-head{font-size:12px;color:#9aa0a6;border-bottom:1px solid rgba(255,255,255,.14);padding-bottom:6px;}' +
+        '.comet-insp-head{display:flex;align-items:center;gap:6px;font-size:12px;color:#9aa0a6;border-bottom:1px solid rgba(255,255,255,.14);padding-bottom:6px;}' +
+        '.comet-insp-drag{flex:0 0 auto;cursor:grab;padding:1px 5px;color:#9aa0a6;touch-action:none;}' +
+        '.comet-insp-title{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
+        '.comet-dock{flex:0 0 auto;display:inline-flex;gap:2px;}' +
+        '.comet-dock-btn{appearance:none;width:18px;height:18px;padding:0;border:1px solid rgba(255,255,255,.16);border-radius:4px;background:rgba(255,255,255,.06);color:#9aa0a6;font:9px/1 system-ui;cursor:pointer;}' +
+        '.comet-dock-btn.active{background:#4a9eff;border-color:#4a9eff;color:#fff;}' +
         '.comet-insp-rows{overflow-y:auto;display:flex;flex-direction:column;gap:6px;}' +
         '.comet-insp-row{display:grid;grid-template-columns:72px minmax(0,1fr) auto;gap:6px;' +
         'align-items:center;border:1px solid transparent;border-radius:6px;padding:4px 6px;}' +
@@ -3121,7 +5398,22 @@
         '.comet-insp-reset-all{border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:#e8eaed;' +
         'cursor:pointer;font:11px system-ui;padding:3px 8px;border-radius:4px;}' +
         '.comet-insp-reset-all:hover{border-color:#ff5252;color:#ff5252;}' +
-        '.comet-insp-send{align-self:flex-end;}';
+        '.comet-selection-main{display:flex;flex-direction:column;align-items:flex-start;gap:2px;}' +
+        '.comet-selection-note{display:block;font-size:10px;color:#9aa0a6;font-weight:400;' +
+        'max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
+        '.comet-diag{position:fixed;right:12px;bottom:12px;z-index:2147483647;width:min(420px,calc(100vw - 24px));' +
+        'max-height:40vh;display:flex;flex-direction:column;background:rgba(10,12,16,.96);' +
+        'border:1px solid rgba(255,255,255,.16);border-radius:10px;color:#e8eaed;' +
+        'font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;pointer-events:auto;' +
+        'box-shadow:0 8px 24px rgba(0,0,0,.45);}' +
+        '.comet-diag[hidden]{display:none;}' +
+        '.comet-diag-head{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.12);}' +
+        '.comet-diag-title{flex:1;font-weight:600;letter-spacing:.02em;}' +
+        '.comet-diag-btn{background:rgba(255,255,255,.08);color:#e8eaed;border:1px solid rgba(255,255,255,.16);' +
+        'border-radius:5px;font:11px ui-monospace,Menlo,Consolas,monospace;padding:2px 8px;cursor:pointer;}' +
+        '.comet-diag-btn:hover{background:rgba(255,255,255,.16);}' +
+        '.comet-diag-body{flex:1;overflow:auto;max-height:calc(40vh - 30px);margin:0;padding:8px;' +
+        'white-space:pre-wrap;word-break:break-word;color:#9aa0a6;}';
     }
     style.textContent = css;
     shadow.appendChild(style);
@@ -3131,12 +5423,27 @@
   function onWindowResize() {
     resizeCanvas();
     repositionAll();
-    if (state.position) applyPosition(state.position.x, state.position.y); // re-clamp
+    // Re-center a docked toolbar/chip; otherwise re-clamp the floating position.
+    if (state.toolbarDock) {
+      const target = dockedToolbarPosition(state.toolbarDock);
+      applyPosition(target.x, target.y);
+    } else if (state.position) {
+      applyPosition(state.position.x, state.position.y);
+    }
+    // Re-anchor the inspector: docked panels stay glued to their edge.
+    if (inspPanel && !inspPanel.hidden) {
+      if (state.dock) applyDock();
+      else positionInspector();
+    }
+    // Re-clamp a persisted inspector size to the new viewport.
+    if (state.inspSize) applyInspSize(state.inspSize.w, state.inspSize.h);
   }
 
   function bindEvents() {
     toolbar.addEventListener('click', onToolbarClick);
     toolbar.addEventListener('change', onToolbarChange);
+    // Keep extension field keystrokes from bubbling into host-page shortcuts.
+    shadow.addEventListener('keydown', (e) => e.stopPropagation());
     dragHandle.addEventListener('pointerdown', startDrag);
     dragHandle.addEventListener('pointermove', onDragMove);
     dragHandle.addEventListener('pointerup', endDrag);
@@ -3153,8 +5460,13 @@
     chatCard.addEventListener('click', (e) => {
       const b = e.target && e.target.closest ? e.target.closest('[data-chat]') : null;
       if (!b) return;
-      if (b.dataset.chat === 'add') addChat();
-      else if (b.dataset.chat === 'cancel') cancelChat();
+      if (b.dataset.chat === 'add') {
+        if (pending) addChat();
+        else if (state.annotateOn && !state.elementMode) commitAnnotNote();
+      } else if (b.dataset.chat === 'cancel') {
+        if (pending) cancelChat();
+        else if (state.annotateOn && !state.elementMode) hideAnnotNoteCard();
+      }
     });
     chatInput.addEventListener('input', () => {
       if (pending && pending.descriptor) pending.descriptor.instruction = chatInput.value;
@@ -3171,7 +5483,29 @@
     if (inspResetAllBtn) inspResetAllBtn.addEventListener('click', onInspectorResetAll);
     if (inspSelectionList) inspSelectionList.addEventListener('click', onSelectionListClick);
     inspInput.addEventListener('input', onInspectorInstr);
-    inspSend.addEventListener('click', () => send(inspSend));
+    if (inspAddEl) {
+      inspAddEl.addEventListener('click', () => {
+        if (pending) addChat();
+      });
+    }
+    if (inspDragHandle) {
+      inspDragHandle.addEventListener('pointerdown', startInspDrag);
+      inspDragHandle.addEventListener('pointermove', onInspDragMove);
+      inspDragHandle.addEventListener('pointerup', endInspDrag);
+      inspDragHandle.addEventListener('pointercancel', endInspDrag);
+    }
+    if (inspResizeHandle) {
+      inspResizeHandle.addEventListener('pointerdown', startInspResize);
+      inspResizeHandle.addEventListener('pointermove', onInspResizeMove);
+      inspResizeHandle.addEventListener('pointerup', endInspResize);
+      inspResizeHandle.addEventListener('pointercancel', endInspResize);
+    }
+    if (inspPanel) {
+      inspPanel.addEventListener('pointermove', onInspPointerMove);
+      inspPanel.addEventListener('pointerenter', onInspPointerEnter);
+      inspPanel.addEventListener('pointerleave', onInspPointerLeave);
+    }
+    if (inspDockEl) inspDockEl.addEventListener('click', onDockClick);
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mousedown', onPageMouseDown, true);
     window.addEventListener('click', onPageClick, true);
@@ -3187,8 +5521,10 @@
 
   /* ---------------- init ---------------- */
   async function init() {
+    diagLog('init:start', 'url=' + location.href);
     try {
       updateMotionPreference();
+      registerInspectorRingProperty();
       // The message listener must survive exit so the popup can re-enable us.
       if (!messagesBound) {
         messagesBound = true;
@@ -3215,17 +5551,25 @@
       if (masterEnabled === false || (st && st.enabled === false)) {
         // Deactivation persists: stay off until the popup re-enables.
         saveTabState({ enabled: false });
+        diagLog('init:skip', 'disabled by master switch');
         return;
       }
       buildUI();
       bindEvents();
       injectShadowStyles();
       restoreTabState(st);
+      diagAttach();
+      const health = diagHealth(true);
+      diagLog('init:done',
+        'ready=' + (health.ok ? 'yes' : 'no')
+        + ' gsap=' + (gsapReady ? 'yes' : 'no')
+        + ' dpr=' + (Number(window.devicePixelRatio) || 1));
     } catch (err) {
       // Never break the host page.
       try { if (host && host.parentNode) host.parentNode.removeChild(host); } catch (_) { /* ok */ }
       window.__hermesAnnotateInjected = false;
       window.__browserlinkInjected = false;
+      diagLog('init:fail', (err && err.message) ? err.message : String(err));
       console.error('Browserlink init failed:', err);
     }
   }

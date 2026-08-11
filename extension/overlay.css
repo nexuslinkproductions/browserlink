@@ -1,4 +1,4 @@
-/* Browserlink — overlay styles (toolbar + canvas + chip + inspector).
+/* Browserlink - overlay styles (toolbar + canvas + chip + inspector).
  *
  * Injected twice by design:
  *   1. into the page document via manifest content_scripts "css" (styles the
@@ -21,15 +21,23 @@
  * Single source for all UI colors. Only the fixed annotation palette
  * (#ff5252/#4a9eff/#ffd166/#35c759) is hardcoded in the shadow content. */
 :host {
+  /* Legacy tokens (kept as the single color source; values tuned for glass). */
   --bl-bg: rgba(16, 18, 24, 0.92);
   --bl-border: rgba(255, 255, 255, 0.16);
   --bl-btn-bg: rgba(255, 255, 255, 0.06);
   --bl-btn-hover: rgba(255, 255, 255, 0.14);
-  --bl-text: #e8eaed;
-  --bl-muted: #9aa0a6;
+  --bl-text: #eef1f6;
+  --bl-muted: #a3aab8;
   --bl-accent: #4a9eff;
   --bl-ok: #35c759;
   --bl-err: #ff5252;
+  /* Glass depth tokens shared by every floating surface. */
+  --bl-glass-top: rgba(255, 255, 255, 0.30);
+  --bl-glass-edge: rgba(255, 255, 255, 0.08);
+  --bl-glass-low: rgba(0, 0, 0, 0.32);
+  --bl-inset-hi: inset 0 1px 0 rgba(255, 255, 255, 0.11), inset 0 -1px 0 rgba(0, 0, 0, 0.28);
+  --bl-ambient: 0 20px 56px -14px rgba(0, 0, 0, 0.60), 0 6px 20px -6px rgba(0, 0, 0, 0.40);
+  --bl-ambient-deep: 0 30px 80px -18px rgba(0, 0, 0, 0.68), 0 10px 28px -8px rgba(0, 0, 0, 0.46);
 }
 
 /* ---- floating toolbar (shadow-internal) ---- */
@@ -41,15 +49,22 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 10px;
-  background: rgba(16, 18, 24, 0.92);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 10px;
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
-  -webkit-backdrop-filter: blur(8px);
-  backdrop-filter: blur(8px);
+  padding: 8px 12px;
+  background:
+    radial-gradient(130% 160% at 50% -35%, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0) 52%) padding-box,
+    linear-gradient(168deg, rgba(30, 34, 46, 0.82), rgba(12, 14, 19, 0.76)) padding-box,
+    linear-gradient(155deg, var(--bl-glass-top, rgba(255, 255, 255, 0.30)), var(--bl-glass-edge, rgba(255, 255, 255, 0.08)) 34%, rgba(255, 255, 255, 0.02) 58%, var(--bl-glass-low, rgba(0, 0, 0, 0.32))) border-box;
+  border: 1px solid transparent;
+  border-radius: 14px;
+  box-shadow:
+    var(--bl-inset-hi, inset 0 1px 0 rgba(255, 255, 255, 0.11)),
+    0 0 0 1px rgba(0, 0, 0, 0.18),
+    var(--bl-ambient, 0 20px 56px -14px rgba(0, 0, 0, 0.60));
+  -webkit-backdrop-filter: blur(18px) saturate(1.5);
+  backdrop-filter: blur(18px) saturate(1.5);
   font: 13px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  color: #e8eaed;
+  letter-spacing: 0.01em;
+  color: var(--bl-text, #eef1f6);
   pointer-events: auto;
   user-select: none;
   -webkit-user-select: none;
@@ -58,31 +73,53 @@
 .comet-btn {
   appearance: none;
   -webkit-appearance: none;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  background: rgba(255, 255, 255, 0.06);
-  color: #e8eaed;
-  border-radius: 6px;
-  padding: 4px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.03));
+  color: var(--bl-text, #eef1f6);
+  border-radius: 8px;
+  padding: 5px 11px;
   font: inherit;
+  font-weight: 500;
+  letter-spacing: 0.015em;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.09), 0 1px 3px rgba(0, 0, 0, 0.28);
   cursor: pointer;
   white-space: nowrap;
 }
 .comet-btn:hover {
-  background: rgba(255, 255, 255, 0.14);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.15), rgba(255, 255, 255, 0.06));
+  border-color: rgba(255, 255, 255, 0.22);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.13), 0 6px 16px -6px rgba(0, 0, 0, 0.50);
 }
 .comet-btn.active {
-  background: #4a9eff;
-  border-color: #4a9eff;
+  background: linear-gradient(180deg, #5cabff, #3f8ef7);
+  border-color: rgba(156, 204, 255, 0.65);
   color: #ffffff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 0 13px rgba(74, 158, 255, 0.38), 0 2px 8px rgba(74, 158, 255, 0.24);
 }
 .comet-btn.comet-send {
-  background: #35c759;
-  border-color: #35c759;
-  color: #07130a;
+  background: linear-gradient(180deg, #45d96f, #2bb84f);
+  border-color: rgba(163, 240, 183, 0.55);
+  color: #06130a;
   font-weight: 600;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 0 14px rgba(53, 199, 89, 0.33), 0 2px 8px rgba(53, 199, 89, 0.22);
 }
 .comet-btn.comet-send:hover {
-  background: #46d768;
+  background: linear-gradient(180deg, #55e37d, #34c95a);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.40), 0 0 20px rgba(53, 199, 89, 0.48), 0 5px 13px rgba(53, 199, 89, 0.28);
+}
+
+/* Icon-only toolbar actions (annotate/element/undo/clear/send): slim square
+   cells so the docked vertical bar stays narrow. Equal widths keep the row
+   layout tidy; glyphs are sized slightly larger than the 13px label text. */
+.comet-icon-btn {
+  min-width: 32px;
+  width: 32px;
+  box-sizing: border-box;
+  padding: 5px 0;
+  text-align: center;
+  font-size: 15px;
+  line-height: 1.15;
+  letter-spacing: 0;
 }
 
 /* ---- color swatch (cycles the 4 spec colors) ---- */
@@ -91,39 +128,45 @@
   -webkit-appearance: none;
   display: flex;
   align-items: center;
-  gap: 3px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  background: rgba(255, 255, 255, 0.06);
-  border-radius: 6px;
-  padding: 4px 6px;
+  gap: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.03));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 1px 3px rgba(0, 0, 0, 0.28);
+  border-radius: 8px;
+  padding: 5px 7px;
   cursor: pointer;
 }
 .comet-swatch .dot {
-  width: 10px;
-  height: 10px;
+  width: 11px;
+  height: 11px;
   border-radius: 50%;
-  border: 1px solid rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(0, 0, 0, 0.45);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.35), 0 1px 2px rgba(0, 0, 0, 0.40);
 }
 .comet-swatch .dot.active {
   outline: 2px solid #ffffff;
   outline-offset: 1px;
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.35), 0 0 9px rgba(255, 255, 255, 0.38);
 }
 
 /* ---- stroke width select ---- */
 .comet-width {
   appearance: none;
   -webkit-appearance: none;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  background: rgba(255, 255, 255, 0.06);
-  color: #e8eaed;
-  border-radius: 6px;
-  padding: 4px 6px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1l3 3 3-3' stroke='%23a3aab8' stroke-width='1.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 8px center,
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.03));
+  color: var(--bl-text, #eef1f6);
+  border-radius: 8px;
+  padding: 5px 22px 5px 9px;
   font: inherit;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 1px 3px rgba(0, 0, 0, 0.28);
   cursor: pointer;
 }
 .comet-width option {
-  background: #1a1c22;
-  color: #e8eaed;
+  background: #14161d;
+  color: #eef1f6;
 }
 
 /* ---- overlay canvas (shadow-internal) ---- */
@@ -143,18 +186,22 @@
   min-width: 90px;
   text-align: right;
   font-size: 12px;
-  color: #9aa0a6;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--bl-muted, #a3aab8);
 }
-/* Collapse the status slot when empty so Send and the exit ✕ sit close
- * together instead of leaving a dead 90px gap. */
+/* Collapse the status slot when empty (e.g. after a successful send) so the
+ * toolbar ends right after Send instead of leaving a dead 90px gap. */
 .status:empty {
   min-width: 0;
 }
 .status.ok {
-  color: #35c759;
+  color: #4ade6e;
+  text-shadow: 0 0 11px rgba(53, 199, 89, 0.38);
 }
 .status.err {
-  color: #ff5252;
+  color: #ff6b6b;
+  text-shadow: 0 0 11px rgba(255, 82, 82, 0.38);
 }
 
 /* ---- element picker layer (shadow-internal, fixed viewport layer) ---- */
@@ -169,7 +216,9 @@
 .comet-hl {
   position: absolute;
   border: 2px solid #4a9eff;
-  background: rgba(74, 158, 255, 0.12);
+  border-radius: 3px;
+  background: rgba(74, 158, 255, 0.10);
+  box-shadow: 0 0 0 1px rgba(74, 158, 255, 0.22), 0 0 18px rgba(74, 158, 255, 0.24), inset 0 0 18px rgba(74, 158, 255, 0.06);
   pointer-events: none;
   box-sizing: border-box;
   display: none; /* shown by content.js while an element is hovered */
@@ -179,11 +228,13 @@
   left: 0;
   top: 0;
   transform: translate(0, -100%);
-  background: #4a9eff;
+  background: linear-gradient(180deg, #5cabff, #3f8ef7);
   color: #ffffff;
-  font: 11px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  padding: 2px 6px;
-  border-radius: 4px 4px 0 0;
+  font: 600 11px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: 0.02em;
+  padding: 2px 7px;
+  border-radius: 5px 5px 0 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35), 0 0 11px rgba(74, 158, 255, 0.33);
   white-space: nowrap;
   max-width: 240px;
   overflow: hidden;
@@ -193,7 +244,9 @@
 .comet-hover-box {
   position: absolute;
   border: 2px solid #ff6b6b;
-  background: rgba(255, 82, 82, 0.08);
+  border-radius: 3px;
+  background: rgba(255, 82, 82, 0.07);
+  box-shadow: 0 0 0 1px rgba(255, 107, 107, 0.25), 0 0 18px rgba(255, 82, 82, 0.22), inset 0 0 16px rgba(255, 82, 82, 0.05);
   pointer-events: none;
   box-sizing: border-box;
   display: none;
@@ -204,6 +257,8 @@
 .comet-el {
   position: absolute;
   border: 2px dashed #ff5252;
+  border-radius: 3px;
+  box-shadow: 0 0 14px rgba(255, 82, 82, 0.22), inset 0 0 13px rgba(255, 82, 82, 0.04);
   pointer-events: none;
   box-sizing: border-box;
 }
@@ -215,13 +270,14 @@
   min-width: 16px;
   height: 16px;
   border-radius: 50%;
-  background: #ff5252;
+  background: linear-gradient(180deg, #ff6e6e, #f23f3f);
   color: #ffffff;
   font: bold 10px/16px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   text-align: center;
   padding: 0 3px;
   box-sizing: border-box;
   white-space: nowrap;
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.30), 0 2px 6px rgba(0, 0, 0, 0.40), 0 0 11px rgba(255, 82, 82, 0.42);
 }
 
 /* ---- instruction chat card (bottom-right of viewport) ---- */
@@ -233,22 +289,34 @@
   width: 280px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px;
-  background: rgba(16, 18, 24, 0.95);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 10px;
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  gap: 9px;
+  padding: 12px;
+  background:
+    radial-gradient(120% 150% at 50% -30%, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0) 50%) padding-box,
+    linear-gradient(170deg, rgba(28, 31, 42, 0.84), rgba(12, 14, 19, 0.78)) padding-box,
+    linear-gradient(155deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.07) 32%, rgba(255, 255, 255, 0.02) 56%, rgba(0, 0, 0, 0.32)) border-box;
+  border: 1px solid transparent;
+  border-radius: 14px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.11),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.28),
+    0 0 0 1px rgba(0, 0, 0, 0.18),
+    0 22px 60px -16px rgba(0, 0, 0, 0.62),
+    0 8px 24px -8px rgba(0, 0, 0, 0.42);
+  -webkit-backdrop-filter: blur(18px) saturate(1.5);
+  backdrop-filter: blur(18px) saturate(1.5);
   font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  color: #e8eaed;
+  color: var(--bl-text, #eef1f6);
   pointer-events: auto;
 }
 .comet-chat[hidden] {
   display: none;
 }
 .comet-chat-head {
-  font-size: 12px;
-  color: #9aa0a6;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--bl-muted, #a3aab8);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -259,16 +327,18 @@
   max-height: 140px;
   resize: vertical;
   box-sizing: border-box;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 6px;
-  color: #e8eaed;
+  background: rgba(7, 9, 13, 0.50);
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 8px;
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.38), inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+  color: var(--bl-text, #eef1f6);
   font: inherit;
-  padding: 6px 8px;
+  padding: 7px 9px;
   outline: none;
 }
 .comet-chat-input:focus {
-  border-color: #4a9eff;
+  border-color: rgba(74, 158, 255, 0.65);
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.38), 0 0 0 3px rgba(74, 158, 255, 0.20), 0 0 14px rgba(74, 158, 255, 0.16);
 }
 .comet-chat-actions {
   display: flex;
@@ -276,45 +346,65 @@
   gap: 6px;
 }
 .comet-chat-add {
-  background: #4a9eff;
-  border-color: #4a9eff;
+  background: linear-gradient(180deg, #5cabff, #3f8ef7);
+  border-color: rgba(156, 204, 255, 0.65);
   color: #ffffff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 0 13px rgba(74, 158, 255, 0.33), 0 2px 8px rgba(74, 158, 255, 0.22);
+}
+/* Note mode (annotate tool): head label uses the annotation amber accent. */
+.comet-chat.comet-chat-note .comet-chat-head {
+  color: rgba(255, 209, 102, 0.95);
 }
 
 /* ---- element count chip in toolbar ---- */
 .comet-count {
   min-width: 64px;
   text-align: center;
-  font-size: 12px;
-  color: #9aa0a6;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  font-variant-numeric: tabular-nums;
+  color: var(--bl-muted, #a3aab8);
   white-space: nowrap;
 }
 
-/* ---- toolbar power / collapse / exit ---- */
-.comet-power:hover {
-  background: var(--bl-ok, #35c759);
-  border-color: var(--bl-ok, #35c759);
-  color: #07130a;
+/* ---- annotation note queue chip in toolbar ---- */
+.comet-note-count {
+  min-width: 40px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 209, 102, 0.9);
+  white-space: nowrap;
 }
-.comet-exit:hover {
-  background: var(--bl-err, #ff5252);
-  border-color: var(--bl-err, #ff5252);
-  color: #ffffff;
+.comet-note-count[hidden] {
+  display: none;
+}
+
+/* ---- toolbar power / collapse ---- */
+.comet-power:hover {
+  background: linear-gradient(180deg, #45d96f, #2bb84f);
+  border-color: rgba(163, 240, 183, 0.55);
+  color: #07130a;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 0 13px rgba(53, 199, 89, 0.38);
 }
 
 /* ---- drag handle (⋮⋮) ---- */
 .comet-drag {
   cursor: grab;
   padding: 4px 6px;
-  border-radius: 6px;
-  color: var(--bl-muted, #9aa0a6);
+  border-radius: 7px;
+  color: var(--bl-muted, #a3aab8);
   font-weight: 600;
   letter-spacing: 1px;
   touch-action: none;
 }
 .comet-drag:hover {
-  background: var(--bl-btn-hover, rgba(255, 255, 255, 0.14));
-  color: var(--bl-text, #e8eaed);
+  background: rgba(255, 255, 255, 0.10);
+  color: var(--bl-text, #eef1f6);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 .comet-drag.dragging,
 .comet-chip.dragging {
@@ -331,11 +421,19 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--bl-bg, rgba(16, 18, 24, 0.92));
-  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.14));
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
-  -webkit-backdrop-filter: blur(8px);
-  backdrop-filter: blur(8px);
+  background:
+    radial-gradient(120% 120% at 32% 24%, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0) 48%) padding-box,
+    linear-gradient(160deg, rgba(32, 36, 48, 0.86), rgba(12, 14, 19, 0.78)) padding-box,
+    linear-gradient(150deg, rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.07) 45%, rgba(0, 0, 0, 0.36)) border-box;
+  border: 1px solid transparent;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    inset 0 -2px 6px rgba(0, 0, 0, 0.30),
+    0 0 0 1px rgba(0, 0, 0, 0.18),
+    0 16px 40px -10px rgba(0, 0, 0, 0.60),
+    0 4px 14px rgba(0, 0, 0, 0.36);
+  -webkit-backdrop-filter: blur(16px) saturate(1.5);
+  backdrop-filter: blur(16px) saturate(1.5);
   cursor: pointer;
   pointer-events: auto;
   user-select: none;
@@ -344,13 +442,87 @@
 }
 .comet-chip:hover {
   border-color: var(--bl-accent, #4a9eff);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.20),
+    inset 0 -2px 6px rgba(0, 0, 0, 0.30),
+    0 0 0 1px rgba(74, 158, 255, 0.30),
+    0 20px 48px -12px rgba(0, 0, 0, 0.66),
+    0 0 22px rgba(74, 158, 255, 0.24);
 }
 .comet-chip-dot {
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  background: var(--bl-accent, #4a9eff);
-  box-shadow: 0 0 0 4px rgba(74, 158, 255, 0.25);
+  background: radial-gradient(circle at 35% 30%, #8dc2ff, #4a9eff 58%, #2f7fe8);
+  box-shadow: 0 0 0 4px rgba(74, 158, 255, 0.22), 0 0 13px rgba(74, 158, 255, 0.48);
+}
+
+/* ---- toolbar edge docking (main bar only; inspector has its own dock) ---- */
+.comet-toolbar.comet-dock-left,
+.comet-toolbar.comet-dock-right {
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 10px 8px;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.comet-toolbar.comet-dock-bottom {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 12px;
+}
+.comet-toolbar.comet-dock-left .comet-drag,
+.comet-toolbar.comet-dock-right .comet-drag {
+  transform: rotate(90deg);
+  letter-spacing: 0;
+  padding: 6px 4px;
+}
+.comet-toolbar.comet-dock-left .comet-mode-toggle,
+.comet-toolbar.comet-dock-right .comet-mode-toggle {
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+}
+.comet-toolbar.comet-dock-left .comet-mode-pill,
+.comet-toolbar.comet-dock-right .comet-mode-pill {
+  inset: 2px 2px auto 2px;
+  width: calc(100% - 4px);
+  height: calc(50% - 2px);
+  transform: translateY(0);
+}
+.comet-toolbar.comet-dock-left .comet-mode-btn,
+.comet-toolbar.comet-dock-right .comet-mode-btn {
+  width: 100%;
+  padding: 5px 8px;
+}
+.comet-toolbar.comet-dock-left .comet-swatch,
+.comet-toolbar.comet-dock-right .comet-swatch {
+  flex-direction: column;
+  padding: 6px 5px;
+}
+.comet-toolbar.comet-dock-left .comet-count,
+.comet-toolbar.comet-dock-right .comet-count {
+  writing-mode: horizontal-tb;
+  min-width: 0;
+  text-align: center;
+  white-space: normal;
+  line-height: 1.25;
+  max-width: 72px;
+}
+.comet-toolbar.comet-dock-left .status,
+.comet-toolbar.comet-dock-right .status {
+  min-width: 0;
+  text-align: center;
+  white-space: normal;
+  max-width: 72px;
+}
+.comet-toolbar.comet-fold-out {
+  will-change: transform, opacity, filter;
 }
 
 /* ---- element inspector panel (below the toolbar, max 320px) ---- */
@@ -362,16 +534,26 @@
   max-height: 60vh;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px;
-  background: var(--bl-bg, rgba(16, 18, 24, 0.95));
-  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
-  border-radius: 10px;
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
-  -webkit-backdrop-filter: blur(8px);
-  backdrop-filter: blur(8px);
+  gap: 9px;
+  padding: 12px;
+  background:
+    radial-gradient(135% 90% at 50% -12%, rgba(74, 158, 255, 0.11), rgba(74, 158, 255, 0) 46%) padding-box,
+    radial-gradient(120% 150% at 50% -30%, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0) 50%) padding-box,
+    linear-gradient(170deg, rgba(26, 30, 41, 0.84), rgba(11, 13, 18, 0.80)) padding-box,
+    linear-gradient(155deg, rgba(255, 255, 255, 0.30), rgba(255, 255, 255, 0.08) 30%, rgba(255, 255, 255, 0.02) 55%, rgba(0, 0, 0, 0.34)) border-box;
+  border: 1px solid transparent;
+  border-radius: 14px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.11),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.30),
+    0 0 0 1px rgba(0, 0, 0, 0.18),
+    0 30px 80px -18px rgba(0, 0, 0, 0.68),
+    0 10px 28px -8px rgba(0, 0, 0, 0.46),
+    0 0 25px -6px rgba(74, 158, 255, 0.10);
+  -webkit-backdrop-filter: blur(22px) saturate(1.6);
+  backdrop-filter: blur(22px) saturate(1.6);
   font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  color: var(--bl-text, #e8eaed);
+  color: var(--bl-text, #eef1f6);
   pointer-events: auto;
   user-select: none;
   -webkit-user-select: none;
@@ -379,17 +561,97 @@
 .comet-inspector[hidden] {
   display: none;
 }
+/* Docked state: JS (applyDock) sets the fixed offsets; these classes only
+ * soften the shadow so a docked panel reads as attached to the edge. */
+.comet-inspector.comet-insp-docked {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.11),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.30),
+    0 0 0 1px rgba(0, 0, 0, 0.18),
+    0 14px 40px -12px rgba(0, 0, 0, 0.55),
+    0 0 22px -6px rgba(74, 158, 255, 0.14);
+}
 .comet-insp-head {
-  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--bl-muted, #a3aab8);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+  padding-bottom: 8px;
+}
+.comet-insp-drag {
+  flex: 0 0 auto;
+  cursor: grab;
+  padding: 1px 5px;
+  border-radius: 6px;
   color: var(--bl-muted, #9aa0a6);
-  border-bottom: 1px solid var(--bl-border, rgba(255, 255, 255, 0.14));
-  padding-bottom: 6px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  touch-action: none;
+}
+.comet-insp-drag:hover {
+  background: rgba(255, 255, 255, 0.14);
+  color: #e8eaed;
+}
+.comet-insp-drag.dragging,
+.comet-inspector.dragging {
+  cursor: grabbing;
+}
+.comet-insp-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.comet-dock {
+  flex: 0 0 auto;
+  display: inline-flex;
+  gap: 2px;
+  align-items: center;
+}
+.comet-dock-btn {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--bl-muted, #9aa0a6);
+  font: 9px/1 system-ui, sans-serif;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.comet-dock-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+  color: #eef1f6;
+  border-color: rgba(255, 255, 255, 0.22);
+}
+.comet-dock-btn.active {
+  background: rgba(74, 158, 255, 0.28);
+  border-color: rgba(74, 158, 255, 0.75);
+  color: #fff;
+  box-shadow: 0 0 7px rgba(74, 158, 255, 0.28);
+}
+.comet-dock-btn:focus-visible {
+  outline: 1px solid rgba(74, 158, 255, 0.8);
+  outline-offset: 1px;
 }
 .comet-insp-rows {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 6px;
+  padding-right: 2px;
 }
 .comet-insp-cat-header {
   display: flex;
@@ -397,26 +659,28 @@
   gap: 6px;
   width: 100%;
   margin: 0;
-  padding: 4px 6px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--bl-text, #e8eaed);
-  font: 11px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  font-weight: 600;
-  letter-spacing: 0.02em;
+  padding: 5px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.02));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  color: var(--bl-text, #eef1f6);
+  font: 600 11px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   cursor: pointer;
   text-align: left;
 }
 .comet-insp-cat-header:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.035));
+  border-color: rgba(255, 255, 255, 0.13);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 4px 12px -4px rgba(0, 0, 0, 0.40);
 }
 .comet-insp-cat-chevron {
   display: inline-block;
   width: 10px;
   transform: rotate(90deg);
-  transition: transform 0.15s ease;
+  transition: transform 0.13s ease;
   color: var(--bl-muted, #9aa0a6);
 }
 .comet-insp-cat-header.is-collapsed .comet-insp-cat-chevron {
@@ -440,20 +704,29 @@
   gap: 6px;
   align-items: center;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: 8px;
   padding: 4px 6px;
 }
+.comet-insp-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
 .comet-insp-row.edited {
-  border-color: var(--bl-accent, #4a9eff);
-  background: rgba(74, 158, 255, 0.08);
+  border-color: rgba(74, 158, 255, 0.55);
+  background: rgba(74, 158, 255, 0.09);
+  box-shadow: inset 2px 0 0 0 var(--bl-accent, #4a9eff);
+}
+.comet-insp-row.edited:hover {
+  background: rgba(74, 158, 255, 0.13);
 }
 .comet-insp-row.hint-active {
   border-color: rgba(255, 209, 102, 0.7);
   background: rgba(255, 209, 102, 0.08);
+  box-shadow: inset 2px 0 0 0 rgba(255, 209, 102, 0.8);
 }
 .comet-insp-label {
   font-size: 11px;
-  color: var(--bl-muted, #9aa0a6);
+  letter-spacing: 0.02em;
+  color: var(--bl-muted, #a3aab8);
   text-transform: capitalize;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -469,6 +742,10 @@
   flex: 1 1 auto;
   min-width: 0;
   width: 100%;
+  height: 18px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
   accent-color: var(--bl-accent, #4a9eff);
   cursor: pointer;
 }
@@ -477,7 +754,11 @@
   min-width: 42px;
   text-align: right;
   font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: var(--bl-muted, #9aa0a6);
+  font-variant-numeric: tabular-nums;
+  color: #c6cedb;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 5px;
+  padding: 2px 6px;
 }
 .comet-insp-input,
 .comet-insp-select,
@@ -485,24 +766,36 @@
   min-width: 0;
   width: 100%;
   box-sizing: border-box;
-  background: var(--bl-btn-bg, rgba(255, 255, 255, 0.06));
-  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
-  border-radius: 4px;
-  color: var(--bl-text, #e8eaed);
+  background: rgba(7, 9, 13, 0.50);
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 6px;
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.35);
+  color: var(--bl-text, #eef1f6);
   font: inherit;
-  padding: 3px 5px;
+  padding: 4px 6px;
   outline: none;
 }
 .comet-insp-select {
+  appearance: none;
+  -webkit-appearance: none;
   cursor: pointer;
+  padding-right: 20px;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1l3 3 3-3' stroke='%23a3aab8' stroke-width='1.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 7px center,
+    rgba(7, 9, 13, 0.50);
+}
+.comet-insp-select option {
+  background: #14161d;
+  color: #eef1f6;
 }
 .comet-insp-color {
   width: 36px;
   height: 24px;
-  padding: 0;
-  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
-  border-radius: 4px;
-  background: transparent;
+  padding: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
   cursor: pointer;
 }
 .comet-insp-input:focus,
@@ -511,7 +804,237 @@
 .comet-insp-row.edited .comet-insp-input,
 .comet-insp-row.edited .comet-insp-select,
 .comet-insp-row.edited .comet-insp-textarea {
-  border-color: var(--bl-accent, #4a9eff);
+  border-color: rgba(74, 158, 255, 0.65);
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.35), 0 0 0 3px rgba(74, 158, 255, 0.18);
+}
+
+
+/* ---- premium Text category: Character + Paragraph groups (Adobe/Figma) ---- */
+.comet-insp-text-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: 2px 0 4px;
+}
+.comet-insp-text-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 9px 9px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.085);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.052), rgba(255, 255, 255, 0.018)),
+    rgba(7, 9, 13, 0.24);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.055),
+    0 1px 0 rgba(0, 0, 0, 0.20);
+}
+.comet-insp-text-group-label {
+  display: flex;
+  align-items: center;
+  min-height: 18px;
+  margin-bottom: 0;
+  padding: 0 2px 5px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.075);
+  color: var(--bl-muted, #a3aab8);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.11em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+.comet-insp-text-twin,
+.comet-insp-text-metrics {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+  min-width: 0;
+}
+.comet-insp-text-metrics {
+  margin-top: 2px;
+  padding: 6px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.comet-insp-text-cell {
+  min-width: 0;
+}
+.comet-insp-text-cell .comet-insp-row {
+  margin: 0;
+}
+.comet-insp-text-panel .comet-insp-row {
+  grid-template-columns: 60px minmax(0, 1fr) 40px;
+  column-gap: 8px;
+  row-gap: 4px;
+  align-items: center;
+  min-width: 0;
+  min-height: 36px;
+  margin: 0;
+  padding: 4px;
+  border-radius: 8px;
+}
+.comet-insp-text-panel .comet-insp-label {
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  width: auto;
+  min-width: 0;
+  color: #aeb7c6;
+  font-size: 10px;
+  line-height: 1.2;
+  letter-spacing: 0.015em;
+  text-transform: none;
+}
+.comet-insp-text-panel .comet-insp-control {
+  width: 100%;
+  min-width: 0;
+}
+.comet-insp-text-panel .comet-insp-slider-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 54px;
+  gap: 8px;
+  align-items: center;
+}
+.comet-insp-text-panel .comet-insp-row-slider {
+  min-height: 38px;
+}
+.comet-insp-text-panel .comet-insp-row-select .comet-insp-control,
+.comet-insp-text-panel .comet-insp-row-color .comet-insp-control,
+.comet-insp-row-seg .comet-insp-control {
+  min-height: 28px;
+  align-items: center;
+}
+.comet-insp-text-panel .comet-insp-reset {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 28px;
+  padding: 0;
+  opacity: 0.78;
+}
+.comet-insp-text-panel .comet-insp-reset:hover,
+.comet-insp-text-panel .comet-insp-reset:focus-visible {
+  opacity: 1;
+}
+.comet-insp-seg-source {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+}
+.comet-insp-seg {
+  display: inline-flex;
+  align-items: stretch;
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  box-sizing: border-box;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 6px;
+  background: rgba(4, 6, 10, 0.36);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.045),
+    inset 0 -1px 2px rgba(0, 0, 0, 0.28);
+}
+.comet-insp-seg-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: 1 1 0;
+  min-width: 22px;
+  height: 100%;
+  margin: 0;
+  padding: 0 4px;
+  border: none;
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0;
+  background: transparent;
+  color: #c7cfdb;
+  font: 10px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+.comet-insp-seg-btn:last-child {
+  border-right: none;
+}
+.comet-insp-seg-btn:hover {
+  background: rgba(74, 158, 255, 0.13);
+  color: #f4f7fb;
+}
+.comet-insp-seg-btn.active {
+  background: linear-gradient(180deg, #5cabff, #3f8ef7);
+  color: #fff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+.comet-insp-seg-btn[data-insp-fmt="fontStyle"][data-on-value="italic"],
+.comet-insp-fmt-btn[data-insp-fmt="fontStyle"] {
+  font-style: italic;
+}
+.comet-insp-seg-btn[data-insp-fmt="textDecoration"][data-on-value="underline"] {
+  text-decoration: underline;
+}
+.comet-insp-seg-btn[data-insp-fmt="textDecoration"][data-on-value="line-through"] {
+  text-decoration: line-through;
+}
+.comet-insp-text-panel .comet-insp-slider {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+.comet-insp-text-panel .comet-insp-val {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  width: 54px;
+  min-width: 54px;
+  max-width: 54px;
+  height: 28px;
+  box-sizing: border-box;
+  overflow: hidden;
+  padding: 0 7px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 6px;
+  background: rgba(4, 6, 10, 0.34);
+  color: #d3d9e3;
+  font: 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.comet-insp-text-panel .comet-insp-select,
+.comet-insp-text-panel .comet-insp-input {
+  height: 28px;
+  padding-top: 0;
+  padding-bottom: 0;
+  font-size: 11px;
+  line-height: 1.2;
+}
+.comet-insp-text-panel .comet-insp-color {
+  width: 100%;
+  height: 28px;
+  box-sizing: border-box;
+}
+.comet-insp-text-panel .comet-insp-row.edited {
+  box-shadow: inset 2px 0 0 0 var(--bl-accent, #4a9eff);
+}
+@media (prefers-reduced-motion: reduce) {
+  .comet-insp-seg-btn,
+  .comet-insp-text-group {
+    transition: none !important;
+  }
 }
 
 /* ---- v1.5 multiline text editor + formatting toolbar ---- */
@@ -555,10 +1078,11 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
-  border-radius: 4px;
-  background: var(--bl-btn-bg, rgba(255, 255, 255, 0.06));
-  color: var(--bl-text, #e8eaed);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 5px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.02));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  color: var(--bl-text, #eef1f6);
   font: 11px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   cursor: pointer;
 }
@@ -572,19 +1096,21 @@
   text-decoration: underline;
 }
 .comet-insp-fmt-btn:hover {
-  border-color: var(--bl-accent, #4a9eff);
+  border-color: rgba(74, 158, 255, 0.60);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 0 9px rgba(74, 158, 255, 0.18);
 }
 .comet-insp-fmt-btn.active {
-  background: var(--bl-accent, #4a9eff);
-  border-color: var(--bl-accent, #4a9eff);
+  background: linear-gradient(180deg, #5cabff, #3f8ef7);
+  border-color: rgba(156, 204, 255, 0.65);
   color: #fff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 0 9px rgba(74, 158, 255, 0.33);
 }
 .comet-insp-fmt-align {
   display: inline-flex;
   align-items: center;
   gap: 0;
-  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
-  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 5px;
   overflow: hidden;
 }
 .comet-insp-fmt-align-btn {
@@ -592,7 +1118,7 @@
   height: 22px;
   border: none;
   border-radius: 0;
-  border-right: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
 }
 .comet-insp-fmt-align-btn:last-child {
   border-right: none;
@@ -616,16 +1142,17 @@
   white-space: nowrap;
 }
 .comet-insp-reset:hover {
-  color: var(--bl-err, #ff5252);
-  background: rgba(255, 82, 82, 0.12);
-  border-color: rgba(255, 82, 82, 0.25);
+  color: #ff7b7b;
+  background: rgba(255, 82, 82, 0.14);
+  border-color: rgba(255, 82, 82, 0.30);
 }
 .comet-insp-foot {
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  border-top: 1px solid var(--bl-border, rgba(255, 255, 255, 0.14));
-  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.09);
+  padding-top: 10px;
 }
 .comet-insp-foot-meta {
   display: flex;
@@ -635,25 +1162,217 @@
 }
 .comet-insp-count {
   font-size: 11px;
-  color: var(--bl-muted, #9aa0a6);
+  letter-spacing: 0.03em;
+  font-variant-numeric: tabular-nums;
+  color: var(--bl-muted, #a3aab8);
 }
 .comet-insp-reset-all {
   appearance: none;
   -webkit-appearance: none;
-  border: 1px solid var(--bl-border, rgba(255, 255, 255, 0.16));
-  background: var(--bl-btn-bg, rgba(255, 255, 255, 0.06));
-  color: var(--bl-text, #e8eaed);
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.02));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  color: var(--bl-text, #eef1f6);
   cursor: pointer;
   font: 11px system-ui, -apple-system, sans-serif;
-  padding: 3px 8px;
-  border-radius: 4px;
+  letter-spacing: 0.02em;
+  padding: 4px 9px;
+  border-radius: 6px;
 }
 .comet-insp-reset-all:hover {
-  border-color: var(--bl-err, #ff5252);
-  color: var(--bl-err, #ff5252);
+  border-color: rgba(255, 82, 82, 0.55);
+  color: #ff7b7b;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 0 11px rgba(255, 82, 82, 0.16);
 }
-.comet-insp-send {
+
+/* Add button: bottom-right of the inspector footer, under the textarea. */
+.comet-insp-add {
+  appearance: none;
+  -webkit-appearance: none;
   align-self: flex-end;
+  margin-left: auto;
+  border: 1px solid rgba(74, 158, 255, 0.45);
+  background: linear-gradient(180deg, rgba(74, 158, 255, 0.28), rgba(74, 158, 255, 0.12));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  color: #eaf2ff;
+  cursor: pointer;
+  font: 600 12px system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.02em;
+  padding: 5px 16px;
+  border-radius: 7px;
+  transition: transform 0.13s ease, opacity 0.13s ease, border-color 0.13s ease;
+}
+.comet-insp-add:hover:not(.is-disabled) {
+  border-color: rgba(74, 158, 255, 0.8);
+  background: linear-gradient(180deg, rgba(74, 158, 255, 0.38), rgba(74, 158, 255, 0.18));
+  transform: translateY(-1px);
+}
+.comet-insp-add:active:not(.is-disabled) {
+  transform: scale(0.97);
+}
+.comet-insp-add.is-disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--bl-muted, #9aa0a6);
+}
+
+/* Corner resize handle: bottom-right, window-like size pulling. */
+.comet-insp-resize {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 14px;
+  height: 14px;
+  cursor: nwse-resize;
+  pointer-events: auto;
+  z-index: 3;
+  background:
+    linear-gradient(135deg, transparent 0 55%, rgba(148, 197, 233, 0.55) 55% 62%, transparent 62%) no-repeat right 3px bottom 3px / 7px 7px;
+  opacity: 0.55;
+  transition: opacity 0.13s ease;
+}
+.comet-insp-resize:hover {
+  opacity: 1;
+}
+.comet-insp-resize::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle at 78% 78%, rgba(125, 211, 252, 0.18), transparent 70%);
+}
+
+/* Cursor glow: feathered radial that follows the pointer inside the panel.
+   The panel's backdrop-filter creates a stacking context, so z-index -1
+   paints above the glass background but below every control and label. */
+.comet-insp-glow {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: -1;
+  opacity: 0;
+  background: radial-gradient(120px circle at var(--cx, 50%) var(--cy, 50%),
+    rgba(125, 211, 252, 0.095),
+    rgba(125, 211, 252, 0.0475) 40%,
+    transparent 70%);
+  transition: opacity 0.15s ease;
+}
+
+/* No horizontal scroll anywhere in the inspector; flex children keep form. */
+.comet-insp-rows,
+.comet-selection-list,
+.comet-insp-foot {
+  overflow-x: hidden;
+}
+.comet-insp-foot,
+.comet-insp-rows,
+.comet-selection-list,
+.comet-insp-foot-meta,
+.comet-insp-instr {
+  min-width: 0;
+}
+.comet-inspector {
+  min-width: 280px;
+  min-height: 240px;
+}
+
+/* ---- premium glass utility layer: scrollbars, range thumbs, placeholders,
+ * focus rings. Appearance only; no layout or behavior changes. ---- */
+.comet-insp-rows::-webkit-scrollbar,
+.comet-selection-list::-webkit-scrollbar,
+.comet-insp-textarea::-webkit-scrollbar {
+  width: 9px;
+}
+.comet-insp-rows::-webkit-scrollbar-track,
+.comet-selection-list::-webkit-scrollbar-track,
+.comet-insp-textarea::-webkit-scrollbar-track {
+  background: transparent;
+}
+.comet-insp-rows::-webkit-scrollbar-thumb,
+.comet-selection-list::-webkit-scrollbar-thumb,
+.comet-insp-textarea::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.comet-insp-rows::-webkit-scrollbar-thumb:hover,
+.comet-selection-list::-webkit-scrollbar-thumb:hover,
+.comet-insp-textarea::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.26);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.comet-chat-input::placeholder,
+.comet-insp-textarea::placeholder {
+  color: rgba(163, 170, 184, 0.55);
+}
+
+.comet-insp-slider::-webkit-slider-runnable-track {
+  box-sizing: border-box;
+  height: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.15), rgba(255, 255, 255, 0.08));
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.50),
+    0 1px 0 rgba(255, 255, 255, 0.025);
+}
+.comet-insp-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  border: 1px solid rgba(255, 255, 255, 0.68);
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #ffffff, #dceaff 50%, #4a9eff 140%);
+  box-shadow:
+    0 2px 5px rgba(0, 0, 0, 0.52),
+    0 0 7px rgba(74, 158, 255, 0.28);
+}
+.comet-insp-slider:hover::-webkit-slider-runnable-track {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.19), rgba(74, 158, 255, 0.12));
+}
+.comet-insp-slider:hover::-webkit-slider-thumb {
+  border-color: rgba(190, 221, 255, 0.88);
+  box-shadow:
+    0 2px 5px rgba(0, 0, 0, 0.52),
+    0 0 8px rgba(74, 158, 255, 0.34);
+}
+.comet-insp-slider:focus-visible {
+  outline: none;
+}
+.comet-insp-slider:focus-visible::-webkit-slider-thumb {
+  box-shadow:
+    0 2px 5px rgba(0, 0, 0, 0.52),
+    0 0 0 3px rgba(74, 158, 255, 0.25),
+    0 0 9px rgba(74, 158, 255, 0.36);
+}
+
+.comet-insp-color::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+.comet-insp-color::-webkit-color-swatch {
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 4px;
+}
+
+.comet-btn:focus-visible,
+.comet-swatch:focus-visible,
+.comet-width:focus-visible,
+.comet-insp-cat-header:focus-visible,
+.comet-insp-fmt-btn:focus-visible,
+.comet-insp-reset:focus-visible,
+.comet-insp-reset-all:focus-visible,
+.comet-selection-main:focus-visible,
+.comet-selection-remove:focus-visible {
+  outline: 2px solid rgba(74, 158, 255, 0.70);
+  outline-offset: 2px;
 }
 
 /* ---- v1.4 motion + multi-selection UI ----
@@ -661,7 +1380,7 @@
  * sizing of the picker overlays are updated by content.js from live rects;
  * the page layout itself is never animated. */
 #hermes-annotate-host {
-  transition: transform 180ms ease-out, opacity 180ms ease-out;
+  transition: transform 155ms ease-out, opacity 155ms ease-out;
 }
 #hermes-annotate-host.is-entering {
   opacity: 0;
@@ -688,7 +1407,7 @@
 .comet-selection-main,
 .comet-selection-remove,
 .comet-send {
-  transition: transform 120ms ease-out, opacity 120ms ease-out;
+  transition: transform 100ms ease-out, opacity 100ms ease-out;
 }
 .comet-btn:hover,
 .comet-swatch:hover,
@@ -707,50 +1426,135 @@
   transform: scale(0.94);
 }
 
+/* ---- premium glass: extended transitions + hover lift. Redeclares the v1.4
+ * transform/opacity transitions with added shadow/border/background easing;
+ * same timings, strictly additive. ---- */
+.comet-btn,
+.comet-swatch,
+.comet-width,
+.comet-drag,
+.comet-insp-reset,
+.comet-insp-reset-all,
+.comet-selection-main,
+.comet-selection-remove,
+.comet-send {
+  transition: transform 100ms ease-out, opacity 100ms ease-out,
+              box-shadow 155ms ease, border-color 155ms ease,
+              background-color 155ms ease;
+}
+.comet-toolbar,
+.comet-chip {
+  transition: transform 100ms ease-out, opacity 100ms ease-out,
+              box-shadow 190ms ease, border-color 190ms ease;
+}
+.comet-insp-cat-header,
+.comet-insp-fmt-btn {
+  transition: transform 100ms ease-out, box-shadow 135ms ease,
+              border-color 135ms ease, background-color 135ms ease;
+}
+.comet-insp-row,
+.comet-chat-input,
+.comet-insp-input,
+.comet-insp-select,
+.comet-insp-textarea,
+.comet-insp-slider {
+  transition: box-shadow 135ms ease, border-color 135ms ease,
+              background-color 135ms ease;
+}
+.comet-insp-cat-header:hover,
+.comet-insp-fmt-btn:hover,
+.comet-insp-reset-all:hover {
+  transform: translateY(-1px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .comet-btn,
+  .comet-swatch,
+  .comet-width,
+  .comet-drag,
+  .comet-insp-reset,
+  .comet-insp-reset-all,
+  .comet-selection-main,
+  .comet-selection-remove,
+  .comet-send,
+  .comet-toolbar,
+  .comet-chip,
+  .comet-insp-cat-header,
+  .comet-insp-fmt-btn,
+  .comet-insp-row,
+  .comet-chat-input,
+  .comet-insp-input,
+  .comet-insp-select,
+  .comet-insp-textarea,
+  .comet-insp-slider {
+    transition: none;
+  }
+  .comet-insp-cat-header:hover,
+  .comet-insp-fmt-btn:hover,
+  .comet-insp-reset-all:hover {
+    transform: none;
+  }
+}
+
 /* Sliding pill mode switch. The buttons retain their old data-act hooks. */
 .comet-mode-toggle {
   position: relative;
   display: inline-flex;
   align-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 9px;
   padding: 2px;
   isolation: isolate;
+  background: rgba(7, 9, 13, 0.42);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.38);
 }
 .comet-mode-pill {
   position: absolute;
-  z-index: -1;
+  z-index: 0;
   inset: 2px auto 2px 2px;
   width: calc(50% - 2px);
-  border-radius: 5px;
-  background: #4a9eff;
+  border-radius: 6px;
+  background: linear-gradient(180deg, #5cabff, #3f8ef7);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 0 11px rgba(74, 158, 255, 0.42);
   transform: translateX(0);
-  transition: transform 180ms ease-out, opacity 180ms ease-out;
+  transition: transform 155ms ease-out, opacity 155ms ease-out;
 }
 .comet-mode-btn {
   position: relative;
   z-index: 1;
+  flex: 1 1 0;
+  min-width: 0;
+  text-align: center;
+  white-space: nowrap;
   border-color: transparent;
   background: transparent;
-  padding: 3px 8px;
+  box-shadow: none;
+  padding: 3px 6px;
+  font-size: 14px;
+  letter-spacing: 0;
+  color: #c7cdd8;
+  font-weight: 600;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
 }
 .comet-mode-btn.active {
   background: transparent;
   border-color: transparent;
+  box-shadow: none;
   color: #ffffff;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
 }
 
 /* Toolbar collapse, chip bounce, and drag shadow lift. */
 .comet-toolbar.is-collapsing {
   transform: scale(0.9);
   opacity: 0;
-  transition-duration: 200ms;
+  transition-duration: 170ms;
 }
 .comet-toolbar.is-restoring {
-  animation: bl-toolbar-in 200ms ease-out both;
+  animation: bl-toolbar-in 170ms ease-out both;
 }
 .comet-chip.is-chip-enter {
-  animation: bl-chip-pop 200ms ease-out both;
+  animation: bl-chip-pop 170ms ease-out both;
 }
 .comet-chip-dot {
   animation: bl-chip-breathe 3s ease-in-out infinite;
@@ -765,7 +1569,7 @@
 .comet-inspector {
   opacity: 0;
   transform: translateY(-8px);
-  transition: transform 200ms ease-out, opacity 200ms ease-out;
+  transition: transform 170ms ease-out, opacity 170ms ease-out;
 }
 .comet-inspector.is-open {
   opacity: 1;
@@ -773,7 +1577,7 @@
 }
 .comet-insp-row {
   position: relative;
-  animation: bl-row-in 240ms ease-out var(--row-delay, 0ms) both;
+  animation: bl-row-in 205ms ease-out var(--row-delay, 0ms) both;
 }
 .comet-insp-row::after {
   content: '';
@@ -804,9 +1608,10 @@
   min-height: 18px;
 }
 .comet-selection-count {
-  color: var(--bl-text, #e8eaed);
+  color: var(--bl-text, #eef1f6);
   font-size: 11px;
   font-weight: 600;
+  letter-spacing: 0.03em;
   transform-origin: left center;
 }
 .comet-selection-count.selection-pop {
@@ -818,17 +1623,23 @@
   gap: 3px;
   max-height: 116px;
   overflow-y: auto;
+  padding-right: 2px;
 }
 .comet-selection-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 4px;
   min-width: 0;
+  border-radius: 6px;
   animation: bl-row-in 200ms ease-out var(--row-delay, 0ms) both;
 }
+.comet-selection-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
 .comet-selection-row.active {
-  background: rgba(74, 158, 255, 0.1);
-  border-radius: 5px;
+  background: linear-gradient(90deg, rgba(74, 158, 255, 0.16), rgba(74, 158, 255, 0.05));
+  box-shadow: inset 2px 0 0 0 var(--bl-accent, #4a9eff);
 }
 .comet-selection-main {
   appearance: none;
@@ -846,6 +1657,19 @@
   white-space: nowrap;
   cursor: pointer;
 }
+.comet-selection-note {
+  display: block;
+  flex: 1 0 100%;
+  max-width: 100%;
+  margin-top: 2px;
+  padding-left: 5px;
+  color: var(--bl-muted, #a3aab8);
+  font-size: 11px;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .comet-selection-remove {
   appearance: none;
   flex: 0 0 auto;
@@ -858,7 +1682,8 @@
   font: 14px/1 system-ui, sans-serif;
 }
 .comet-selection-remove:hover {
-  color: var(--bl-err, #ff5252);
+  color: #ff7b7b;
+  background: rgba(255, 82, 82, 0.12);
 }
 .comet-selection-row.is-removing {
   animation: bl-row-remove 120ms ease-out both;
@@ -871,7 +1696,7 @@
   animation: bl-marker-remove 100ms ease-out both;
 }
 
-/* Send feedback and the transient Sent toast. */
+/* Send feedback, the send-away collapse, and the top-center confirmation toast. */
 .comet-send {
   position: relative;
   overflow: hidden;
@@ -888,32 +1713,62 @@
 .comet-send.send-error {
   animation: bl-send-error 300ms ease-out both;
 }
-.comet-toast {
+/* Toolbar Send button collapses away 2.5s after a successful send (JS adds
+ * comet-send-away, then display:none); it returns when new strokes/elements
+ * exist. */
+.comet-toolbar .comet-send {
+  max-width: 140px;
+}
+.comet-send.comet-send-away {
+  animation: comet-send-away 240ms cubic-bezier(0.5, 0, 0.75, 0) both;
+  transform-origin: right center;
+  pointer-events: none;
+}
+@keyframes comet-send-away {
+  to {
+    opacity: 0;
+    transform: scaleX(0.7);
+    max-width: 0;
+    padding-left: 0;
+    padding-right: 0;
+  }
+}
+/* Send confirmation toast: independent of the toolbar, top-center, timed.
+ * Pops in (scale/fade), holds ~1.4s (JS timer), then slides up and vanishes. */
+.comet-sent-toast {
   position: fixed;
-  right: 16px;
-  bottom: 16px;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
   z-index: 2147483647;
-  padding: 7px 11px;
+  padding: 7px 14px;
   border: 1px solid rgba(53, 199, 89, 0.5);
-  border-radius: 7px;
+  border-radius: 999px;
   background: rgba(16, 18, 24, 0.95);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35), 0 0 11px rgba(53, 199, 89, 0.18);
   color: #7ff095;
-  font: 12px/1.2 system-ui, -apple-system, sans-serif;
+  font: 600 12px/1.3 system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
   pointer-events: none;
   opacity: 0;
-  transform: translateY(8px);
-  transition: transform 150ms ease-out, opacity 150ms ease-out;
 }
-.comet-toast[hidden] {
+.comet-sent-toast[hidden] {
   display: none;
 }
-.comet-toast.visible {
-  opacity: 1;
-  transform: translateY(0);
+.comet-sent-toast.comet-sent-in {
+  animation: comet-sent-in 180ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
 }
-.comet-toast.leaving {
-  opacity: 0;
-  transform: translateY(8px);
+.comet-sent-toast.comet-sent-out {
+  animation: comet-sent-out 200ms ease-in both;
+}
+@keyframes comet-sent-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(-6px) scale(0.85); }
+  to { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+}
+@keyframes comet-sent-out {
+  from { opacity: 1; transform: translateX(-50%) translateY(0); }
+  to { opacity: 0; transform: translateX(-50%) translateY(-12px); }
 }
 
 @keyframes bl-toolbar-in {
@@ -993,4 +1848,799 @@
   .comet-insp-cat-chevron {
     transition: none !important;
   }
+}
+
+/* ==================== appended: send pulse + inspector enter/exit =========== */
+/* Energy pulse: a ring radiates from the Send button center while the
+ * annotation round-trip is in flight. The JS anchors it to the shadow root
+ * with position:fixed (viewport coords) so it escapes the button's
+ * overflow:hidden. Reduced motion skips it entirely in JS. */
+.comet-send-pulse {
+  position: fixed;
+  z-index: 2147483647;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(144, 255, 168, 0.88) 0%, rgba(53, 199, 89, 0.34) 55%, rgba(53, 199, 89, 0) 75%);
+  box-shadow: 0 0 9px rgba(144, 255, 168, 0.72), 0 0 22px rgba(53, 199, 89, 0.48);
+  pointer-events: none;
+}
+.comet-send-pulse.comet-send-pulse-run {
+  animation: comet-send-pulse 650ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.comet-send-pulse.comet-send-pulse-fail {
+  animation: comet-send-pulse-fail 180ms ease-out both;
+}
+@keyframes comet-send-pulse {
+  0% { opacity: 0.9; transform: scale(0.15); }
+  30% { opacity: 0.85; }
+  100% { opacity: 0; transform: scale(15); }
+}
+@keyframes comet-send-pulse-fail {
+  from { opacity: 0.65; transform: scale(0.9); }
+  to { opacity: 0; transform: scale(1.6); }
+}
+
+/* Inspector enter/exit (fold): the panel folds open from its anchor side -
+ * the viewport side of the selected element, or the dock edge when docked -
+ * and collapses back toward it on close. Direction class comet-insp-from-*
+ * picks the transform origin + travel; every keyframe end state equals the
+ * resting state so removing the animation class causes no pop. Subtle and
+ * short (<=300ms, cubic-bezier ease-out). Reduced motion skips these (JS
+ * guards + the global media query above). */
+.comet-inspector.comet-insp-from-left { transform-origin: left center; }
+.comet-inspector.comet-insp-from-right { transform-origin: right center; }
+.comet-inspector.comet-insp-from-top { transform-origin: center top; }
+.comet-inspector.comet-insp-from-bottom { transform-origin: center bottom; }
+.comet-inspector.comet-insp-from-left.comet-insp-open { animation: comet-insp-fold-left 280ms cubic-bezier(0.22, 0.9, 0.32, 1) both; }
+.comet-inspector.comet-insp-from-right.comet-insp-open { animation: comet-insp-fold-right 280ms cubic-bezier(0.22, 0.9, 0.32, 1) both; }
+.comet-inspector.comet-insp-from-top.comet-insp-open { animation: comet-insp-fold-top 280ms cubic-bezier(0.22, 0.9, 0.32, 1) both; }
+.comet-inspector.comet-insp-from-bottom.comet-insp-open { animation: comet-insp-fold-bottom 280ms cubic-bezier(0.22, 0.9, 0.32, 1) both; }
+.comet-inspector.comet-insp-from-left.comet-insp-close { animation: comet-insp-unfold-left 200ms cubic-bezier(0.5, 0, 0.75, 0.4) both; }
+.comet-inspector.comet-insp-from-right.comet-insp-close { animation: comet-insp-unfold-right 200ms cubic-bezier(0.5, 0, 0.75, 0.4) both; }
+.comet-inspector.comet-insp-from-top.comet-insp-close { animation: comet-insp-unfold-top 200ms cubic-bezier(0.5, 0, 0.75, 0.4) both; }
+.comet-inspector.comet-insp-from-bottom.comet-insp-close { animation: comet-insp-unfold-bottom 200ms cubic-bezier(0.5, 0, 0.75, 0.4) both; }
+@keyframes comet-insp-fold-left {
+  0% {
+    opacity: 0;
+    transform: translateX(-26px) scaleX(0.3) scaleY(0.92);
+    filter: drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+  60% {
+    opacity: 1;
+    transform: translateX(4px) scaleX(1.04) scaleY(1);
+    filter: drop-shadow(0 0 13px rgba(74, 158, 255, 0.33));
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+    filter: drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+}
+@keyframes comet-insp-fold-right {
+  0% {
+    opacity: 0;
+    transform: translateX(26px) scaleX(0.3) scaleY(0.92);
+    filter: drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+  60% {
+    opacity: 1;
+    transform: translateX(-4px) scaleX(1.04) scaleY(1);
+    filter: drop-shadow(0 0 13px rgba(74, 158, 255, 0.33));
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+    filter: drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+}
+@keyframes comet-insp-fold-top {
+  0% {
+    opacity: 0;
+    transform: translateY(-26px) scaleY(0.3) scaleX(0.92);
+    filter: drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+  60% {
+    opacity: 1;
+    transform: translateY(4px) scaleY(1.04) scaleX(1);
+    filter: drop-shadow(0 0 13px rgba(74, 158, 255, 0.33));
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+}
+@keyframes comet-insp-fold-bottom {
+  0% {
+    opacity: 0;
+    transform: translateY(26px) scaleY(0.3) scaleX(0.92);
+    filter: drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+  60% {
+    opacity: 1;
+    transform: translateY(-4px) scaleY(1.04) scaleX(1);
+    filter: drop-shadow(0 0 13px rgba(74, 158, 255, 0.33));
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+}
+@keyframes comet-insp-unfold-left {
+  0% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(-22px) scaleX(0.35) scaleY(0.92);
+  }
+}
+@keyframes comet-insp-unfold-right {
+  0% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(22px) scaleX(0.35) scaleY(0.92);
+  }
+}
+@keyframes comet-insp-unfold-top {
+  0% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-22px) scaleY(0.35) scaleX(0.92);
+  }
+}
+@keyframes comet-insp-unfold-bottom {
+  0% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(22px) scaleY(0.35) scaleX(0.92);
+  }
+}
+
+/* ==================== appended: inspector devtool categories ================ */
+/* Selectors / Computed / Size & Position - compact read-only readouts. */
+.comet-insp-dev-row {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+.comet-insp-dev-row-actions {
+  grid-template-columns: 1fr;
+  padding-top: 2px;
+  padding-bottom: 4px;
+}
+.comet-insp-mono {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--bl-text, #eef1f6);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 5px;
+  padding: 3px 6px;
+}
+.comet-insp-copy,
+.comet-insp-reveal {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--bl-muted, #9aa0a6);
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1.2;
+  padding: 3px 7px;
+  border-radius: 5px;
+  white-space: nowrap;
+}
+.comet-insp-copy:hover,
+.comet-insp-reveal:hover {
+  color: #eef1f6;
+  background: rgba(74, 158, 255, 0.18);
+  border-color: rgba(74, 158, 255, 0.55);
+}
+.comet-insp-copy.is-copied {
+  color: #90ffa8;
+  background: rgba(53, 199, 89, 0.16);
+  border-color: rgba(53, 199, 89, 0.55);
+}
+.comet-insp-reveal {
+  width: 100%;
+  text-align: center;
+  color: var(--bl-text, #eef1f6);
+}
+.comet-insp-computed {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 8px;
+  padding: 2px 6px 4px;
+}
+.comet-insp-computed-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  padding: 3px 4px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+.comet-insp-computed-key {
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  color: var(--bl-muted, #9aa0a6);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.comet-insp-computed-val {
+  font: 10px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--bl-text, #eef1f6);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.comet-insp-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+  padding: 2px 6px 4px;
+}
+.comet-insp-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  padding: 3px 4px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+.comet-insp-metric-wide {
+  grid-column: 1 / -1;
+}
+.comet-insp-metric-key {
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--bl-muted, #9aa0a6);
+}
+.comet-insp-metric-val {
+  font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--bl-text, #eef1f6);
+}
+.comet-el.comet-el-reveal-pulse {
+  animation: comet-el-reveal-pulse 700ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes comet-el-reveal-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(74, 158, 255, 0.48), 0 0 14px rgba(255, 82, 82, 0.22);
+    border-color: #4a9eff;
+  }
+  45% {
+    box-shadow: 0 0 0 8px rgba(74, 158, 255, 0.12), 0 0 20px rgba(74, 158, 255, 0.28);
+    border-color: #90c8ff;
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(74, 158, 255, 0), 0 0 14px rgba(255, 82, 82, 0.22);
+    border-color: #ff5252;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .comet-el.comet-el-reveal-pulse {
+    animation: none !important;
+  }
+}
+
+/* ==================== Apple-grade motion elevation ======================== */
+/* Spring-like cubic-bezier family, 150-320ms. Layered scale/translate/opacity
+ * (+ slight blur on panel reveals). Pressed state scale(0.97). Does NOT touch
+ * .comet-insp-* text-control layout. Reduced-motion block below nukes these. */
+:host, #hermes-annotate-host, .comet-toolbar, .comet-inspector, .comet-chat {
+  --bl-ease-spring: cubic-bezier(0.2, 0.9, 0.3, 1.15);
+  --bl-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --bl-ease-soft: cubic-bezier(0.22, 0.9, 0.32, 1);
+  --bl-ease-exit: cubic-bezier(0.5, 0, 0.75, 0.4);
+  --bl-dur-fast: 160ms;
+  --bl-dur: 240ms;
+  --bl-dur-panel: 280ms;
+}
+
+#hermes-annotate-host {
+  transition: transform var(--bl-dur) var(--bl-ease-spring),
+              opacity var(--bl-dur) var(--bl-ease-out),
+              filter var(--bl-dur) var(--bl-ease-soft);
+}
+#hermes-annotate-host.is-entering {
+  opacity: 0;
+  transform: translateY(-10px) scale(0.98);
+  filter: blur(2px);
+}
+#hermes-annotate-host.is-entered {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  filter: blur(0);
+}
+#hermes-annotate-host.is-exiting {
+  opacity: 0;
+  transform: scale(0.96) translateY(-4px);
+  filter: blur(1.5px);
+  transition-duration: 180ms;
+  transition-timing-function: var(--bl-ease-exit);
+}
+
+.comet-toolbar,
+.comet-chip,
+.comet-btn,
+.comet-swatch,
+.comet-width,
+.comet-drag,
+.comet-insp-reset,
+.comet-insp-reset-all,
+.comet-selection-main,
+.comet-selection-remove,
+.comet-send,
+.comet-dock-btn,
+.comet-insp-copy,
+.comet-insp-reveal,
+.comet-mode-btn,
+.comet-insp-cat-header,
+.comet-insp-fmt-btn {
+  transition: transform var(--bl-dur-fast) var(--bl-ease-spring),
+              opacity var(--bl-dur-fast) var(--bl-ease-out),
+              box-shadow var(--bl-dur) var(--bl-ease-soft),
+              border-color var(--bl-dur) var(--bl-ease-soft),
+              background-color var(--bl-dur) var(--bl-ease-soft),
+              color var(--bl-dur-fast) var(--bl-ease-out);
+}
+.comet-btn:hover,
+.comet-swatch:hover,
+.comet-width:hover,
+.comet-selection-main:hover,
+.comet-selection-remove:hover,
+.comet-dock-btn:hover,
+.comet-insp-copy:hover,
+.comet-insp-reveal:hover,
+.comet-mode-btn:hover {
+  transform: scale(1.04);
+}
+.comet-btn:active,
+.comet-swatch:active,
+.comet-width:active,
+.comet-send:active,
+.comet-selection-main:active,
+.comet-selection-remove:active,
+.comet-dock-btn:active,
+.comet-insp-copy:active,
+.comet-insp-reveal:active,
+.comet-insp-reset:active,
+.comet-insp-reset-all:active,
+.comet-insp-cat-header:active,
+.comet-insp-fmt-btn:active,
+.comet-mode-btn:active,
+.comet-send.send-press {
+  transform: scale(0.97);
+}
+
+.comet-mode-pill {
+  transition: transform var(--bl-dur) var(--bl-ease-spring),
+              opacity var(--bl-dur) var(--bl-ease-out),
+              box-shadow var(--bl-dur) var(--bl-ease-soft);
+}
+
+.comet-toolbar.is-collapsing {
+  transform: scale(0.94) translateY(-4px);
+  opacity: 0;
+  filter: blur(1px);
+  transition-duration: 200ms;
+  transition-timing-function: var(--bl-ease-exit);
+}
+.comet-toolbar.is-restoring {
+  animation: bl-toolbar-in 260ms var(--bl-ease-spring) both;
+}
+.comet-chip.is-chip-enter {
+  animation: bl-chip-pop 260ms var(--bl-ease-spring) both;
+}
+
+.comet-inspector {
+  transition: transform var(--bl-dur-panel) var(--bl-ease-spring),
+              opacity var(--bl-dur-panel) var(--bl-ease-out),
+              box-shadow var(--bl-dur-panel) var(--bl-ease-soft),
+              filter var(--bl-dur-panel) var(--bl-ease-soft);
+}
+.comet-inspector.is-open {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  filter: blur(0);
+}
+.comet-inspector.comet-insp-docked {
+  transition: transform var(--bl-dur) var(--bl-ease-spring),
+              opacity var(--bl-dur) var(--bl-ease-out),
+              box-shadow var(--bl-dur) var(--bl-ease-soft);
+}
+
+.comet-insp-row {
+  animation: bl-row-in 240ms var(--bl-ease-spring) var(--row-delay, 0ms) both;
+}
+.comet-selection-row {
+  animation: bl-row-in 220ms var(--bl-ease-spring) var(--row-delay, 0ms) both;
+}
+.comet-selection-count.selection-pop {
+  animation: bl-selection-pop 200ms var(--bl-ease-spring) both;
+}
+.comet-el-badge {
+  animation: bl-marker-pop 220ms var(--bl-ease-spring) both;
+}
+.comet-selection-row.is-removing {
+  animation: bl-row-remove 160ms var(--bl-ease-exit) both;
+}
+.comet-el.is-removing {
+  animation: bl-marker-remove 160ms var(--bl-ease-exit) both;
+}
+
+.comet-hl,
+.comet-hover-box {
+  transition: opacity 180ms var(--bl-ease-out),
+              box-shadow 220ms var(--bl-ease-soft),
+              border-color 180ms var(--bl-ease-out);
+}
+.comet-hl-chip {
+  transition: transform 180ms var(--bl-ease-spring),
+              opacity 180ms var(--bl-ease-out);
+}
+
+.comet-sent-toast.comet-sent-in {
+  animation: comet-sent-in 240ms var(--bl-ease-spring) both;
+}
+.comet-sent-toast.comet-sent-out {
+  animation: comet-sent-out 200ms var(--bl-ease-exit) both;
+}
+.comet-send.comet-send-away {
+  animation: comet-send-away 220ms var(--bl-ease-exit) both;
+}
+.comet-send-pulse.comet-send-pulse-run {
+  animation: comet-send-pulse 620ms var(--bl-ease-out) both;
+}
+.comet-send-pulse.comet-send-pulse-fail {
+  animation: comet-send-pulse-fail 180ms var(--bl-ease-exit) both;
+}
+
+.comet-inspector.comet-insp-from-left.comet-insp-open { animation: comet-insp-fold-left 280ms var(--bl-ease-spring) both; }
+.comet-inspector.comet-insp-from-right.comet-insp-open { animation: comet-insp-fold-right 280ms var(--bl-ease-spring) both; }
+.comet-inspector.comet-insp-from-top.comet-insp-open { animation: comet-insp-fold-top 280ms var(--bl-ease-spring) both; }
+.comet-inspector.comet-insp-from-bottom.comet-insp-open { animation: comet-insp-fold-bottom 280ms var(--bl-ease-spring) both; }
+.comet-inspector.comet-insp-from-left.comet-insp-close { animation: comet-insp-unfold-left 200ms var(--bl-ease-exit) both; }
+.comet-inspector.comet-insp-from-right.comet-insp-close { animation: comet-insp-unfold-right 200ms var(--bl-ease-exit) both; }
+.comet-inspector.comet-insp-from-top.comet-insp-close { animation: comet-insp-unfold-top 200ms var(--bl-ease-exit) both; }
+.comet-inspector.comet-insp-from-bottom.comet-insp-close { animation: comet-insp-unfold-bottom 200ms var(--bl-ease-exit) both; }
+
+@keyframes bl-toolbar-in {
+  from { opacity: 0; transform: translateY(-10px) scale(0.97); filter: blur(2px); }
+  to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+@keyframes bl-chip-pop {
+  0% { opacity: 0; transform: scale(0.72); filter: blur(1px); }
+  70% { opacity: 1; transform: scale(1.05); filter: blur(0); }
+  100% { opacity: 1; transform: scale(1); filter: blur(0); }
+}
+@keyframes bl-row-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); filter: blur(1px); }
+  to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+@keyframes bl-row-remove {
+  from { opacity: 1; transform: translateX(0) scale(1); }
+  to { opacity: 0; transform: translateX(-8px) scale(0.97); }
+}
+@keyframes bl-marker-pop {
+  0% { opacity: 0; transform: translate(-50%, -100%) scale(0.55); }
+  65% { opacity: 1; transform: translate(-50%, -100%) scale(1.08); }
+  100% { opacity: 1; transform: translate(-50%, -100%) scale(1); }
+}
+@keyframes bl-marker-remove {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(0.82); }
+}
+@keyframes bl-selection-pop {
+  0% { opacity: 0.55; transform: scale(0.6); }
+  65% { opacity: 1; transform: scale(1.08); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes comet-sent-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(-8px) scale(0.88); filter: blur(1.5px); }
+  to { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); filter: blur(0); }
+}
+@keyframes comet-sent-out {
+  from { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); filter: blur(0); }
+  to { opacity: 0; transform: translateX(-50%) translateY(-10px) scale(0.96); filter: blur(1px); }
+}
+@keyframes comet-insp-fold-left {
+  0% {
+    opacity: 0;
+    transform: translateX(-22px) scaleX(0.42) scaleY(0.94);
+    filter: blur(2px) drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+  55% {
+    opacity: 1;
+    transform: translateX(3px) scaleX(1.03) scaleY(1);
+    filter: blur(0) drop-shadow(0 0 12px rgba(74, 158, 255, 0.28));
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+    filter: blur(0) drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+}
+@keyframes comet-insp-fold-right {
+  0% {
+    opacity: 0;
+    transform: translateX(22px) scaleX(0.42) scaleY(0.94);
+    filter: blur(2px) drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+  55% {
+    opacity: 1;
+    transform: translateX(-3px) scaleX(1.03) scaleY(1);
+    filter: blur(0) drop-shadow(0 0 12px rgba(74, 158, 255, 0.28));
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+    filter: blur(0) drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+}
+@keyframes comet-insp-fold-top {
+  0% {
+    opacity: 0;
+    transform: translateY(-22px) scaleY(0.42) scaleX(0.94);
+    filter: blur(2px) drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+  55% {
+    opacity: 1;
+    transform: translateY(3px) scaleY(1.03) scaleX(1);
+    filter: blur(0) drop-shadow(0 0 12px rgba(74, 158, 255, 0.28));
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0) drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+}
+@keyframes comet-insp-fold-bottom {
+  0% {
+    opacity: 0;
+    transform: translateY(22px) scaleY(0.42) scaleX(0.94);
+    filter: blur(2px) drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+  55% {
+    opacity: 1;
+    transform: translateY(-3px) scaleY(1.03) scaleX(1);
+    filter: blur(0) drop-shadow(0 0 12px rgba(74, 158, 255, 0.28));
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0) drop-shadow(0 0 0 rgba(74, 158, 255, 0));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #hermes-annotate-host,
+  .comet-toolbar,
+  .comet-chip,
+  .comet-btn,
+  .comet-swatch,
+  .comet-width,
+  .comet-drag,
+  .comet-insp-reset,
+  .comet-insp-reset-all,
+  .comet-selection-main,
+  .comet-selection-remove,
+  .comet-send,
+  .comet-dock-btn,
+  .comet-insp-copy,
+  .comet-insp-reveal,
+  .comet-mode-btn,
+  .comet-insp-cat-header,
+  .comet-insp-fmt-btn,
+  .comet-mode-pill,
+  .comet-inspector,
+  .comet-hl,
+  .comet-hover-box,
+  .comet-hl-chip {
+    transition: none !important;
+  }
+  #hermes-annotate-host.is-entering,
+  #hermes-annotate-host.is-entered,
+  #hermes-annotate-host.is-exiting,
+  .comet-toolbar.is-collapsing,
+  .comet-btn:hover,
+  .comet-swatch:hover,
+  .comet-width:hover,
+  .comet-selection-main:hover,
+  .comet-selection-remove:hover,
+  .comet-dock-btn:hover,
+  .comet-insp-copy:hover,
+  .comet-insp-reveal:hover,
+  .comet-mode-btn:hover,
+  .comet-btn:active,
+  .comet-swatch:active,
+  .comet-width:active,
+  .comet-send:active,
+  .comet-selection-main:active,
+  .comet-selection-remove:active,
+  .comet-dock-btn:active,
+  .comet-insp-copy:active,
+  .comet-insp-reveal:active,
+  .comet-insp-reset:active,
+  .comet-insp-reset-all:active,
+  .comet-insp-cat-header:active,
+  .comet-insp-fmt-btn:active,
+  .comet-mode-btn:active,
+  .comet-send.send-press {
+    transform: none !important;
+    filter: none !important;
+  }
+}
+
+/* ---- inspector cyan-silver ring glow (slow conic sweep along the edges) ---- */
+@property --bl-ring-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+/* One soft light-cyan + silver travelling segment rotating around the panel
+   edges. ::before is masked to a thin ring, sits on the border (inset -1px)
+   and paints behind the panel content (negative z-index inside the panel's
+   own stacking context), so every control and any resize handle stay fully
+   interactive. When the panel is hidden ([hidden] -> display:none) the
+   pseudo is not rendered. */
+.comet-inspector::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: conic-gradient(from var(--bl-ring-angle, 0deg),
+    transparent 0deg,
+    rgba(165, 243, 252, 0.02) 30deg,
+    rgba(125, 211, 252, 0.30) 70deg,
+    rgba(226, 232, 240, 0.28) 100deg,
+    rgba(165, 243, 252, 0.02) 130deg,
+    transparent 180deg,
+    transparent 360deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+  z-index: -1;
+  opacity: 0.4;
+  animation: comet-ring-spin 14s linear infinite, comet-ring-breathe 6.5s ease-in-out infinite;
+}
+
+/* Static ambient cyan-silver edge so the perimeter never looks dead between
+   sweeps. Pointer-events none keeps resize/content interactive above it. */
+.comet-inspector::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 1px solid rgba(148, 197, 233, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(226, 232, 240, 0.04);
+  pointer-events: none;
+  z-index: -1;
+}
+
+/* GSAP-driven angle: suppress the discrete CSS spin (it would fight the GSAP
+   interpolation of --bl-ring-angle) but keep the opacity breathe. */
+.comet-inspector.comet-ring-js::before {
+  animation: comet-ring-breathe 6.5s ease-in-out infinite;
+}
+
+@keyframes comet-ring-spin {
+  to {
+    --bl-ring-angle: 360deg;
+  }
+}
+
+@keyframes comet-ring-breathe {
+  0%, 100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .comet-inspector::before,
+  .comet-inspector.comet-ring-js::before {
+    animation: none;
+    opacity: 0.2;
+  }
+}
+
+/* Diagnostics overlay (Ctrl+Shift+D). Lives inside the shadow root, hidden by
+   default; when closed it never blocks element picking. */
+.comet-diag {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 2147483647;
+  width: min(420px, calc(100vw - 24px));
+  max-height: 40vh;
+  display: flex;
+  flex-direction: column;
+  background: rgba(10, 12, 16, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 10px;
+  color: #e8eaed;
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  pointer-events: auto;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.comet-diag[hidden] {
+  display: none;
+}
+
+.comet-diag-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.comet-diag-title {
+  flex: 1;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.comet-diag-btn {
+  background: rgba(255, 255, 255, 0.08);
+  color: #e8eaed;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 5px;
+  font: 11px ui-monospace, Menlo, Consolas, monospace;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.comet-diag-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.comet-diag-body {
+  flex: 1;
+  overflow: auto;
+  max-height: calc(40vh - 30px);
+  margin: 0;
+  padding: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #9aa0a6;
 }
