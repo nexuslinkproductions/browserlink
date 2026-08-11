@@ -2459,7 +2459,14 @@
     // Events from inspector controls must reach their real shadow-DOM target.
     // Only Escape and the Enter shortcuts (chat card / inspector instruction
     // field) are global actions.
-    if (fromUi && e.key !== 'Escape' && !chatEnter && !inspEnter) return;
+    if (fromUi && e.key !== 'Escape' && !chatEnter && !inspEnter) {
+      // Block host-page shortcuts (capture-phase window listeners run before
+      // the shadow-root bubble guard at bindEvents). stopImmediatePropagation
+      // without preventDefault: the field still receives the character, the
+      // page never sees the key.
+      e.stopImmediatePropagation();
+      return;
+    }
 
     // Annotate note mode: the card is bound to the note, not to an element.
     if (state.annotateOn && !state.elementMode && chatCard && !chatCard.hidden) {
