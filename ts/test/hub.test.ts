@@ -14,7 +14,13 @@ import {
   reloadAdapters,
   storeAnnotation,
 } from "../src/hub.ts";
-import { formatMessage, resolveSessionId } from "../src/adapters/hermes.ts";
+import {
+  formatMessage,
+  register as registerHermes,
+  resolveSessionId,
+} from "../src/adapters/hermes.ts";
+import { register as registerWebhook } from "../src/adapters/webhook.ts";
+import { MAX_MESSAGE_TEXT_LENGTH } from "../src/schema.ts";
 
 const TINY_PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -420,5 +426,233 @@ describe("GET /sessions proxy", () => {
         else process.env.HERMES_API_KEY = prevKey;
       }
     });
+  });
+});
+
+describe("hermes text-only fallback and caps", () => {
+  test("no screenshot: text-only message with @file chip, no @image", async () => {
+    await withTempDataDir(async (dir) => {
+      const annDir = path.join(dir, "annotations");
+      await mkdir(annDir, { recursive: true });
+      const jsonPath = path.join(annDir, "20260101-000000-001.json");
+      const ann = {
+        source: "test",
+        url: "https://example.test/login",
+        title: "Login",
+        label: "qa",
+        viewport: { w: 100, h: 100 },
+        strokes: [
+          { color: "#f00", width: 2, points: [[0.1, 0.2], [0.3, 0.4]] },
+        ],
+        note: "capture failed, no screenshot",
+      };
+      await writeFile(jsonPath, JSON.stringify(ann));
+      const msg = formatMessage(ann, jsonPath);
+      assert.ok(!msg.includes("@image:"), "no @image: line without a screenshot");
+      assert.ok(!msg.includes("image_url"), "no image_url part in text-only fallback");
+      assert.ok(msg.endsWith(`@file:${path.resolve(jsonPath)}`), "@file chip appended");
+      assert.ok(msg.includes("Note: capture failed, no screenshot"));
+    });
+  });
+
+  test("MAX_MESSAGE_TEXT_LENGTH never cuts @image or @file lines", async () => {
+    await withTempDataDir(async (dir) => {
+      const annDir = path.join(dir, "annotations");
+      await mkdir(annDir, { recursive: true });
+      const pngPath = path.join(annDir, "20260101-000000-002.png");
+      const jsonPath = path.join(annDir, "20260101-000000-002.json");
+      await writeFile(pngPath, TINY_PNG);
+      const ann = {
+        source: "test",
+        url: "https://example.test/login",
+        title: "Login",
+        label: "qa",
+        viewport: { w: 100, h: 100 },
+        strokes: [
+          { color: "#f00", width: 2, points: [[0.1, 0.2], [0.3, 0.4]] },
+        ],
+        elements: [
+          { index: 1, tag: "div", text: "x".repeat(MAX_MESSAGE_TEXT_LENGTH + 1000) },
+        ],
+        screenshotFile: "20260101-000000-002.png",
+      };
+      await writeFile(jsonPath, JSON.stringify(ann));
+      const msg = formatMessage(ann, jsonPath);
+      const lines = msg.split("\n");
+      assert.ok(lines[0].startsWith("@image:"), "@image line survives the cap");
+      assert.ok(
+        lines[lines.length - 1].startsWith("@file:"),
+        "@file line survives the cap",
+      );
+      const body = lines.slice(1, -1).join("\n");
+      assert.ok(
+        body.length <= MAX_MESSAGE_TEXT_LENGTH,
+        `body capped (got ${body.length})`,
+      );
+    });
+  });
+});
+
+describe("hermes adapter delivery", () => {
+  test("res.ok logs structured success line with message id", async () => {
+    const prevUrl = process.env.HERMES_API_URL;
+    const prevKey = process.env.HERMES_API_KEY;
+    const prevSid = process.env.HERMES_SESSION_ID;
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; body: string } | null = null;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      captured = {
+        url: String(url),
+        body: String(init?.body ?? ""),
+      };
+      return new Response(JSON.stringify({ id: "msg-9001" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      await withTempDataDir(async (dir) => {
+        process.env.HERMES_API_URL = "http://hermes.test";
+        process.env.HERMES_API_KEY = "k";
+        process.env.HERMES_SESSION_ID = "sess-live";
+        const annDir = path.join(dir, "annotations");
+        await mkdir(annDir, { recursive: true });
+        const jsonPath = path.join(annDir, "20260101-000000-003.json");
+        const ann = {
+          id: "ann-success-1",
+          source: "test",
+          url: "https://example.test/",
+          viewport: { w: 100, h: 100 },
+          strokes: [],
+          note: "no screenshot here",
+        };
+        await writeFile(jsonPath, JSON.stringify(ann));
+        await registerHermes(ann, jsonPath);
+        assert.ok(captured, "fetch was called");
+        const sent = JSON.parse(captured!.body) as Record<string, unknown>;
+        // Text-only fallback: plain string message, no image part.
+        assert.equal(typeof sent.message, "string");
+        assert.ok(!String(sent.message).includes("@image:"));
+        assert.ok(String(sent.message).includes("@file:"));
+        assert.ok(String(sent.message).includes("Note: no screenshot here"));
+        const logLines = (
+          await readFile(path.join(dir, "browserlink-error.log"), "utf8")
+        )
+          .trim()
+          .split("\n");
+        const success = logLines
+          .map((l) => JSON.parse(l))
+          .find((l) => l.message === "delivered");
+        assert.ok(success, "success line written to the shared log");
+        assert.equal(success.adapter, "hermes");
+        assert.equal(success.annotationId, "ann-success-1");
+        assert.equal(success.sessionId, "sess-live");
+        assert.equal(success.messageId, "msg-9001");
+        assert.ok(typeof success.ts === "string" && success.ts.length > 0);
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (prevUrl === undefined) delete process.env.HERMES_API_URL;
+      else process.env.HERMES_API_URL = prevUrl;
+      if (prevKey === undefined) delete process.env.HERMES_API_KEY;
+      else process.env.HERMES_API_KEY = prevKey;
+      if (prevSid === undefined) delete process.env.HERMES_SESSION_ID;
+      else process.env.HERMES_SESSION_ID = prevSid;
+    }
+  });
+});
+
+describe("webhook adapter", () => {
+  test("missing URL skips without sending", async () => {
+    const prevUrl = process.env.BROWSERLINK_WEBHOOK_URL;
+    const originalFetch = globalThis.fetch;
+    let called = false;
+    globalThis.fetch = (async () => {
+      called = true;
+      return new Response("ok", { status: 200 });
+    }) as typeof fetch;
+    try {
+      delete process.env.BROWSERLINK_WEBHOOK_URL;
+      await registerWebhook({
+        source: "test",
+        url: "https://example.test/",
+        viewport: { w: 100, h: 100 },
+        strokes: [],
+      });
+      assert.equal(called, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (prevUrl === undefined) delete process.env.BROWSERLINK_WEBHOOK_URL;
+      else process.env.BROWSERLINK_WEBHOOK_URL = prevUrl;
+    }
+  });
+
+  test("oversized payload is skipped and logged", async () => {
+    const prevUrl = process.env.BROWSERLINK_WEBHOOK_URL;
+    const originalFetch = globalThis.fetch;
+    let called = false;
+    globalThis.fetch = (async () => {
+      called = true;
+      return new Response("ok", { status: 200 });
+    }) as typeof fetch;
+    try {
+      await withTempDataDir(async (dir) => {
+        process.env.BROWSERLINK_WEBHOOK_URL = "http://webhook.test/hook";
+        await registerWebhook({
+          id: "ann-big-1",
+          source: "test",
+          url: "https://example.test/",
+          viewport: { w: 100, h: 100 },
+          strokes: [],
+          note: "x".repeat(1_100_000),
+        });
+        assert.equal(called, false, "oversized body never sent");
+        const logLines = (
+          await readFile(path.join(dir, "browserlink-error.log"), "utf8")
+        )
+          .trim()
+          .split("\n");
+        const entry = logLines
+          .map((l) => JSON.parse(l))
+          .find((l) => l.adapter === "webhook");
+        assert.ok(entry, "oversized skip logged to the shared error log");
+        assert.equal(entry.annotationId, "ann-big-1");
+        assert.match(entry.error, /exceeds/);
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (prevUrl === undefined) delete process.env.BROWSERLINK_WEBHOOK_URL;
+      else process.env.BROWSERLINK_WEBHOOK_URL = prevUrl;
+    }
+  });
+
+  test("sends under the cap", async () => {
+    const prevUrl = process.env.BROWSERLINK_WEBHOOK_URL;
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; body: string } | null = null;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      captured = { url: String(url), body: String(init?.body ?? "") };
+      return new Response("ok", { status: 200 });
+    }) as typeof fetch;
+    try {
+      process.env.BROWSERLINK_WEBHOOK_URL = "http://webhook.test/hook";
+      await registerWebhook({
+        id: "ann-ok-1",
+        source: "test",
+        url: "https://example.test/",
+        viewport: { w: 100, h: 100 },
+        strokes: [],
+        note: "small payload",
+      });
+      assert.ok(captured, "fetch was called");
+      assert.equal(captured!.url, "http://webhook.test/hook");
+      const sent = JSON.parse(captured!.body) as Record<string, unknown>;
+      assert.equal(sent.id, "ann-ok-1");
+      assert.equal(sent.note, "small payload");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (prevUrl === undefined) delete process.env.BROWSERLINK_WEBHOOK_URL;
+      else process.env.BROWSERLINK_WEBHOOK_URL = prevUrl;
+    }
   });
 });

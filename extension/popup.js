@@ -9,7 +9,8 @@
  *     "Delivered to: <label|sessionId|not connected>".
  *   - Session picker: GETs /sessions, lists options (title|preview|id),
  *     preselects the current /target sessionId; on change POSTs /target
- *     {sessionId, label, activate:false}. Refresh reloads the list.
+ *     {sessionId, label, activate:true} so the service worker poll auto-
+ *     connects the tool to the active tab. Refresh reloads the list.
  *   - Context label: persisted via chrome.storage.local ("contextLabel"),
  *     merged into payload.label at send time by content.js.
  *   - Master switch ("Tool active"): persisted via chrome.storage.local
@@ -23,6 +24,38 @@
 
 const $ = (id) => document.getElementById(id);
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787';
+const HUB_STATUS_TIMEOUT_MS = 2000;
+
+/* Normalize a hub endpoint: trim, strip trailing slashes, and map
+ * 'localhost' to '127.0.0.1' so IPv6 (::1) resolution cannot break the
+ * picker against an IPv4-only hub. */
+function normalizeEndpoint(v) {
+  let s = String(v == null ? '' : v).trim();
+  if (!s) return '';
+  s = s.replace(/\/+$/, '');
+  if (/^https?:\/\/localhost(?=[:/]|$)/i.test(s)) {
+    s = s.replace(/^https?:\/\/localhost(?=[:/]|$)/i, (m) => m.replace(/localhost/i, '127.0.0.1'));
+  } else if (/^localhost(?=[:/]|$)/i.test(s)) {
+    s = 'http://127.0.0.1' + s.slice('localhost'.length);
+  }
+  return s;
+}
+
+/* Resolve the popup-side hub endpoint: normalize the input value, and when
+ * the stored/input endpoint is stale (fails a health probe), fall back to
+ * DEFAULT_ENDPOINT so a dead endpoint cannot break the picker. */
+async function resolveEndpoint() {
+  const v = normalizeEndpoint($('endpointInput').value) || DEFAULT_ENDPOINT;
+  if (v === DEFAULT_ENDPOINT) return v;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), HUB_STATUS_TIMEOUT_MS);
+    const res = await fetch(v + '/health', { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (res.ok) return v;
+  } catch (_) { /* stale or unreachable */ }
+  return DEFAULT_ENDPOINT;
+}
 
 function setHubStatus(text, cls) {
   const el = $('hubStatus');
@@ -62,7 +95,7 @@ function updateDeliveredLine(hubLine, hubCls, target) {
 /* Populate session <select> from GET /sessions; preselect currentTargetId. */
 async function loadSessions(currentTargetId) {
   const select = $('sessionSelect');
-  const endpoint = ($('endpointInput').value || '').trim() || DEFAULT_ENDPOINT;
+  const endpoint = await resolveEndpoint();
   setSessionStatus('Loading sessions...', false);
 
   // Reset to placeholder while loading.
@@ -131,14 +164,14 @@ async function onSessionChange() {
   const label = (selected && selected.dataset.label)
     ? selected.dataset.label
     : (selected ? selected.textContent : sessionId);
-  const endpoint = ($('endpointInput').value || '').trim() || DEFAULT_ENDPOINT;
+  const endpoint = await resolveEndpoint();
 
   setSessionStatus('Setting target...', false);
   try {
     const res = await fetch(endpoint + '/target', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: sessionId, label: label, activate: false }),
+      body: JSON.stringify({ sessionId: sessionId, label: label, activate: true }),
     });
     if (!res.ok) {
       setSessionStatus('Failed to set target (' + res.status + ').', true);
@@ -146,7 +179,9 @@ async function onSessionChange() {
     }
     let body = null;
     try { body = await res.json(); } catch (_) { body = null; }
-    const target = (body && typeof body === 'object')
+    // The hub answers {ok:true} without echoing the record, so build the
+    // confirmation from the selection unless the body carries the target.
+    const target = (body && (body.sessionId || body.label))
       ? body
       : { sessionId: sessionId, label: label };
     // Preserve current hub status class/prefix from the status element.
@@ -156,6 +191,8 @@ async function onSessionChange() {
     const hubLine = hubEl.classList.contains('ok') ? 'Hub: connected ✓' : 'Hub: offline';
     updateDeliveredLine(hubLine, hubCls, target);
     setSessionStatus('', false);
+    // Reload the list so the pick shows the new target selected.
+    await loadSessions(sessionId);
   } catch (_) {
     setSessionStatus('Could not set target.', true);
   }
@@ -177,7 +214,10 @@ async function checkHub() {
   let delivered = 'Delivered to: not connected';
   let targetBody = null;
   try {
-    const endpoint = ($('endpointInput').value || '').trim() || DEFAULT_ENDPOINT;
+    const endpoint = await resolveEndpoint();
+    // Reflect the fallback in the field so the UI shows the endpoint in use.
+    const shown = normalizeEndpoint($('endpointInput').value);
+    if (shown && shown !== endpoint) $('endpointInput').value = endpoint;
     const res = await fetch(endpoint + '/target');
     if (res.ok) {
       targetBody = await res.json();
@@ -209,13 +249,14 @@ async function loadEndpoint() {
   let v = DEFAULT_ENDPOINT;
   try {
     const got = await chrome.storage.local.get('endpoint');
-    if (got && got.endpoint && String(got.endpoint).trim()) v = String(got.endpoint);
+    if (got && got.endpoint && String(got.endpoint).trim()) v = normalizeEndpoint(got.endpoint);
   } catch (_) { /* storage unavailable */ }
   $('endpointInput').value = v;
 }
 
 function saveEndpoint() {
-  const v = $('endpointInput').value.trim();
+  const v = normalizeEndpoint($('endpointInput').value);
+  $('endpointInput').value = v;
   chrome.storage.local.set({ endpoint: v }).catch(() => {});
   checkHub(); // re-check against the saved endpoint
 }

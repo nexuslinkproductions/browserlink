@@ -1,4 +1,4 @@
-/** Shared annotation schema (v1.4) — single source of truth for hub + MCP. */
+/** Shared annotation schema (v1.4), single source of truth for hub + MCP. */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -174,6 +174,39 @@ export function logError(entry: Omit<ErrorLogEntry, "ts">): void {
   } catch {
     // Last-resort: if we can't write the error log, still emit to stderr.
     console.warn("failed to write error log:", line);
+  }
+}
+
+interface SuccessLogEntry {
+  ts: string;
+  adapter: string;
+  annotationId: string | null;
+  sessionId: string | null;
+  messageId: string | null;
+  message: string;
+}
+
+/**
+ * Structured success line for confirmed deliveries. Written to the SAME log
+ * file as logError (browserlink-error.log, kept for Python-hub parity) so a
+ * single file traces every adapter outcome, success or failure.
+ */
+export function logSuccess(entry: Omit<SuccessLogEntry, "ts">): void {
+  const line: SuccessLogEntry = {
+    ts: new Date().toISOString(),
+    adapter: entry.adapter,
+    annotationId: entry.annotationId || null,
+    sessionId: entry.sessionId || null,
+    messageId: entry.messageId || null,
+    message: entry.message,
+  };
+  try {
+    const logPath = errorLogPath();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, `${JSON.stringify(line)}\n`, "utf8");
+  } catch {
+    // Last-resort: if we can't write the log, still emit to stderr.
+    console.warn("failed to write success log:", line);
   }
 }
 

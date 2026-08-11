@@ -17,14 +17,45 @@ const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787';
 const HUB_STATUS_TIMEOUT_MS = 2000;
 const POLL_ALARM = 'browserlink-poll';
 
+/* Normalize a hub endpoint: trim, strip trailing slashes, and map
+ * 'localhost' to '127.0.0.1' so IPv6 (::1) resolution cannot break the
+ * connect flow against an IPv4-only hub. */
+function normalizeEndpoint(v) {
+  let s = String(v == null ? '' : v).trim();
+  if (!s) return '';
+  s = s.replace(/\/+$/, '');
+  if (/^https?:\/\/localhost(?=[:/]|$)/i.test(s)) {
+    s = s.replace(/^https?:\/\/localhost(?=[:/]|$)/i, (m) => m.replace(/localhost/i, '127.0.0.1'));
+  } else if (/^localhost(?=[:/]|$)/i.test(s)) {
+    s = 'http://127.0.0.1' + s.slice('localhost'.length);
+  }
+  return s;
+}
+
 async function getEndpoint() {
   try {
     const got = await chrome.storage.local.get('endpoint');
-    const v = got && got.endpoint ? String(got.endpoint).trim() : '';
+    const v = got && got.endpoint ? normalizeEndpoint(got.endpoint) : '';
     return v || DEFAULT_ENDPOINT;
   } catch (_) {
     return DEFAULT_ENDPOINT;
   }
+}
+
+/* Resolve the hub endpoint with a stale-storage fallback: when the stored
+ * endpoint fails a health probe, fall back to DEFAULT_ENDPOINT so a stale
+ * 'endpoint' value cannot break the picker/connect flow. */
+async function resolveEndpoint() {
+  const endpoint = await getEndpoint();
+  if (endpoint === DEFAULT_ENDPOINT) return endpoint;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), HUB_STATUS_TIMEOUT_MS);
+    const res = await fetch(endpoint + '/health', { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (res.ok) return endpoint;
+  } catch (_) { /* stale or unreachable */ }
+  return DEFAULT_ENDPOINT;
 }
 
 function ensurePollAlarm() {
@@ -46,7 +77,7 @@ ensurePollAlarm();
 async function pollTargetAndMaybeActivate() {
   let endpoint;
   try {
-    endpoint = await getEndpoint();
+    endpoint = await resolveEndpoint();
   } catch (_) {
     return;
   }
@@ -189,7 +220,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'hubStatus') {
-    getEndpoint()
+    resolveEndpoint()
       .then((endpoint) => {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), HUB_STATUS_TIMEOUT_MS);

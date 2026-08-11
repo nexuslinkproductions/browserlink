@@ -1,5 +1,5 @@
 /**
- * browserlink HTTP hub — TypeScript port of server/hub.py.
+ * browserlink HTTP hub, TypeScript port of server/hub.py.
  * Drop-in compatible REST contract (v2.0.0).
  */
 
@@ -202,7 +202,7 @@ function dispatchAdapter(
       try {
         return registerFn(annotation, annotationPath);
       } catch (err) {
-        // Some adapters may reject a second arg — try annotation-only.
+        // Some adapters may reject a second arg, try annotation-only.
         if (err instanceof TypeError) {
           return registerFn(annotation);
         }

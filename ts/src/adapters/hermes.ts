@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { logError } from "../schema.ts";
+import { logError, logSuccess, MAX_MESSAGE_TEXT_LENGTH } from "../schema.ts";
 
 export type JsonObject = Record<string, unknown>;
 
@@ -125,11 +125,68 @@ export function formatMessage(
   annotationPath?: string | null,
   includeImageRef = true,
 ): string {
+  // Content lines first; the @image:/@file: directive lines are appended
+  // AFTER the MAX_MESSAGE_TEXT_LENGTH cap below, so a cap can never cut a
+  // directive path line.
+  const contentLines: string[] = [];
+
+  contentLines.push("📎 browserlink annotation");
+  contentLines.push(`URL: ${String(annotation.url ?? "")}`);
+  contentLines.push(`Title: ${String(annotation.title ?? "")}`);
+  contentLines.push(`Label: ${String(annotation.label ?? "")}`);
+
+  const elements = annotation.elements;
+  if (Array.isArray(elements)) {
+    let number = 0;
+    for (const element of elements) {
+      if (!element || typeof element !== "object" || Array.isArray(element)) continue;
+      number += 1;
+      const el = element as JsonObject;
+      const tagName = elementTagName(el);
+      const text = String(el.text ?? "");
+      let part = `E${number}: ${tagName} '${text}'`;
+      if (el.instruction) part += ` - instruction: ${String(el.instruction)}`;
+      const editsStr = formatEdits(el.edits);
+      if (editsStr) part += ` - edits: ${editsStr}`;
+      contentLines.push(part);
+    }
+  }
+
+  const strokes = annotation.strokes;
+  const strokeCount = Array.isArray(strokes) ? strokes.length : 0;
+  contentLines.push(`${strokeCount} stroke(s)`);
+
+  // Queued annotation notes (the extension sends both a legacy `note` and a
+  // `notes` array; surface whichever is present so the note is never dropped).
+  const notes = annotation.notes;
+  if (Array.isArray(notes) && notes.length) {
+    const list = notes
+      .map((n) => String(n ?? ""))
+      .filter((n) => n.trim())
+      .map((n) => `- ${n.trim()}`)
+      .join("\n");
+    if (list) contentLines.push(`Notes:\n${list}`);
+  } else {
+    const note = String(annotation.note ?? "");
+    if (note.trim()) contentLines.push(`Note: ${note.trim()}`);
+  }
+
+  // Cap the body text so a single annotation can never blow the request
+  // body; the directive lines are appended after this cap.
+  let content = contentLines.join("\n");
+  if (content.length > MAX_MESSAGE_TEXT_LENGTH) {
+    content = content.slice(0, MAX_MESSAGE_TEXT_LENGTH);
+    // Never leave a split surrogate pair at the cut point.
+    const last = content.charCodeAt(content.length - 1);
+    if (last >= 0xd800 && last <= 0xdbff) content = content.slice(0, -1);
+  }
+
   const lines: string[] = [];
 
   // Schema v1.4: @image first when the sibling PNG exists on disk. Skipped
   // when the caller sends the screenshot as a real image_url part (the text
-  // ref would duplicate the image).
+  // ref would duplicate the image). Built after the content cap so the
+  // directive line is never truncated.
   if (includeImageRef) {
     const screenshotFile = annotation.screenshotFile;
     if (typeof screenshotFile === "string" && screenshotFile) {
@@ -145,48 +202,10 @@ export function formatMessage(
     }
   }
 
-  lines.push("📎 browserlink annotation");
-  lines.push(`URL: ${String(annotation.url ?? "")}`);
-  lines.push(`Title: ${String(annotation.title ?? "")}`);
-  lines.push(`Label: ${String(annotation.label ?? "")}`);
+  lines.push(content);
 
-  const elements = annotation.elements;
-  if (Array.isArray(elements)) {
-    let number = 0;
-    for (const element of elements) {
-      if (!element || typeof element !== "object" || Array.isArray(element)) continue;
-      number += 1;
-      const el = element as JsonObject;
-      const tagName = elementTagName(el);
-      const text = String(el.text ?? "");
-      let part = `E${number}: ${tagName} '${text}'`;
-      if (el.instruction) part += ` - instruction: ${String(el.instruction)}`;
-      const editsStr = formatEdits(el.edits);
-      if (editsStr) part += ` - edits: ${editsStr}`;
-      lines.push(part);
-    }
-  }
-
-  const strokes = annotation.strokes;
-  const strokeCount = Array.isArray(strokes) ? strokes.length : 0;
-  lines.push(`${strokeCount} stroke(s)`);
-
-  // Queued annotation notes (the extension sends both a legacy `note` and a
-  // `notes` array; surface whichever is present so the note is never dropped).
-  const notes = annotation.notes;
-  if (Array.isArray(notes) && notes.length) {
-    const list = notes
-      .map((n) => String(n ?? ""))
-      .filter((n) => n.trim())
-      .map((n) => `- ${n.trim()}`)
-      .join("\n");
-    if (list) lines.push(`Notes:\n${list}`);
-  } else {
-    const note = String(annotation.note ?? "");
-    if (note.trim()) lines.push(`Note: ${note.trim()}`);
-  }
-
-  // Always append @file last when the annotation JSON exists.
+  // Always append @file last when the annotation JSON exists. Built after
+  // the content cap so the directive line is never truncated.
   if (annotationPath) {
     try {
       readFileSync(annotationPath);
@@ -322,8 +341,36 @@ export async function register(
 
       if (response.ok) {
         if (annotationId) deliveredIds.add(annotationId);
+        // The chat endpoint returns the completion object; lift a message id
+        // when the response carries one (shape varies by server version).
+        let messageId: string | null = null;
+        try {
+          const parsed = (await response.json()) as unknown;
+          if (parsed && typeof parsed === "object") {
+            const obj = parsed as JsonObject;
+            const data =
+              obj.data && typeof obj.data === "object" && !Array.isArray(obj.data)
+                ? (obj.data as JsonObject)
+                : null;
+            const message =
+              obj.message && typeof obj.message === "object" && !Array.isArray(obj.message)
+                ? (obj.message as JsonObject)
+                : null;
+            const candidate = obj.id ?? data?.id ?? message?.id;
+            if (typeof candidate === "string" && candidate) messageId = candidate;
+          }
+        } catch {
+          // body not JSON; messageId stays null
+        }
+        logSuccess({
+          adapter: "hermes",
+          annotationId,
+          sessionId,
+          messageId,
+          message: "delivered",
+        });
         console.info(
-          `Hermes adapter: delivered annotation${annotationId ? ` ${annotationId}` : ""} to session ${sessionId} (${response.status})`,
+          `Hermes adapter: delivered annotation${annotationId ? ` ${annotationId}` : ""} to session ${sessionId} (${response.status})${messageId ? ` message ${messageId}` : ""}`,
         );
         return;
       }
