@@ -260,8 +260,8 @@ export interface ComposerAttachment {
  *
  * The image chip is included only when the screenshot PNG exists on disk;
  * the file chip is included when the annotation JSON exists. Both missing
- * returns an empty array: text-only annotations skip the injection entirely
- * and still ship through /chat.
+ * returns an empty array: text-only annotations skip the attach path and
+ * ship through the /chat fallback.
  */
 export function buildComposerAttachments(
   annotation: JsonObject,
@@ -302,36 +302,36 @@ export function buildComposerAttachments(
   return attachments;
 }
 
-// Best-effort surface: the injection must never delay or fail the /chat
-// delivery, so it gets a short bounded timeout and no retries.
+// Best-effort surface: composer attach must never block or delay the /chat
+// fallback, so it gets a short bounded timeout and no retries.
 const COMPOSER_ATTACH_TIMEOUT_MS = 15_000;
 
 /**
  * Deliver the annotation's screenshot + JSON to the Hermes gateway composer
- * attach endpoint so the desktop surfaces them as drag-and-drop-style
- * composer chips (image thumbnail + file chip). The user then sends them
- * through the normal desktop submit path. Defensive by design: a missing
- * endpoint (404 while the gateway side is still being deployed), any other
- * HTTP error, or a network failure is logged and falls through; this call
- * never throws and never blocks the /chat POST.
+ * attach endpoint so the desktop surfaces them as composer chips (image
+ * thumbnail + file chip) waiting in the composer. The user then writes their
+ * own notes in the composer and sends manually. Defensive by design: a
+ * missing endpoint (404 while the gateway side is still being deployed), any
+ * other HTTP error, or a network failure is logged and falls through to the
+ * /chat fallback so an annotation is never lost.
+ *
+ * Returns true only when the endpoint accepted the attachments (HTTP 2xx),
+ * false otherwise so the caller knows the /chat fallback must run. Never
+ * throws.
  */
 async function injectComposerAttachments(
   sessionId: string,
-  annotation: JsonObject,
-  annotationPath?: string | null,
-): Promise<void> {
+  annotationId: string | null,
+  attachments: ComposerAttachment[],
+): Promise<boolean> {
   const apiUrl = process.env.HERMES_API_URL;
   const apiKey = process.env.HERMES_API_KEY;
-  if (!(apiUrl && apiKey)) return;
-
-  const attachments = buildComposerAttachments(annotation, annotationPath);
-  if (attachments.length === 0) return; // text-only: skip silently
+  if (!(apiUrl && apiKey)) return false;
+  if (attachments.length === 0) return false;
 
   const endpoint = `${apiUrl.replace(/\/+$/, "")}/api/composer/attach`;
   const body = JSON.stringify({ sessionId, attachments });
 
-  const annotationId =
-    typeof annotation.id === "string" && annotation.id ? annotation.id : null;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), COMPOSER_ATTACH_TIMEOUT_MS);
@@ -359,43 +359,50 @@ async function injectComposerAttachments(
         message: "composer-attached",
       });
       console.info(
-        `Hermes adapter: composer attach delivered ${attachments.length} attachment(s) to session ${sessionId} (${response.status})`,
+        `Hermes adapter: composer-attached annotation${annotationId ? ` ${annotationId}` : ""} to session ${sessionId} (${attachments.length} attachment(s), HTTP ${response.status})`,
       );
-      return;
+      return true;
     }
 
     if (response.status === 404) {
-      // The gateway endpoint may not be deployed yet. The /chat delivery
-      // still carries the annotation, so this is informational, not an error.
+      // The gateway endpoint may not be deployed yet; the /chat fallback
+      // still carries the annotation, so this is informational.
       console.info(
-        `Hermes adapter: composer attach endpoint not available (404) for session ${sessionId}; annotation still delivered via /chat`,
+        `Hermes adapter: composer attach endpoint not available (404) for session ${sessionId}; falling back to /chat`,
       );
-      return;
+      return false;
     }
 
     console.warn(
-      `Hermes adapter: composer attach HTTP ${response.status} for session ${sessionId}`,
+      `Hermes adapter: composer attach HTTP ${response.status} for session ${sessionId}; falling back to /chat`,
     );
+    return false;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(
-      `Hermes adapter: composer attach failed for session ${sessionId}: ${message}`,
+      `Hermes adapter: composer attach failed for session ${sessionId}: ${message}; falling back to /chat`,
     );
+    return false;
   }
 }
 
-export async function register(
+/**
+ * Deliver the annotation as a chat message to the Hermes session. This is
+ * the FALLBACK path, used only when composer attach could not deliver
+ * (zero attachments, 404 from the attach endpoint, or any other attach
+ * failure) so an annotation is never lost.
+ */
+async function deliverViaChat(
   annotation: JsonObject,
-  annotationPath?: string | null,
+  annotationPath: string | null | undefined,
+  sessionId: string,
+  annotationId: string | null,
 ): Promise<void> {
   const apiUrl = process.env.HERMES_API_URL;
   const apiKey = process.env.HERMES_API_KEY;
-  if (!(apiUrl && apiKey)) return;
-
-  const sessionId = resolveSessionId(annotation);
-  if (!sessionId) {
-    console.info(
-      "Hermes adapter: no sessionId in annotation, target.json, or HERMES_SESSION_ID; skipping delivery",
+  if (!(apiUrl && apiKey)) {
+    console.warn(
+      "Hermes adapter: HERMES_API_URL/HERMES_API_KEY not set; cannot fall back to /chat",
     );
     return;
   }
@@ -449,19 +456,6 @@ export async function register(
   // deterministic and retrying them would just repeat the rejection). Two
   // retries with 1s / 4s backoff. The annotation id dedupes deliveries so a
   // duplicate POST cannot double-send the same annotation.
-  const annotationId =
-    typeof annotation.id === "string" && annotation.id ? annotation.id : null;
-  if (annotationId && deliveredIds.has(annotationId)) {
-    console.info(`Hermes adapter: annotation ${annotationId} already delivered; skipping`);
-    return;
-  }
-
-  // Composer injection: surface the screenshot + JSON as drag-and-drop-style
-  // composer chips on the desktop. Runs before the (potentially minutes-long)
-  // /chat turn so the chips appear immediately; best-effort and 404-safe, it
-  // never blocks the /chat delivery below.
-  await injectComposerAttachments(sessionId, annotation, annotationPath);
-
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
@@ -510,10 +504,10 @@ export async function register(
           annotationId,
           sessionId,
           messageId,
-          message: "delivered",
+          message: "/chat fallback",
         });
         console.info(
-          `Hermes adapter: delivered annotation${annotationId ? ` ${annotationId}` : ""} to session ${sessionId} (${response.status})${messageId ? ` message ${messageId}` : ""}`,
+          `Hermes adapter: /chat fallback delivered annotation${annotationId ? ` ${annotationId}` : ""} to session ${sessionId} (${response.status})${messageId ? ` message ${messageId}` : ""}`,
         );
         return;
       }
@@ -529,7 +523,7 @@ export async function register(
       });
       if (response.status < 500) {
         console.warn(
-          `Hermes adapter: HTTP ${response.status} not retried for session ${sessionId}`,
+          `Hermes adapter: /chat fallback HTTP ${response.status} not retried for session ${sessionId}`,
         );
         return;
       }
@@ -537,7 +531,7 @@ export async function register(
       const message = error instanceof Error ? error.message : String(error);
       if (attempt < maxAttempts) {
         console.warn(
-          `Hermes adapter: attempt ${attempt} failed (${message}); retrying in ${attempt}s`,
+          `Hermes adapter: /chat fallback attempt ${attempt} failed (${message}); retrying in ${attempt}s`,
         );
         await new Promise((resolveWait) =>
           setTimeout(resolveWait, attempt * 1000),
@@ -552,4 +546,53 @@ export async function register(
       });
     }
   }
+}
+
+export async function register(
+  annotation: JsonObject,
+  annotationPath?: string | null,
+): Promise<void> {
+  const sessionId = resolveSessionId(annotation);
+  if (!sessionId) {
+    console.info(
+      "Hermes adapter: no sessionId in annotation, target.json, or HERMES_SESSION_ID; skipping delivery",
+    );
+    return;
+  }
+
+  // The annotation id dedupes deliveries so a duplicate POST (or a retry
+  // that actually succeeded server-side) cannot double-send the annotation.
+  const annotationId =
+    typeof annotation.id === "string" && annotation.id ? annotation.id : null;
+  if (annotationId && deliveredIds.has(annotationId)) {
+    console.info(`Hermes adapter: annotation ${annotationId} already delivered; skipping`);
+    return;
+  }
+
+  // PRIMARY path: composer attach. Surface the screenshot PNG + annotation
+  // JSON as composer chips (image thumbnail + file chip) waiting in the
+  // desktop composer; the user writes their own notes and sends manually.
+  // When the desktop accepts the attachments there is NO /chat POST, so the
+  // annotation message is never auto-sent.
+  const attachments = buildComposerAttachments(annotation, annotationPath);
+  if (attachments.length > 0) {
+    const attached = await injectComposerAttachments(
+      sessionId,
+      annotationId,
+      attachments,
+    );
+    if (attached) {
+      if (annotationId) deliveredIds.add(annotationId);
+      return;
+    }
+  } else {
+    console.info(
+      "Hermes adapter: no composer attachments (screenshot PNG and annotation JSON missing on disk); falling back to /chat",
+    );
+  }
+
+  // FALLBACK path: /chat delivery. Runs only when composer attach could not
+  // deliver, so an annotation is never lost. Without HERMES_API_URL /
+  // HERMES_API_KEY nothing can be sent; deliverViaChat logs the skip.
+  await deliverViaChat(annotation, annotationPath, sessionId, annotationId);
 }

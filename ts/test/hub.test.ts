@@ -494,18 +494,15 @@ describe("hermes text-only fallback and caps", () => {
 });
 
 describe("hermes adapter delivery", () => {
-  test("res.ok logs structured success line with message id", async () => {
+  test("attachments present: composer attach called, no /chat POST", async () => {
     const prevUrl = process.env.HERMES_API_URL;
     const prevKey = process.env.HERMES_API_KEY;
     const prevSid = process.env.HERMES_SESSION_ID;
     const originalFetch = globalThis.fetch;
-    let captured: { url: string; body: string } | null = null;
+    const calls: { url: string; body: string }[] = [];
     globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
-      captured = {
-        url: String(url),
-        body: String(init?.body ?? ""),
-      };
-      return new Response(JSON.stringify({ id: "msg-9001" }), {
+      calls.push({ url: String(url), body: String(init?.body ?? "") });
+      return new Response(JSON.stringify({ ok: true }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
@@ -517,38 +514,189 @@ describe("hermes adapter delivery", () => {
         process.env.HERMES_SESSION_ID = "sess-live";
         const annDir = path.join(dir, "annotations");
         await mkdir(annDir, { recursive: true });
-        const jsonPath = path.join(annDir, "20260101-000000-003.json");
+        const pngPath = path.join(annDir, "20260101-000000-010.png");
+        const jsonPath = path.join(annDir, "20260101-000000-010.json");
+        await writeFile(pngPath, TINY_PNG);
         const ann = {
-          id: "ann-success-1",
+          id: "ann-attach-1",
+          source: "test",
+          url: "https://example.test/",
+          viewport: { w: 100, h: 100 },
+          strokes: [],
+          note: "user note",
+          screenshotFile: "20260101-000000-010.png",
+        };
+        await writeFile(jsonPath, JSON.stringify(ann));
+        await registerHermes(ann, jsonPath);
+        assert.equal(calls.length, 1, "exactly one POST runs");
+        assert.ok(
+          calls[0].url.endsWith("/api/composer/attach"),
+          `composer attach endpoint called (got ${calls[0].url})`,
+        );
+        assert.ok(
+          !calls[0].url.includes("/api/sessions/"),
+          "no /chat POST when composer attach delivers",
+        );
+        const sent = JSON.parse(calls[0].body) as {
+          sessionId: string;
+          attachments: { kind: string; path: string; label: string }[];
+        };
+        assert.equal(sent.sessionId, "sess-live");
+        assert.equal(sent.attachments.length, 2);
+        assert.equal(sent.attachments[0].kind, "image");
+        assert.equal(sent.attachments[0].path, path.resolve(pngPath));
+        assert.equal(sent.attachments[1].kind, "file");
+        assert.equal(sent.attachments[1].path, path.resolve(jsonPath));
+        const logLines = (
+          await readFile(path.join(dir, "browserlink-error.log"), "utf8")
+        )
+          .trim()
+          .split("\n");
+        const entry = logLines
+          .map((l) => JSON.parse(l))
+          .find((l) => l.message === "composer-attached");
+        assert.ok(entry, "composer-attached line written to the shared log");
+        assert.equal(entry.adapter, "hermes");
+        assert.equal(entry.annotationId, "ann-attach-1");
+        assert.equal(entry.sessionId, "sess-live");
+        assert.equal(entry.messageId, null);
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (prevUrl === undefined) delete process.env.HERMES_API_URL;
+      else process.env.HERMES_API_URL = prevUrl;
+      if (prevKey === undefined) delete process.env.HERMES_API_KEY;
+      else process.env.HERMES_API_KEY = prevKey;
+      if (prevSid === undefined) delete process.env.HERMES_SESSION_ID;
+      else process.env.HERMES_SESSION_ID = prevSid;
+    }
+  });
+
+  test("no attachments (text-only): /chat fallback", async () => {
+    const prevUrl = process.env.HERMES_API_URL;
+    const prevKey = process.env.HERMES_API_KEY;
+    const prevSid = process.env.HERMES_SESSION_ID;
+    const originalFetch = globalThis.fetch;
+    const calls: { url: string; body: string }[] = [];
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      calls.push({ url: String(url), body: String(init?.body ?? "") });
+      return new Response(JSON.stringify({ id: "msg-9002" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      await withTempDataDir(async (dir) => {
+        process.env.HERMES_API_URL = "http://hermes.test";
+        process.env.HERMES_API_KEY = "k";
+        process.env.HERMES_SESSION_ID = "sess-live";
+        const ann = {
+          id: "ann-fallback-1",
           source: "test",
           url: "https://example.test/",
           viewport: { w: 100, h: 100 },
           strokes: [],
           note: "no screenshot here",
         };
-        await writeFile(jsonPath, JSON.stringify(ann));
-        await registerHermes(ann, jsonPath);
-        assert.ok(captured, "fetch was called");
-        const sent = JSON.parse(captured!.body) as Record<string, unknown>;
-        // Text-only fallback: plain string message, no image part.
+        // No annotationPath and no screenshotFile: zero attachments, so the
+        // composer attach path cannot run and /chat must deliver.
+        await registerHermes(ann, null);
+        assert.equal(calls.length, 1, "only the /chat POST runs");
+        assert.ok(
+          calls[0].url.endsWith("/api/sessions/sess-live/chat"),
+          `chat endpoint called (got ${calls[0].url})`,
+        );
+        assert.ok(!calls[0].url.includes("/api/composer/attach"));
+        const sent = JSON.parse(calls[0].body) as Record<string, unknown>;
         assert.equal(typeof sent.message, "string");
         assert.ok(!String(sent.message).includes("@image:"));
-        assert.ok(String(sent.message).includes("@file:"));
+        assert.ok(!String(sent.message).includes("@file:"));
         assert.ok(String(sent.message).includes("Note: no screenshot here"));
         const logLines = (
           await readFile(path.join(dir, "browserlink-error.log"), "utf8")
         )
           .trim()
           .split("\n");
-        const success = logLines
+        const entry = logLines
           .map((l) => JSON.parse(l))
-          .find((l) => l.message === "delivered");
-        assert.ok(success, "success line written to the shared log");
-        assert.equal(success.adapter, "hermes");
-        assert.equal(success.annotationId, "ann-success-1");
-        assert.equal(success.sessionId, "sess-live");
-        assert.equal(success.messageId, "msg-9001");
-        assert.ok(typeof success.ts === "string" && success.ts.length > 0);
+          .find((l) => l.message === "/chat fallback");
+        assert.ok(entry, "/chat fallback line written to the shared log");
+        assert.equal(entry.adapter, "hermes");
+        assert.equal(entry.annotationId, "ann-fallback-1");
+        assert.equal(entry.sessionId, "sess-live");
+        assert.equal(entry.messageId, "msg-9002");
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (prevUrl === undefined) delete process.env.HERMES_API_URL;
+      else process.env.HERMES_API_URL = prevUrl;
+      if (prevKey === undefined) delete process.env.HERMES_API_KEY;
+      else process.env.HERMES_API_KEY = prevKey;
+      if (prevSid === undefined) delete process.env.HERMES_SESSION_ID;
+      else process.env.HERMES_SESSION_ID = prevSid;
+    }
+  });
+
+  test("attach 404: /chat fallback delivers with message id", async () => {
+    const prevUrl = process.env.HERMES_API_URL;
+    const prevKey = process.env.HERMES_API_KEY;
+    const prevSid = process.env.HERMES_SESSION_ID;
+    const originalFetch = globalThis.fetch;
+    const calls: { url: string; body: string }[] = [];
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      calls.push({ url: u, body: String(init?.body ?? "") });
+      if (u.includes("/api/composer/attach")) {
+        return new Response("not found", { status: 404 });
+      }
+      return new Response(JSON.stringify({ id: "msg-9003" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      await withTempDataDir(async (dir) => {
+        process.env.HERMES_API_URL = "http://hermes.test";
+        process.env.HERMES_API_KEY = "k";
+        process.env.HERMES_SESSION_ID = "sess-live";
+        const annDir = path.join(dir, "annotations");
+        await mkdir(annDir, { recursive: true });
+        const jsonPath = path.join(annDir, "20260101-000000-011.json");
+        const ann = {
+          id: "ann-fallback-2",
+          source: "test",
+          url: "https://example.test/",
+          viewport: { w: 100, h: 100 },
+          strokes: [],
+          note: "file chip only",
+        };
+        await writeFile(jsonPath, JSON.stringify(ann));
+        await registerHermes(ann, jsonPath);
+        assert.equal(calls.length, 2, "attach POST then /chat fallback POST");
+        assert.ok(
+          calls[0].url.endsWith("/api/composer/attach"),
+          `attach endpoint tried first (got ${calls[0].url})`,
+        );
+        assert.ok(
+          calls[1].url.endsWith("/api/sessions/sess-live/chat"),
+          `chat endpoint used as fallback (got ${calls[1].url})`,
+        );
+        const sent = JSON.parse(calls[1].body) as Record<string, unknown>;
+        assert.equal(typeof sent.message, "string");
+        assert.ok(String(sent.message).includes("@file:"));
+        const logLines = (
+          await readFile(path.join(dir, "browserlink-error.log"), "utf8")
+        )
+          .trim()
+          .split("\n");
+        const entry = logLines
+          .map((l) => JSON.parse(l))
+          .find((l) => l.message === "/chat fallback");
+        assert.ok(entry, "/chat fallback line written to the shared log");
+        assert.equal(entry.adapter, "hermes");
+        assert.equal(entry.annotationId, "ann-fallback-2");
+        assert.equal(entry.sessionId, "sess-live");
+        assert.equal(entry.messageId, "msg-9003");
       });
     } finally {
       globalThis.fetch = originalFetch;
