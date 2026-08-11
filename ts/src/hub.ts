@@ -19,6 +19,7 @@ import {
   atomicWriteBytes,
   validatePayload,
   validateTargetBody,
+  MAX_SCREENSHOT_BYTES,
   type JsonObject,
 } from "./schema.ts";
 import * as hermes from "./adapters/hermes.ts";
@@ -167,15 +168,21 @@ function requestPathname(reqUrl: string | undefined): string {
 
 async function readJsonBody(
   req: http.IncomingMessage,
-): Promise<{ payload: unknown; error: string | null }> {
+): Promise<{ payload: unknown; error: string | null; status: number | null }> {
   try {
     const lengthHeader = req.headers["content-length"];
     if (lengthHeader === undefined) {
-      return { payload: null, error: "invalid JSON" };
+      return { payload: null, error: "invalid JSON", status: 400 };
     }
     const length = Number.parseInt(String(lengthHeader), 10);
     if (!Number.isFinite(length) || length < 0) {
-      return { payload: null, error: "invalid JSON" };
+      return { payload: null, error: "invalid JSON", status: 400 };
+    }
+    // Oversized annotation payloads (base64 screenshots inflate ~4/3) are
+    // rejected up front with 413 so a single bad send can never exhaust the
+    // hub or the downstream API server request cap (10 MB there too).
+    if (length > MAX_SCREENSHOT_BYTES) {
+      return { payload: null, error: "payload too large", status: 413 };
     }
     const chunks: Buffer[] = [];
     let received = 0;
@@ -186,9 +193,9 @@ async function readJsonBody(
       if (received > length) break;
     }
     const raw = Buffer.concat(chunks).subarray(0, length).toString("utf8");
-    return { payload: JSON.parse(raw), error: null };
+    return { payload: JSON.parse(raw), error: null, status: null };
   } catch {
-    return { payload: null, error: "invalid JSON" };
+    return { payload: null, error: "invalid JSON", status: 400 };
   }
 }
 
@@ -473,9 +480,9 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
           return;
         }
 
-        const { payload, error: err } = await readJsonBody(req);
+        const { payload, error: err, status: bodyStatus } = await readJsonBody(req);
         if (err !== null) {
-          status = 400;
+          status = bodyStatus ?? 400;
           sendJson(res, status, { error: err });
           return;
         }

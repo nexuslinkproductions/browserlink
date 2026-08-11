@@ -4903,7 +4903,11 @@
         // always hide. The inspector and chat card are the chrome the user
         // watches while the note sends and stay visible throughout.
         const toolbarTouchesCrop = (() => {
-          const tb = host.querySelector('.comet-toolbar') ?? host.querySelector('.comet-chip');
+          // The toolbar and chip live inside the CLOSED shadow root, so
+          // host.querySelector cannot see them. Use the retained refs:
+          // the chip is the visible surface when collapsed, the toolbar
+          // otherwise.
+          const tb = state.collapsed ? chipEl : toolbar;
           if (!tb) return false;
           const r = tb.getBoundingClientRect();
           return !(

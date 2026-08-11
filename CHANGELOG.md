@@ -19,9 +19,11 @@ All notable changes to browserlink are documented here. Format follows
   that chat; endpoint porting hardened (`localhost` -> `127.0.0.1`, trailing
   slash strip, stale-endpoint fallback).
 - **Transport hardening** - Hermes adapter: response-status checking, bounded
-  retry (1s/4s) on network failures only, dedupe by annotation id, structured
-  success/error logging to `browserlink-error.log`, text-only fallback when no
-  screenshot exists, directive lines protected from text caps. Webhook
+  retry (1s then 2s backoff on network failures, HTTP 5xx retried without
+  delay), dedupe by annotation id, structured success/error logging to
+  `browserlink-error.log`, /chat fallback only when composer attach cannot
+  deliver (no attachments, 404, or attach failure), directive lines protected
+  from text caps. Webhook
   adapter: payload size cap + skip logging. Hub: oversized payloads -> 413,
   malformed JSON handling, per-adapter crash isolation.
 - **Queued note delivery** - annotation notes (`note` + `notes`) now flow
@@ -29,8 +31,10 @@ All notable changes to browserlink are documented here. Format follows
 
 ### Fixed
 
-- **Send no longer hides the UI** - the capture state hides only the hover
-  box + canvas; the toolbar and inspector stay visible during send.
+- **Send keeps the chrome visible** - the capture state always hides the
+  hover box + canvas; the toolbar and collapsed chip hide only when they
+  intersect the element crop (full mode), so a screenshot never shows the
+  tool; the inspector and chat card stay visible during send.
 - **'n' key no longer exits isolation** - UI-origin keystrokes call
   `stopImmediatePropagation` so host-page shortcuts (Comet's 'n') never fire
   from extension controls.
