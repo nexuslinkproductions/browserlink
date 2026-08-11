@@ -20,14 +20,22 @@
  * page document, where the manifest-injected copy lives) ----
  * Single source for all UI colors. Only the fixed annotation palette
  * (#ff5252/#4a9eff/#ffd166/#35c759) is hardcoded in the shadow content. */
-/* ---- send capture state: hide only what overlaps the element crop ----
-   The capture is cropped to the selected element rect (+8px), so the toolbar
-   and chip are outside the shot and must NOT blink. The hover box and canvas
-   strokes sit ON the element and would pollute the crop, so they hide. The
-   inspector and chat card stay fully visible while the note sends. */
-:host(.comet-capturing) .comet-hl,
-:host(.comet-capturing) .comet-hover-box,
-:host(.comet-capturing) canvas {
+/* ---- send capture state: hide the tool surface, keep the chrome ----
+   The capture is cropped to the selected element rect (+8px). The hover box
+   and canvas strokes sit ON the element and would pollute the crop, so they
+   always hide (partial + full). The toolbar and its collapsed chip are
+   draggable and can sit inside the crop, so they hide only in FULL mode
+   (toolbar intersects the crop); in partial mode they stay visible and never
+   blink. The inspector and chat card are the chrome the user watches while
+   the note sends, so they stay fully visible throughout. */
+:host([data-capturing='full']) .comet-toolbar,
+:host([data-capturing='full']) .comet-chip,
+:host([data-capturing='partial']) .comet-hl,
+:host([data-capturing='partial']) .comet-hover-box,
+:host([data-capturing='partial']) canvas,
+:host([data-capturing='full']) .comet-hl,
+:host([data-capturing='full']) .comet-hover-box,
+:host([data-capturing='full']) canvas {
   visibility: hidden !important;
 }
 

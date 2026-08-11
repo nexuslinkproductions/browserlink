@@ -4883,10 +4883,11 @@
       + ' captureRect=' + (captureRect ? 'yes' : 'no'));
     setStatus('sending…', '');
     let ok = false;
-    // Hide the tool overlay (toolbar, inspector, canvas, markers) so the
+    // Hide the tool surface (toolbar, chip, hover box, canvas) so the
     // captured screenshot shows only the page element, never the tool UI.
-    // The SW captures before it responds, so restoring after the round-trip
-    // is safe.
+    // The inspector and chat card stay visible - they are the chrome the
+    // user watches while the note sends. The SW captures before it
+    // responds, so restoring after the round-trip is safe.
     let overlayHidden = false;
     // Hide the tool overlay ONLY when an element-only screenshot is being
     // captured (captureRect exists). For stroke-only sends there is no
@@ -4894,10 +4895,23 @@
     // animating uninterrupted.
     try {
       if (captureRect && host && host.parentNode) {
-        // Hide ONLY the tool chrome (toolbar, chip, hover box, canvas) so the
-        // capture shows the bare page element. The inspector stays visible:
-        // the user watches it while the queued note sends.
-        host.classList.add('comet-capturing');
+        // Hide the tool surface so the capture shows only the page element.
+        // The toolbar and its collapsed chip are draggable and can sit inside
+        // the element crop, so they hide only when they actually intersect
+        // the crop; otherwise they stay fully visible and never blink. The
+        // hover box and canvas strokes always sit ON the element, so they
+        // always hide. The inspector and chat card are the chrome the user
+        // watches while the note sends and stay visible throughout.
+        const toolbarTouchesCrop = (() => {
+          const tb = host.querySelector('.comet-toolbar') ?? host.querySelector('.comet-chip');
+          if (!tb) return false;
+          const r = tb.getBoundingClientRect();
+          return !(
+            r.right < captureRect.x || r.left > captureRect.x + captureRect.w ||
+            r.bottom < captureRect.y || r.top > captureRect.y + captureRect.h
+          );
+        })();
+        host.dataset.capturing = toolbarTouchesCrop ? 'full' : 'partial';
         overlayHidden = true;
         // Flush the hide to the compositor BEFORE the SW captures: the SW
         // runs captureVisibleTab on message receipt, and without waiting for
@@ -4920,7 +4934,7 @@
         'latencyMs=' + (Date.now() - sendStartMs) + ' error=sendMessage threw');
     }
     try {
-      if (overlayHidden && host) host.classList.remove('comet-capturing');
+      if (overlayHidden && host) delete host.dataset.capturing;
     } catch (_) { /* ok */ }
     // The capture-hide covered the ring's first radiation (element sends):
     // re-kick it from the button's current center so the success moment shows
