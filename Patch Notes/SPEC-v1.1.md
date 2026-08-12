@@ -1,11 +1,11 @@
-# browserlink v1.1 — Extension Update Spec (toolbar, activation, element inspector)
+# browserlink v1.1 - Extension Update Spec (toolbar, activation, element inspector)
 
 Repo: /Users/marcelspatz/browserlink (branch main, tag v1.0.0 shipped).
 This update ships as a PR: feat/extension-v1.1 -> main, tagged v1.1.0 after merge.
 Backward compatible: schema v1 gains an OPTIONAL `edits` field on elements.
 
 ## Payload schema addition (protocol v1.1, documented in docs/protocol.md)
-elements[].edits — optional object mapping a CSS/text property to the DESIRED
+elements[].edits - optional object mapping a CSS/text property to the DESIRED
 new value (string), e.g. {"width":"48px","fontSize":"16px","color":"#0af",
 "text":"Shop now"}. Allowed keys: width, height, fontFamily, fontSize,
 fontWeight, lineHeight, color, backgroundColor, text, href, display, margin,
@@ -50,7 +50,7 @@ visual verification.
    instruction chat) must keep working unchanged.
 5. Activation/deactivation messages: content.js listens for
    chrome.runtime.onMessage {type:"browserlinkToggle", enabled:bool} and
-   {type:"browserlinkExit"} — exit removes everything (as above); toggle off
+   {type:"browserlinkExit"} - exit removes everything (as above); toggle off
    == exit; toggle on == inject (idempotent, guarded by the existing
    __browserlinkInjected flag).
 

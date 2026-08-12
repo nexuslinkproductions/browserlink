@@ -1,4 +1,4 @@
-# browserlink v1.5 — Full lightweight text editor in the inspector
+# browserlink v1.5 - Full lightweight text editor in the inspector
 
 Repo: /Users/marcelspatz/browserlink. Ships as its own PR (feat/editor-v1.5 -> main),
 tag v1.5.0 after merge. Do NOT touch the TS v2.0 work (ts/ dir) or the

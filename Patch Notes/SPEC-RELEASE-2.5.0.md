@@ -1,4 +1,4 @@
-# browserlink — Patch Notes v2.5.0
+# browserlink - Patch Notes v2.5.0
 
 Released: 2026-08-12
 Branch: feat/overnight-v2.5 → main (single PR)
