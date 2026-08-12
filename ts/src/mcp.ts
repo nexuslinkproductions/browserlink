@@ -12,6 +12,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+import { INTENT_VALUES, SEVERITY_VALUES } from "./schema.ts";
+
 export const VERSION = "2.6.0";
 export const DEFAULT_HUB = "http://127.0.0.1:8787";
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
@@ -108,6 +110,14 @@ export type AnnotationListOptions = {
   url?: string;
   /** ISO 8601 timestamp; only annotations stored at or after it are returned. */
   since?: string;
+  /** Element CSS-path prefix filter (NFC-normalized, case-insensitive prefix over any element's cssPath). */
+  cssPathPrefix?: string;
+  /** True: only annotations whose elements include at least one non-empty edits array; false: only annotations with no element edits. */
+  hasEdits?: boolean;
+  /** Any element carries this intent (one of fix, change, question, approve). */
+  intent?: string;
+  /** Any element carries this severity (one of blocking, important, suggestion). */
+  severity?: string;
 };
 
 /* ---------------------------------------------------------------------------
@@ -187,11 +197,66 @@ export async function listAnnotationFiles(): Promise<AnnotationFileInfo[]> {
   return result;
 }
 
+function elementEditCount(element: JsonObject): number {
+  const edits = element.edits;
+  return Array.isArray(edits) ? edits.length : 0;
+}
+
+/* Any element carries a non-empty edits array. */
+function hasEdits(annotation: JsonObject): boolean {
+  if (!Array.isArray(annotation.elements)) return false;
+  for (const element of annotation.elements) {
+    if (element === null || typeof element !== "object" || Array.isArray(element)) {
+      continue;
+    }
+    if (elementEditCount(element as JsonObject) > 0) return true;
+  }
+  return false;
+}
+
+/* Any element carries the given scalar field value (intent / severity). */
+function anyElementField(annotation: JsonObject, key: string, value: string): boolean {
+  if (!Array.isArray(annotation.elements)) return false;
+  for (const element of annotation.elements) {
+    if (element === null || typeof element !== "object" || Array.isArray(element)) {
+      continue;
+    }
+    if ((element as JsonObject)[key] === value) return true;
+  }
+  return false;
+}
+
+/* Any element's cssPath starts with the normalized prefix. */
+function anyElementCssPathPrefix(annotation: JsonObject, prefix: string): boolean {
+  if (!Array.isArray(annotation.elements)) return false;
+  for (const element of annotation.elements) {
+    if (element === null || typeof element !== "object" || Array.isArray(element)) {
+      continue;
+    }
+    const cssPath = (element as JsonObject).cssPath;
+    if (typeof cssPath === "string" && normalizeSearchText(cssPath).startsWith(prefix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export async function listAnnotationFilesFiltered(
   options: AnnotationListOptions = {},
 ): Promise<AnnotationFileInfo[]> {
   const q = normalizeSearchText((options.q ?? "").trim());
   const urlFilter = normalizeSearchText((options.url ?? "").trim());
+  const cssPathPrefix = normalizeSearchText((options.cssPathPrefix ?? "").trim());
+  if (options.intent !== undefined && !(INTENT_VALUES as readonly string[]).includes(options.intent)) {
+    throw new Error(
+      `intent must be one of ${INTENT_VALUES.join(", ")}`,
+    );
+  }
+  if (options.severity !== undefined && !(SEVERITY_VALUES as readonly string[]).includes(options.severity)) {
+    throw new Error(
+      `severity must be one of ${SEVERITY_VALUES.join(", ")}`,
+    );
+  }
   const sinceRaw = options.since ?? "";
   let sinceMs: number | null = null;
   if (sinceRaw !== "") {
@@ -202,7 +267,9 @@ export async function listAnnotationFilesFiltered(
     sinceMs = parsed;
   }
   const all = await listAnnotationFiles();
-  const filtering = q !== "" || urlFilter !== "" || sinceMs !== null;
+  const filtering = q !== "" || urlFilter !== "" || sinceMs !== null
+    || cssPathPrefix !== "" || options.hasEdits !== undefined
+    || options.intent !== undefined || options.severity !== undefined;
   if (!filtering) return all;
 
   const out: AnnotationFileInfo[] = [];
@@ -211,6 +278,17 @@ export async function listAnnotationFilesFiltered(
     const annotation = await tryReadAnnotation(info.name);
     if (annotation === null) continue; // corrupt record: skipped like REST
     if (urlFilter !== "" && !normalizeSearchText(annotation.url).includes(urlFilter)) {
+      continue;
+    }
+    if (cssPathPrefix !== "" && !anyElementCssPathPrefix(annotation, cssPathPrefix)) {
+      continue;
+    }
+    if (options.hasEdits === true && !hasEdits(annotation)) continue;
+    if (options.hasEdits === false && hasEdits(annotation)) continue;
+    if (options.intent !== undefined && !anyElementField(annotation, "intent", options.intent)) {
+      continue;
+    }
+    if (options.severity !== undefined && !anyElementField(annotation, "severity", options.severity)) {
       continue;
     }
     if (q !== "" && !annotationSearchText(annotation).includes(q)) continue;
@@ -397,16 +475,28 @@ export function createMcpServer(): McpServer {
     "annotations_list",
     {
       description:
-        "List annotation files, newest first. Optional q (full-text term across label, URL, title, notes, element text and instruction), url (URL substring), and since (ISO 8601 timestamp) filters match the hub REST search semantics.",
+        "List annotation files, newest first. Optional filters compose with AND semantics and match the hub REST search normalization: q (full-text term across label, URL, title, notes, element text and instruction), url (URL substring), since (ISO 8601 timestamp), cssPathPrefix (element CSS-path prefix), hasEdits (boolean: elements include a non-empty edits array), intent (fix, change, question, or approve on any element), and severity (blocking, important, or suggestion on any element).",
       inputSchema: {
         limit: z.number().int().default(20).describe("Max files to return"),
         q: z.string().optional().describe("Full-text term; case-insensitive NFC-normalized substring match"),
         url: z.string().optional().describe("URL substring filter (same normalization as q)"),
         since: z.string().optional().describe("ISO 8601 timestamp; only annotations stored at or after it"),
+        cssPathPrefix: z.string().optional().describe("Element cssPath prefix filter (NFC-normalized, case-insensitive; any element)"),
+        hasEdits: z.boolean().optional().describe("True: only annotations whose elements include at least one non-empty edits array; false: only annotations with no element edits"),
+        intent: z.enum(["fix", "change", "question", "approve"]).optional().describe("Only annotations where any element carries this intent"),
+        severity: z.enum(["blocking", "important", "suggestion"]).optional().describe("Only annotations where any element carries this severity"),
       },
     },
-    async ({ limit, q, url, since }) =>
-      asText(await annotationsList(limit ?? 20, { q, url, since })),
+    async ({ limit, q, url, since, cssPathPrefix, hasEdits, intent, severity }) =>
+      asText(await annotationsList(limit ?? 20, {
+        q,
+        url,
+        since,
+        cssPathPrefix,
+        hasEdits,
+        intent,
+        severity,
+      })),
   );
 
   server.registerTool(

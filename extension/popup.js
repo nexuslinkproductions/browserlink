@@ -962,6 +962,200 @@ function onSearchInput() {
   searchTimer = setTimeout(runSearch, SEARCH_DEBOUNCE_MS);
 }
 
+/* ---- Route opt-outs (F10): origin + pathname-prefix exclusion list ----
+ * The popup manages a local list of exact-origin plus pathname-prefix
+ * opt-outs in chrome.storage.local ("routeOptOuts"). Entries are
+ * canonicalized (default port removed, localhost mapped to 127.0.0.1,
+ * trailing slashes stripped); wildcards, query strings, fragments, and
+ * invalid URLs are rejected and never stored. The content script keeps
+ * opted-out routes dormant and exits an active host once when the SPA
+ * navigates into one; the service worker refuses programmatic enable on
+ * them. Matching functions are pure and identical to the content script's,
+ * so the mechanism gate can extract and drive them from either file. */
+const ROUTE_OPTOUTS_KEY = 'routeOptOuts'; // chrome.storage.local
+
+// Canonicalize an opt-out entry (see the content script for the exact
+// contract): 'scheme://host[:port][/path]', default port removed, host
+// lowercased, trailing slash stripped, query/fragment/wildcards rejected.
+function normalizeRoutePattern(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return null;
+  if (s.indexOf('*') !== -1) return null;
+  if (s.indexOf('?') !== -1 || s.indexOf('#') !== -1) return null;
+  let url = null;
+  try { url = new URL(s); } catch (_) { return null; }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  let host = url.hostname.toLowerCase();
+  if (host === 'localhost') host = '127.0.0.1';
+  const port = url.port;
+  const defaultPort =
+    (url.protocol === 'http:' && port === '80') ||
+    (url.protocol === 'https:' && port === '443');
+  const hostPort = defaultPort ? host : (port ? host + ':' + port : host);
+  let path = url.pathname || '';
+  while (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+  if (path === '/') path = '';
+  return url.protocol + '//' + hostPort + path;
+}
+
+// Split a canonical entry into {origin, prefix}. prefix '' matches every
+// path on the origin; a non-empty prefix is a pathname prefix.
+function routeEntryParts(canonical) {
+  const idx = canonical.indexOf('://');
+  if (idx < 0) return { origin: canonical, prefix: '' };
+  const rest = canonical.slice(idx + 3);
+  const slash = rest.indexOf('/');
+  if (slash < 0) return { origin: canonical, prefix: '' };
+  return { origin: canonical.slice(0, idx + 3) + rest.slice(0, slash), prefix: rest.slice(slash) };
+}
+
+// Does the href sit on an opted-out route? Exact-origin entries match every
+// path; origin + pathname-prefix entries match with a boundary check.
+function routeMatchesHref(optOuts, href) {
+  if (!Array.isArray(optOuts) || optOuts.length === 0) return false;
+  let current = null;
+  try { current = new URL(href); } catch (_) { return false; }
+  let host = current.hostname.toLowerCase();
+  if (host === 'localhost') host = '127.0.0.1';
+  const port = current.port;
+  const defaultPort =
+    (current.protocol === 'http:' && port === '80') ||
+    (current.protocol === 'https:' && port === '443');
+  const hostPort = defaultPort ? host : (port ? host + ':' + port : host);
+  const origin = current.protocol + '//' + hostPort;
+  const pathname = current.pathname || '/';
+  for (const entry of optOuts) {
+    const canonical = normalizeRoutePattern(entry);
+    if (!canonical) continue;
+    const parts = routeEntryParts(canonical);
+    if (parts.origin !== origin) continue;
+    if (parts.prefix === '') return true;
+    if (pathname === parts.prefix || pathname.startsWith(parts.prefix + '/')) return true;
+  }
+  return false;
+}
+
+function addRouteOptOut() {
+  const input = $('routeInput');
+  const status = $('routeStatus');
+  const raw = (input.value || '').trim();
+  if (!raw) {
+    status.textContent = 'Enter an origin, optionally with a path prefix.';
+    status.className = 'hint err';
+    return;
+  }
+  if (raw.indexOf('*') !== -1) {
+    status.textContent = 'Wildcards are not supported; use an exact origin plus an optional path prefix.';
+    status.className = 'hint err';
+    return;
+  }
+  if (raw.indexOf('?') !== -1 || raw.indexOf('#') !== -1) {
+    status.textContent = 'Query strings and fragments are not stored; use origin + path only.';
+    status.className = 'hint err';
+    return;
+  }
+  const canonical = normalizeRoutePattern(raw);
+  if (!canonical) {
+    status.textContent = 'Not a valid http(s) URL.';
+    status.className = 'hint err';
+    return;
+  }
+  chrome.storage.local.get(ROUTE_OPTOUTS_KEY).then((got) => {
+    const list = (got && Array.isArray(got[ROUTE_OPTOUTS_KEY]))
+      ? got[ROUTE_OPTOUTS_KEY].slice()
+      : [];
+    if (list.indexOf(canonical) !== -1) {
+      status.textContent = 'Already on the list.';
+      status.className = 'hint err';
+      return;
+    }
+    list.push(canonical);
+    return chrome.storage.local.set({ [ROUTE_OPTOUTS_KEY]: list }).then(() => {
+      input.value = '';
+      status.textContent = 'Added ' + canonical;
+      status.className = 'hint';
+      renderRouteOptOuts();
+      refreshRouteState();
+    });
+  }).catch(() => {
+    status.textContent = 'Could not save the opt-out.';
+    status.className = 'hint err';
+  });
+}
+
+function removeRouteOptOut(canonical) {
+  chrome.storage.local.get(ROUTE_OPTOUTS_KEY).then((got) => {
+    const list = (got && Array.isArray(got[ROUTE_OPTOUTS_KEY]))
+      ? got[ROUTE_OPTOUTS_KEY].slice()
+      : [];
+    const next = list.filter((entry) => entry !== canonical);
+    if (next.length === list.length) return;
+    return chrome.storage.local.set({ [ROUTE_OPTOUTS_KEY]: next }).then(() => {
+      renderRouteOptOuts();
+      refreshRouteState();
+    });
+  }).catch(() => { /* storage unavailable */ });
+}
+
+function renderRouteOptOuts() {
+  const listEl = $('routeList');
+  listEl.textContent = '';
+  chrome.storage.local.get(ROUTE_OPTOUTS_KEY).then((got) => {
+    const list = (got && Array.isArray(got[ROUTE_OPTOUTS_KEY]))
+      ? got[ROUTE_OPTOUTS_KEY]
+      : [];
+    if (list.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'note';
+      empty.textContent = 'No route opt-outs: the tool may activate on every eligible page.';
+      listEl.appendChild(empty);
+      return;
+    }
+    // textContent only: stored entries are treated as untrusted text.
+    for (const canonical of list) {
+      const row = document.createElement('div');
+      row.className = 'route-item';
+      const pat = document.createElement('span');
+      pat.className = 'pat';
+      pat.textContent = String(canonical);
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.textContent = 'Remove';
+      rm.title = 'Allow the tool on ' + String(canonical);
+      rm.addEventListener('click', () => removeRouteOptOut(String(canonical)));
+      row.appendChild(pat);
+      row.appendChild(rm);
+      listEl.appendChild(row);
+    }
+  }).catch(() => { /* storage unavailable */ });
+}
+
+/* Current-tab route state via the service worker. Harnesses use the same
+ * browserlinkRouteControl message with action enable/disable; restricted
+ * pages fail closed. */
+async function refreshRouteState() {
+  const el = $('routeState');
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'browserlinkRouteControl', action: 'state' });
+    if (resp && resp.ok) {
+      const reasonText = {
+        'restricted': 'restricted page',
+        'route-opt-out': 'route opt-out',
+      }[resp.reason] || '';
+      const act = resp.enabled ? 'active' : 'dormant';
+      el.textContent = 'Current tab: ' + (resp.routeMatched ? 'opted out' : 'allowed')
+        + ' (' + act + ')' + (reasonText ? ' - ' + reasonText : '');
+      el.className = resp.routeMatched || resp.reason === 'restricted' ? 'hint err' : 'hint';
+    } else {
+      el.textContent = 'Current tab state unavailable.';
+      el.className = 'hint err';
+    }
+  } catch (_) {
+    el.textContent = 'Current tab state unavailable.';
+    el.className = 'hint err';
+  }
+}
+
 /* wiring */
 $('toolToggle').addEventListener('change', onToolToggle);
 $('alwaysOnToggle').addEventListener('change', onAlwaysOnToggle);
@@ -995,9 +1189,23 @@ $('searchInput').addEventListener('keydown', (event) => {
     $('searchResults').textContent = '';
   }
 });
+$('routeAdd').addEventListener('click', addRouteOptOut);
+$('routeInput').addEventListener('keydown', (event) => {
+  // Keyboard reachable: Enter adds the opt-out, Escape clears the input.
+  if (event.key === 'Enter') {
+    addRouteOptOut();
+  } else if (event.key === 'Escape') {
+    $('routeInput').value = '';
+    $('routeStatus').textContent = '';
+    $('routeStatus').className = 'hint';
+  }
+});
+$('routeRefresh').addEventListener('click', refreshRouteState);
 checkHub();
 loadEndpoint();
 loadLabel();
+renderRouteOptOuts();
+refreshRouteState();
 loadToolEnabled();
 loadAlwaysOn();
 loadPageState();

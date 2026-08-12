@@ -80,6 +80,136 @@ function allowContentSessionStorage() {
   } catch (_) { /* storage unavailable */ }
 }
 
+/* Schemes/hosts where Chrome blocks extension content scripts: the tool can
+ * never run there. Used to fail closed when a harness asks to enable the
+ * current tab. */
+function isRestrictedTabUrl(rawUrl) {
+  const u = String(rawUrl || '').trim();
+  if (!u) return true;
+  if (/^(chrome|chrome-extension|edge|about|devtools|view-source|moz-extension|opera):/i.test(u)) {
+    return true;
+  }
+  try {
+    const url = new URL(u);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:' && url.protocol !== 'file:') {
+      return true;
+    }
+    if (url.hostname === 'chrome.google.com' && /^\/webstore\//.test(url.pathname)) {
+      return true;
+    }
+  } catch (_) { return true; }
+  return false;
+}
+
+/* ---- Route opt-outs (F10): same canonicalization and matching the content
+ * script and popup use. The service worker evaluates the ACTIVE tab's URL
+ * so harnesses can enable/disable the current eligible tab programmatically
+ * and so activation is refused on opted-out routes before any injection. */
+const ROUTE_OPTOUTS_KEY = 'routeOptOuts'; // chrome.storage.local
+
+// Canonicalize an opt-out entry: 'scheme://host[:port][/path]' with the
+// default port removed, host lowercased (localhost mapped to 127.0.0.1),
+// and trailing slashes stripped. Wildcards, query strings, fragments, and
+// non-http(s) input are rejected (return null).
+function normalizeRoutePattern(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return null;
+  if (s.indexOf('*') !== -1) return null;
+  if (s.indexOf('?') !== -1 || s.indexOf('#') !== -1) return null;
+  let url = null;
+  try { url = new URL(s); } catch (_) { return null; }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  let host = url.hostname.toLowerCase();
+  if (host === 'localhost') host = '127.0.0.1';
+  const port = url.port;
+  const defaultPort =
+    (url.protocol === 'http:' && port === '80') ||
+    (url.protocol === 'https:' && port === '443');
+  const hostPort = defaultPort ? host : (port ? host + ':' + port : host);
+  let path = url.pathname || '';
+  while (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+  if (path === '/') path = '';
+  return url.protocol + '//' + hostPort + path;
+}
+
+// Split a canonical entry into {origin, prefix}. prefix '' matches every
+// path on the origin; a non-empty prefix is a pathname prefix.
+function routeEntryParts(canonical) {
+  const idx = canonical.indexOf('://');
+  if (idx < 0) return { origin: canonical, prefix: '' };
+  const rest = canonical.slice(idx + 3);
+  const slash = rest.indexOf('/');
+  if (slash < 0) return { origin: canonical, prefix: '' };
+  return { origin: canonical.slice(0, idx + 3) + rest.slice(0, slash), prefix: rest.slice(slash) };
+}
+
+// Does the href sit on an opted-out route? Exact-origin entries match every
+// path; origin + pathname-prefix entries match with a boundary check.
+function routeMatchesHref(optOuts, href) {
+  if (!Array.isArray(optOuts) || optOuts.length === 0) return false;
+  let current = null;
+  try { current = new URL(href); } catch (_) { return false; }
+  let host = current.hostname.toLowerCase();
+  if (host === 'localhost') host = '127.0.0.1';
+  const port = current.port;
+  const defaultPort =
+    (current.protocol === 'http:' && port === '80') ||
+    (current.protocol === 'https:' && port === '443');
+  const hostPort = defaultPort ? host : (port ? host + ':' + port : host);
+  const origin = current.protocol + '//' + hostPort;
+  const pathname = current.pathname || '/';
+  for (const entry of optOuts) {
+    const canonical = normalizeRoutePattern(entry);
+    if (!canonical) continue;
+    const parts = routeEntryParts(canonical);
+    if (parts.origin !== origin) continue;
+    if (parts.prefix === '') return true;
+    if (pathname === parts.prefix || pathname.startsWith(parts.prefix + '/')) return true;
+  }
+  return false;
+}
+
+async function storedRouteOptOuts() {
+  try {
+    const got = await chrome.storage.local.get(ROUTE_OPTOUTS_KEY);
+    const list = got && got[ROUTE_OPTOUTS_KEY];
+    return Array.isArray(list) ? list : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+/* Route state for the active tab: {routeMatched, enabled, reason}. Restricted
+ * pages fail closed (reason 'restricted'). When the tab URL is unavailable
+ * the content script (if present) reports its own route match. */
+async function activeTabRouteState() {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tab = tabs && tabs[0];
+  if (!tab || typeof tab.id !== 'number') {
+    return { routeMatched: false, enabled: false, reason: 'no-tab', tab: null };
+  }
+  let tabUrl = null;
+  try { tabUrl = typeof tab.url === 'string' && tab.url ? tab.url : null; } catch (_) { tabUrl = null; }
+  if (tabUrl && isRestrictedTabUrl(tabUrl)) {
+    return { routeMatched: false, enabled: false, reason: 'restricted', tab: tab };
+  }
+  let routeMatched = false;
+  if (tabUrl) {
+    routeMatched = routeMatchesHref(await storedRouteOptOuts(), tabUrl);
+  } else {
+    try {
+      const routeResp = await chrome.tabs.sendMessage(tab.id, { type: 'browserlinkGetRoute' });
+      routeMatched = !!(routeResp && routeResp.routeMatched);
+    } catch (_) { routeMatched = false; }
+  }
+  let enabled = false;
+  try {
+    const resp = await chrome.tabs.sendMessage(tab.id, { type: 'browserlinkGetState' });
+    enabled = !!(resp && resp.enabled);
+  } catch (_) { enabled = false; }
+  return { routeMatched: routeMatched, enabled: enabled, reason: '', tab: tab };
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   ensurePollAlarm();
   allowContentSessionStorage();
@@ -339,53 +469,150 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'browserlinkToggle' || msg.type === 'browserlinkExit'
     || msg.type === 'browserlinkShowTour') {
-    // Forward activation/deactivation (and the F6 "Replay intro" tour
-    // request) from the popup to the active tab. If the content script is
-    // absent (fresh page, or after an extension reload) inject it on demand
-    // so the popup works without a refresh; a dormant content script
-    // handles browserlinkShowTour by reinjecting and showing the tour.
-    chrome.tabs.query({ active: true, currentWindow: true })
-      .then((tabs) => {
-        const tab = tabs && tabs[0];
-        if (!tab || typeof tab.id !== 'number') {
-          sendResponse({ ok: false, error: 'no active tab' });
+    // Route opt-outs (F10): activation is refused on opted-out routes and
+    // restricted pages fail closed, before any injection. This guards the
+    // popup toggle, the alarm-driven connect poll, and harness enables
+    // alike; the content script repeats the check as defense in depth.
+    const forward = (tab) => {
+      const injectThenSend = () =>
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['gsap.min.js', 'CustomEase.min.js', 'content.js'],
+        })
+          .then(() => {
+            // content.js init is async: try the message right away, and
+            // retry once after ~150ms if the listener is not ready yet.
+            const trySend = () =>
+              chrome.tabs.sendMessage(tab.id, msg)
+                .then(() => sendResponse({ ok: true }))
+                .catch((err) => {
+                  sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
+                });
+            return chrome.tabs.sendMessage(tab.id, msg)
+              .then(() => sendResponse({ ok: true }))
+              .catch(() => new Promise((resolve) => setTimeout(resolve, 150)).then(trySend));
+          })
+          .catch((err) => {
+            sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
+          });
+      return chrome.tabs.sendMessage(tab.id, msg)
+        .then(() => sendResponse({ ok: true }))
+        .catch(() => {
+          if (msg.type === 'browserlinkExit') {
+            // Nothing to exit: the content script was never injected.
+            sendResponse({ ok: true });
+            return;
+          }
+          return injectThenSend();
+        });
+    };
+    (async () => {
+      let tab = null;
+      try {
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        tab = tabs && tabs[0];
+      } catch (_) { tab = null; }
+      if (!tab || typeof tab.id !== 'number') {
+        sendResponse({ ok: false, error: 'no active tab' });
+        return;
+      }
+      if (msg.type === 'browserlinkToggle' && msg.enabled === true) {
+        let tabUrl = null;
+        try { tabUrl = typeof tab.url === 'string' && tab.url ? tab.url : null; } catch (_) { tabUrl = null; }
+        if (tabUrl && isRestrictedTabUrl(tabUrl)) {
+          sendResponse({ ok: false, error: 'restricted page', routeMatched: false, enabled: false, reason: 'restricted' });
           return;
         }
-        const injectThenSend = () =>
-          chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ['gsap.min.js', 'CustomEase.min.js', 'content.js'],
-          })
-            .then(() => {
-              // content.js init is async: try the message right away, and
-              // retry once after ~150ms if the listener is not ready yet.
-              const trySend = () =>
-                chrome.tabs.sendMessage(tab.id, msg)
-                  .then(() => sendResponse({ ok: true }))
-                  .catch((err) => {
-                    sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
-                  });
-              return chrome.tabs.sendMessage(tab.id, msg)
-                .then(() => sendResponse({ ok: true }))
-                .catch(() => new Promise((resolve) => setTimeout(resolve, 150)).then(trySend));
-            })
-            .catch((err) => {
-              sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
-            });
-        return chrome.tabs.sendMessage(tab.id, msg)
-          .then(() => sendResponse({ ok: true }))
-          .catch(() => {
-            if (msg.type === 'browserlinkExit') {
-              // Nothing to exit: the content script was never injected.
-              sendResponse({ ok: true });
+        let routeMatched = false;
+        if (tabUrl) {
+          routeMatched = routeMatchesHref(await storedRouteOptOuts(), tabUrl);
+        } else {
+          try {
+            const routeResp = await chrome.tabs.sendMessage(tab.id, { type: 'browserlinkGetRoute' });
+            routeMatched = !!(routeResp && routeResp.routeMatched);
+          } catch (_) { routeMatched = false; }
+        }
+        if (routeMatched) {
+          sendResponse({ ok: false, error: 'route opt-out', routeMatched: true, enabled: false, reason: 'route-opt-out' });
+          return;
+        }
+      }
+      return forward(tab);
+    })();
+    return true; // keep the message channel open for the async sendResponse
+  }
+
+  if (msg.type === 'browserlinkRouteControl') {
+    // F10: programmatic per-tab control for harnesses. action 'state'
+    // reports {routeMatched, enabled, reason}; 'enable' activates the
+    // current eligible tab (refused on opted-out routes, restricted pages
+    // fail closed); 'disable' exits it.
+    const action = msg.action === 'enable' || msg.action === 'disable' ? msg.action : 'state';
+    (async () => {
+      try {
+        const state = await activeTabRouteState();
+        if (action === 'enable') {
+          if (state.reason === 'restricted') {
+            sendResponse({ ok: true, routeMatched: false, enabled: false, reason: 'restricted' });
+            return;
+          }
+          if (state.routeMatched) {
+            sendResponse({ ok: true, routeMatched: true, enabled: false, reason: 'route-opt-out' });
+            return;
+          }
+          const tab = state.tab;
+          if (!tab || typeof tab.id !== 'number') {
+            sendResponse({ ok: false, error: 'no active tab', enabled: false, reason: 'no-tab' });
+            return;
+          }
+          try {
+            await chrome.tabs.sendMessage(tab.id, { type: 'browserlinkToggle', enabled: true });
+          } catch (_) {
+            // Content script absent: inject it, then activate (mirrors the
+            // popup toggle's injectThenSend fallback).
+            try {
+              await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                files: ['gsap.min.js', 'CustomEase.min.js', 'content.js'],
+              });
+              await new Promise((resolve) => setTimeout(resolve, 150));
+              await chrome.tabs.sendMessage(tab.id, { type: 'browserlinkToggle', enabled: true });
+            } catch (err) {
+              sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err), routeMatched: false, enabled: false, reason: 'error' });
               return;
             }
-            return injectThenSend();
-          });
-      })
-      .catch((err) => {
-        sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err) });
-      });
+          }
+          // reinject builds the host asynchronously; confirm within ~600ms.
+          let enabled = false;
+          for (let i = 0; i < 6; i++) {
+            try {
+              const resp = await chrome.tabs.sendMessage(tab.id, { type: 'browserlinkGetState' });
+              enabled = !!(resp && resp.enabled);
+            } catch (_) { enabled = false; }
+            if (enabled) break;
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          sendResponse({ ok: true, routeMatched: false, enabled: enabled, reason: 'ok' });
+          return;
+        }
+        if (action === 'disable') {
+          const tab = state.tab;
+          if (tab && typeof tab.id === 'number') {
+            try {
+              await chrome.tabs.sendMessage(tab.id, { type: 'browserlinkExit' });
+            } catch (_) { /* nothing to exit */ }
+          }
+          sendResponse({ ok: true, routeMatched: state.routeMatched, enabled: false, reason: 'disabled' });
+          return;
+        }
+        // state
+        const reason = state.reason === 'restricted' ? 'restricted'
+          : (state.routeMatched ? 'route-opt-out' : (state.enabled ? 'active' : 'inactive'));
+        sendResponse({ ok: true, routeMatched: state.routeMatched, enabled: state.enabled, reason: reason });
+      } catch (err) {
+        sendResponse({ ok: false, error: (err && err.message) ? err.message : String(err), enabled: false });
+      }
+    })();
     return true; // keep the message channel open for the async sendResponse
   }
 

@@ -384,3 +384,236 @@ describe("mcp annotations_list search filters", () => {
     });
   });
 });
+
+/* ---------------------------------------------------------------------------
+ * F10: annotations_list programmatic filters. cssPathPrefix, hasEdits,
+ * intent, and severity compose with q/url/since using AND semantics and
+ * keep the stable newest-first ordering. Invalid filter values reject with
+ * documented errors. Test names carry 'annotations_list' or 'filter' for
+ * the mechanism gate's --test-name-pattern.
+ * ------------------------------------------------------------------------- */
+describe("mcp annotations_list programmatic filters", () => {
+  const filterSeed = [
+    {
+      name: "20260101-000000-000.json",
+      record: {
+        url: "https://fixture.test/a",
+        title: "Alpha",
+        label: "Combined fixture one",
+        notes: [],
+        elements: [
+          {
+            index: 1, tag: "div", cssPath: "#app > div:nth-of-type(1)",
+            text: "First card", instruction: "fix the spacing",
+            intent: "fix", severity: "blocking",
+            edits: [{ key: "color", value: "#fff" }],
+          },
+        ],
+      },
+    },
+    {
+      name: "20260101-000001-000.json",
+      record: {
+        url: "https://fixture.test/b",
+        title: "Beta",
+        label: "Combined fixture two",
+        notes: [],
+        elements: [
+          {
+            index: 1, tag: "p", cssPath: "#main > p:nth-of-type(2)",
+            text: "Second paragraph", instruction: "tweak copy",
+            intent: "change", severity: "suggestion",
+            edits: [{ key: "fontStyle" }],
+          },
+          {
+            index: 2, tag: "span", cssPath: "#app > div:nth-of-type(1) span",
+            text: "inline span",
+            intent: "fix", severity: "blocking",
+          },
+        ],
+      },
+    },
+    {
+      name: "20260101-000002-000.json",
+      record: {
+        url: "https://fixture.test/c",
+        label: "Combined fixture three",
+        notes: [],
+        elements: [
+          { index: 1, cssPath: "#app > div:nth-of-type(1)", intent: "fix", severity: "blocking", edits: [] },
+        ],
+      },
+    },
+    {
+      name: "20260101-000003-000.json",
+      record: {
+        url: "https://fixture.test/d",
+        label: "Combined fixture four",
+        notes: [],
+        elements: [
+          { index: 1, cssPath: "#app > div:nth-of-type(1)", intent: "question", severity: "blocking", edits: [{ key: "x" }] },
+        ],
+      },
+    },
+    {
+      name: "20260101-000004-000.json",
+      record: {
+        url: "https://other.test/e",
+        label: "Combined fixture five",
+        notes: [],
+        elements: [
+          { index: 1, cssPath: "#app > div:nth-of-type(1)", intent: "fix", severity: "blocking", edits: [{ key: "x" }] },
+        ],
+      },
+    },
+    {
+      name: "20260101-000005-000.json",
+      record: {
+        url: "https://fixture.test/f",
+        label: "Combined fixture six",
+        notes: [],
+        elements: [
+          { index: 1, cssPath: "#sidebar > ul", intent: "fix", severity: "blocking", edits: [{ key: "x" }] },
+        ],
+      },
+    },
+  ];
+
+  async function seedFilterData(dir: string): Promise<void> {
+    const annotations = path.join(dir, "annotations");
+    await mkdir(annotations, { recursive: true });
+    for (const item of filterSeed) {
+      await writeFile(
+        path.join(annotations, item.name),
+        JSON.stringify(item.record),
+      );
+      await new Promise((r) => setTimeout(r, 20)); // distinct mtimes
+    }
+  }
+
+  const names = (list: { name: string }[]) => list.map((f) => f.name);
+  // Newest-first mtime order after seeding: reverse of the write order.
+  const ALL = [
+    "20260101-000005-000.json",
+    "20260101-000004-000.json",
+    "20260101-000003-000.json",
+    "20260101-000002-000.json",
+    "20260101-000001-000.json",
+    "20260101-000000-000.json",
+  ];
+
+  test("annotations_list cssPathPrefix filter matches any element prefix", async () => {
+    await withTempDataDir(async (dir) => {
+      await seedFilterData(dir);
+      const byPrefix = await annotationsList(20, { cssPathPrefix: "#app > div" });
+      assert.deepEqual(names(byPrefix), [
+        "20260101-000004-000.json",
+        "20260101-000003-000.json",
+        "20260101-000002-000.json",
+        "20260101-000001-000.json",
+        "20260101-000000-000.json",
+      ]);
+      // Case-insensitive, NFC-normalized: a different-case prefix still matches.
+      const mixedCase = await annotationsList(20, { cssPathPrefix: "#APP > DIV" });
+      assert.deepEqual(names(mixedCase), names(byPrefix));
+      const noHit = await annotationsList(20, { cssPathPrefix: "#footer" });
+      assert.deepEqual(noHit, []);
+    });
+  });
+
+  test("annotations_list hasEdits filter separates edited elements", async () => {
+    await withTempDataDir(async (dir) => {
+      await seedFilterData(dir);
+      const edited = await annotationsList(20, { hasEdits: true });
+      // A1, A2, A4, A5, A6 carry a non-empty edits array; A3's edits:[] does not count.
+      assert.deepEqual(names(edited), [
+        "20260101-000005-000.json",
+        "20260101-000004-000.json",
+        "20260101-000003-000.json",
+        "20260101-000001-000.json",
+        "20260101-000000-000.json",
+      ]);
+      const untouched = await annotationsList(20, { hasEdits: false });
+      assert.deepEqual(names(untouched), ["20260101-000002-000.json"]);
+    });
+  });
+
+  test("annotations_list intent and severity filters match any element", async () => {
+    await withTempDataDir(async (dir) => {
+      await seedFilterData(dir);
+      const fix = await annotationsList(20, { intent: "fix" });
+      assert.deepEqual(names(fix), [
+        "20260101-000005-000.json",
+        "20260101-000004-000.json",
+        "20260101-000002-000.json",
+        "20260101-000001-000.json",
+        "20260101-000000-000.json",
+      ]);
+      const question = await annotationsList(20, { intent: "question" });
+      assert.deepEqual(names(question), ["20260101-000003-000.json"]);
+      const blocking = await annotationsList(20, { severity: "blocking" });
+      assert.deepEqual(names(blocking), ALL);
+      const suggestion = await annotationsList(20, { severity: "suggestion" });
+      assert.deepEqual(names(suggestion), ["20260101-000001-000.json"]);
+      // AND semantics between intent and severity: each filter matches any
+      // element independently, so an annotation with fix on one element and
+      // suggestion on another qualifies, while an absent combo does not.
+      const fixAndSuggestion = await annotationsList(20, { intent: "fix", severity: "suggestion" });
+      assert.deepEqual(names(fixAndSuggestion), ["20260101-000001-000.json"]);
+      const changeAndSuggestion = await annotationsList(20, { intent: "change", severity: "suggestion" });
+      assert.deepEqual(names(changeAndSuggestion), ["20260101-000001-000.json"]);
+      const questionAndSuggestion = await annotationsList(20, { intent: "question", severity: "suggestion" });
+      assert.deepEqual(questionAndSuggestion, []);
+    });
+  });
+
+  test("annotations_list combined filter fixture returns exact ordered ids", async () => {
+    await withTempDataDir(async (dir) => {
+      await seedFilterData(dir);
+      // Every filter narrows: q, url, since, cssPathPrefix, hasEdits,
+      // intent, and severity must ALL hold, in newest-first order.
+      const combined = await annotationsList(20, {
+        q: "combined",
+        url: "fixture",
+        since: "2026-01-01T00:00:00.000Z",
+        cssPathPrefix: "#app > div",
+        hasEdits: true,
+        intent: "fix",
+        severity: "blocking",
+      });
+      assert.deepEqual(names(combined), [
+        "20260101-000001-000.json",
+        "20260101-000000-000.json",
+      ]);
+      // limit composes with the filters and keeps the same ordering.
+      const limited = await annotationsList(1, {
+        q: "combined",
+        url: "fixture",
+        since: "2026-01-01T00:00:00.000Z",
+        cssPathPrefix: "#app > div",
+        hasEdits: true,
+        intent: "fix",
+        severity: "blocking",
+      });
+      assert.deepEqual(names(limited), ["20260101-000001-000.json"]);
+    });
+  });
+
+  test("annotations_list invalid filter values reject", async () => {
+    await withTempDataDir(async (dir) => {
+      await seedFilterData(dir);
+      await assert.rejects(
+        () => annotationsList(20, { intent: "bogus" }),
+        /intent must be one of fix, change, question, approve/,
+      );
+      await assert.rejects(
+        () => annotationsList(20, { severity: "bogus" }),
+        /severity must be one of blocking, important, suggestion/,
+      );
+      await assert.rejects(
+        () => annotationsList(20, { intent: "fix", since: "not-a-date" }),
+        /invalid since timestamp/,
+      );
+    });
+  });
+});

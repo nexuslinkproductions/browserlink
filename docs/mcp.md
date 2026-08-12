@@ -10,7 +10,7 @@ chat. Requires hub listening on `http://127.0.0.1:8787` (override with
 | Tool | Args | Returns |
 |---|---|---|
 | `hub_status` | none | `{ok, version, dataDir, adapters}` from local data-dir resolution |
-| `annotations_list` | `limit` (default 20); `q`, `url`, `since` (all optional) | newest-first file list `{name,size,mtime}`, filtered with the same normalization, ordering, and result set as `GET /annotations?q=&url=&since=` |
+| `annotations_list` | `limit` (default 20); `q`, `url`, `since`, `cssPathPrefix`, `hasEdits`, `intent`, `severity` (all optional) | newest-first file list `{name,size,mtime}`, filtered with AND semantics and the same normalization, ordering, and result set as `GET /annotations?q=&url=&since=` |
 | `annotations_latest` | none | newest annotation object, or `{}` |
 | `annotations_get` | `name` | one annotation by safe file name |
 | `annotations_watch` | `seconds` (default 10) | names of files that appear while waiting |
@@ -84,5 +84,22 @@ Optional env:
   compose with AND; an invalid `since` rejects with an error. Records that
   cannot be read are skipped exactly like the REST route's `skippedCorrupt`
   diagnostics, so REST and MCP return the same names in the same order.
+- Programmatic filters (F10): `cssPathPrefix`, `hasEdits`, `intent`, and
+  `severity` compose with `q`, `url`, and `since` using AND semantics and
+  keep the stable newest-first ordering. `cssPathPrefix` is an
+  NFC-normalized, case-insensitive prefix over any element's `cssPath`
+  (an annotation matches when any element's path starts with the prefix).
+  `hasEdits: true` keeps only annotations whose elements include at least
+  one non-empty `edits` array; `hasEdits: false` keeps only annotations
+  with no element edits (an empty `edits: []` does not count as edits).
+  `intent` and `severity` match when any element carries the value, with
+  the strict schema enumerations: `fix | change | question | approve` and
+  `blocking | important | suggestion`. Validation errors are documented and
+  deterministic: an invalid `since` rejects with `invalid since timestamp`,
+  an invalid `intent` with `intent must be one of fix, change, question,
+  approve`, and an invalid `severity` with `severity must be one of
+  blocking, important, suggestion`; the tool schema also rejects unknown
+  enum values up front. A negative `limit` rejects with `limit must be
+  non-negative`.
 - Delivery to Hermes still needs `HERMES_API_URL` and `HERMES_API_KEY` on the
   hub process; the session comes from `target.json` when connected.

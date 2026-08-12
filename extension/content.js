@@ -331,6 +331,136 @@
    */
   const ONBOARDED_KEY = 'browserlinkOnboarded'; // chrome.storage.local
   const ALWAYS_ON_KEY = 'browserlinkAlwaysOn';  // chrome.storage.session
+
+  /* ---------------- Route opt-outs (F10): per-route programmatic control ----------------
+   * A local list of exact-origin plus pathname-prefix opt-outs, stored in
+   * chrome.storage.local under "routeOptOuts" and managed by the popup.
+   * A route that matches an entry stays dormant on load and performs
+   * fullExit once when an active host navigates into it (pushState,
+   * replaceState, popstate, hashchange); leaving the route permits the
+   * existing manual or session always-on activation model. Matching is
+   * pure (no DOM, no storage): canonical origin equality plus a
+   * pathname-prefix boundary check, so the mechanism gate can extract and
+   * drive these functions verbatim. Entries never carry wildcards, query
+   * strings, or fragments.
+   */
+  const ROUTE_OPTOUTS_KEY = 'routeOptOuts'; // chrome.storage.local
+  let lastRouteMatched = null;  // null unknown; true/false after an evaluation
+  let routeOptOutsCount = 0;    // list size seen at the last evaluation
+  let routeCheckPending = false;
+
+  // Canonicalize an opt-out entry: 'scheme://host[:port][/path]' with the
+  // default port removed, host lowercased (localhost mapped to 127.0.0.1),
+  // and trailing slashes stripped. Wildcards, query strings, and fragments
+  // are rejected (return null), as are non-http(s) schemes and unparseable
+  // input. The canonical form is what the popup stores and shows.
+  function normalizeRoutePattern(raw) {
+    const s = String(raw == null ? '' : raw).trim();
+    if (!s) return null;
+    if (s.indexOf('*') !== -1) return null;
+    if (s.indexOf('?') !== -1 || s.indexOf('#') !== -1) return null;
+    let url = null;
+    try { url = new URL(s); } catch (_) { return null; }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    let host = url.hostname.toLowerCase();
+    if (host === 'localhost') host = '127.0.0.1';
+    const port = url.port;
+    const defaultPort =
+      (url.protocol === 'http:' && port === '80') ||
+      (url.protocol === 'https:' && port === '443');
+    const hostPort = defaultPort ? host : (port ? host + ':' + port : host);
+    let path = url.pathname || '';
+    while (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+    if (path === '/') path = '';
+    return url.protocol + '//' + hostPort + path;
+  }
+
+  // Split a canonical entry into {origin, prefix}. prefix '' matches every
+  // path on the origin; a non-empty prefix is a pathname prefix.
+  function routeEntryParts(canonical) {
+    const idx = canonical.indexOf('://');
+    if (idx < 0) return { origin: canonical, prefix: '' };
+    const rest = canonical.slice(idx + 3);
+    const slash = rest.indexOf('/');
+    if (slash < 0) return { origin: canonical, prefix: '' };
+    return { origin: canonical.slice(0, idx + 3) + rest.slice(0, slash), prefix: rest.slice(slash) };
+  }
+
+  // Does the href sit on an opted-out route? Entries are exact-origin
+  // (every path matches) or origin + pathname prefix with a boundary check
+  // (/blocked matches /blocked and /blocked/xyz but not /blocking).
+  function routeMatchesHref(optOuts, href) {
+    if (!Array.isArray(optOuts) || optOuts.length === 0) return false;
+    let current = null;
+    try { current = new URL(href); } catch (_) { return false; }
+    let host = current.hostname.toLowerCase();
+    if (host === 'localhost') host = '127.0.0.1';
+    const port = current.port;
+    const defaultPort =
+      (current.protocol === 'http:' && port === '80') ||
+      (current.protocol === 'https:' && port === '443');
+    const hostPort = defaultPort ? host : (port ? host + ':' + port : host);
+    const origin = current.protocol + '//' + hostPort;
+    const pathname = current.pathname || '/';
+    for (const entry of optOuts) {
+      const canonical = normalizeRoutePattern(entry);
+      if (!canonical) continue; // corrupt entry: skipped, never fatal
+      const parts = routeEntryParts(canonical);
+      if (parts.origin !== origin) continue;
+      if (parts.prefix === '') return true;
+      if (pathname === parts.prefix || pathname.startsWith(parts.prefix + '/')) return true;
+    }
+    return false;
+  }
+
+  // Read the stored opt-out list defensively: any failure yields [].
+  function storedRouteOptOuts() {
+    return new Promise((resolve) => {
+      try {
+        chrome.storage.local.get(ROUTE_OPTOUTS_KEY).then((got) => {
+          const list = got && got[ROUTE_OPTOUTS_KEY];
+          resolve(Array.isArray(list) ? list : []);
+        }).catch(() => resolve([]));
+      } catch (_) { resolve([]); }
+    });
+  }
+
+  // Pure route transition decision for history events, so the mechanism
+  // gate can drive enter/leave fixtures: 'exit' when the route became
+  // matched while the host is active (fullExit once), 'dormant' when the
+  // route is matched and no host exists, 'allowed' when the route is no
+  // longer matched and the host is gone (manual or session always-on
+  // activation is permitted again), 'stay' otherwise.
+  function routeTransitionAction(wasMatched, isMatched, isActive) {
+    if (isMatched && isActive) return 'exit';
+    if (isMatched && !isActive) return 'dormant';
+    if (!isMatched && !isActive && wasMatched) return 'allowed';
+    return 'stay';
+  }
+
+  // Evaluate the current route against the stored opt-outs on every history
+  // event. Fire-and-forget; the route guard never breaks the page.
+  async function checkRouteForHistory() {
+    if (routeCheckPending) return;
+    routeCheckPending = true;
+    try {
+      const optOuts = await storedRouteOptOuts();
+      routeOptOutsCount = optOuts.length;
+      const matched = routeMatchesHref(optOuts, location.href);
+      const isActive = !!(host && host.parentNode);
+      const action = routeTransitionAction(!!lastRouteMatched, matched, isActive);
+      lastRouteMatched = matched;
+      if (action === 'exit') {
+        diagLog('route:exit', 'url=' + location.href + ' optOuts=' + optOuts.length);
+        fullExit({ routeOptOut: true });
+      } else if (action === 'dormant') {
+        diagLog('route:dormant', 'url=' + location.href + ' optOuts=' + optOuts.length);
+      } else if (action === 'allowed') {
+        diagLog('route:allowed', 'url=' + location.href + ' optOuts=' + optOuts.length);
+      }
+    } catch (_) { /* route guard never breaks the page */ }
+    routeCheckPending = false;
+  }
   const TOUR_COPY = [
     {
       title: 'Pick an element',
@@ -845,6 +975,12 @@
         } : null,
       },
       health: diagHealth(false),
+      // Route opt-outs (F10): last evaluated route match state. matched is
+      // null until the first evaluation (init or a history event) ran.
+      route: {
+        matched: lastRouteMatched === null ? null : !!lastRouteMatched,
+        optOuts: routeOptOutsCount,
+      },
       log: diagRing.slice(),
     };
   }
@@ -3587,6 +3723,10 @@
 
   function onHistoryChange() {
     scheduleReanchor('history');
+    // Route opt-outs (F10): pushState/replaceState/popstate/hashchange all
+    // re-evaluate the route so an opted-out route performs fullExit once and
+    // leaving it permits the existing activation model again.
+    checkRouteForHistory();
   }
 
   /* ---------------- deep pick: same-origin frame registry ---------------- */
@@ -8289,7 +8429,12 @@
   }
 
   // Full exit: animate the host out, then remove it and all listeners.
-  function fullExit() {
+  // opts.routeOptOut (F10): the exit was forced by an opted-out route, so
+  // deactivation must NOT persist - the user did not ask to disable the
+  // tool, and leaving the route permits the existing manual or session
+  // always-on activation model again.
+  function fullExit(opts) {
+    const routeOptOut = !!(opts && opts.routeOptOut);
     if (exitTimer) return;
     // Freeze State Capture: unfreeze immediately so the page keeps running
     // during the exit animation (teardownHost also calls removeFreeze, so
@@ -8358,10 +8503,12 @@
     window.removeEventListener('pagehide', onPageHide); // exiting never writes a draft
     window.removeEventListener('popstate', onHistoryChange);
     window.removeEventListener('hashchange', onHistoryChange);
-    saveTabState({ enabled: false }); // deactivation persists per tab
-    try {
-      chrome.storage.local.set({ toolEnabled: false }); // master switch stays off across refreshes
-    } catch (_) { /* storage unavailable */ }
+    if (!routeOptOut) {
+      saveTabState({ enabled: false }); // deactivation persists per tab
+      try {
+        chrome.storage.local.set({ toolEnabled: false }); // master switch stays off across refreshes
+      } catch (_) { /* storage unavailable */ }
+    }
 
     // Premium smooth-out: reverse of the toolbar entrance. The whole host
     // (toolbar + chip + card) scales 0.98 -> 0.92 toward the toolbar's
@@ -8410,6 +8557,18 @@
       teardownHost();
     }
     if (host && host.parentNode) return; // already active
+    // Route opt-outs (F10): an opted-out route refuses activation, including
+    // programmatic enable. A storage failure must not lock the tool out.
+    try {
+      const optOuts = await storedRouteOptOuts();
+      routeOptOutsCount = optOuts.length;
+      if (routeMatchesHref(optOuts, location.href)) {
+        lastRouteMatched = true;
+        diagLog('route:block', 'reinject refused: url=' + location.href + ' optOuts=' + optOuts.length);
+        return;
+      }
+      lastRouteMatched = false;
+    } catch (_) { /* proceed: route guard must not lock the tool out */ }
     try {
       updateMotionPreference();
       buildUI();
@@ -8502,6 +8661,19 @@
         sendResponse({ ok: true, enabled: !!(host && host.parentNode) });
       } catch (_) { /* ok */ }
       return false;
+    }
+    if (msg.type === 'browserlinkGetRoute') {
+      // Service worker asks whether THIS page sits on an opted-out route
+      // (used when the tab URL is unavailable to the background). Dormant
+      // pages answer too: the listener survives exit.
+      storedRouteOptOuts().then((optOuts) => {
+        try {
+          sendResponse({ ok: true, routeMatched: routeMatchesHref(optOuts, location.href) });
+        } catch (_) { /* ok */ }
+      }).catch(() => {
+        try { sendResponse({ ok: true, routeMatched: false }); } catch (_) { /* ok */ }
+      });
+      return true; // async sendResponse
     }
     if (msg.type === 'browserlinkToggle') {
       if (msg.enabled === true) reinject();
@@ -9133,6 +9305,21 @@
         diagLog('init:skip', 'disabled by master switch');
         return;
       }
+      // Route opt-outs (F10): an opted-out route stays dormant even when the
+      // master switch is on and the session always-on flag is set. Per-tab
+      // state is left untouched so leaving the route (or a later refresh on
+      // an allowed route) falls back to the existing activation model.
+      let routeOptedOut = false;
+      try {
+        const optOuts = await storedRouteOptOuts();
+        routeOptOutsCount = optOuts.length;
+        routeOptedOut = routeMatchesHref(optOuts, location.href);
+      } catch (_) { routeOptedOut = false; }
+      lastRouteMatched = routeOptedOut;
+      if (routeOptedOut) {
+        diagLog('init:skip', 'route opt-out: url=' + location.href + ' optOuts=' + routeOptOutsCount);
+        return;
+      }
       // Session always-on (F6): a freshly loaded page with no per-tab state
       // stays dormant unless the popup "Always on for this browser session"
       // toggle is on. Per-tab state (explicit exit, or manual activation via
@@ -9311,6 +9498,17 @@
       get selMarkerCount() {
         return state.elements.filter((en) => en.descriptor && en.descriptor.quoteMarker).length;
       },
+      // Route opt-outs (F10): harness hooks for the mechanism gate's route
+      // normalization, match, and transition fixtures (the gate also
+      // extracts these functions verbatim from the shipped file).
+      normalizeRoutePattern,
+      routeEntryParts,
+      routeMatchesHref,
+      routeTransitionAction,
+      storedRouteOptOuts,
+      checkRouteForHistory,
+      get lastRouteMatched() { return lastRouteMatched; },
+      get routeOptOutsCount() { return routeOptOutsCount; },
     };
   }
 

@@ -37,6 +37,24 @@
   is on, per-tab exit still wins, and pages where Chrome blocks content
   scripts (chrome://, the web store, ...) never receive injection attempts
   or permission prompts; the popup shows an honest unavailable state there.
+- **Route opt-outs (2.7)** - the popup manages a local list of exact-origin
+  plus pathname-prefix opt-outs under `chrome.storage.local`
+  (`routeOptOuts`). Entries are canonicalized at add time: default ports
+  are removed, `localhost` maps to `127.0.0.1`, trailing slashes are
+  stripped, and hosts are lowercased. Wildcards, query strings, fragments,
+  and invalid or non-http(s) input are rejected and never stored, so an
+  opt-out is always an exact origin with an optional path prefix. An
+  opted-out route stays dormant on load and an active tool performs
+  `fullExit` once when the SPA navigates into it (pushState, replaceState,
+  popstate, hashchange); leaving the route permits the existing manual or
+  session always-on activation model again, and the opt-out exit never
+  flips the user's master switch or per-tab state. The service worker
+  answers a `browserlinkRouteControl` message (`state` / `enable` /
+  `disable`) for harnesses: `enable` is refused with `reason:
+  route-opt-out` on opted-out routes, restricted pages fail closed with
+  `reason: restricted`, and every answer carries `routeMatched`, `enabled`,
+  and `reason`. No new permission is involved: everything reads and writes
+  the existing `storage` area.
 - Page DOM is never mutated beyond a closed ShadowRoot overlay; screenshots
   are captured via `chrome.tabs.captureVisibleTab` and cropped locally to
   the annotated element rect.
