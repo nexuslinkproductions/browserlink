@@ -377,7 +377,7 @@ Responses:
 |---|---|
 | `GET /annotations` | `{"files": [{"name","size","mtime"}]}` newest first |
 | `GET /annotations/<name>` | the stored JSON (same schema, plus `ts`, `savedAt`) |
-| `GET /health` | `{"ok": true, "version": "1.0.0"}` |
+| `GET /health` | `{"ok": true, "version": "2.6.0"}` |
 | `GET /status` | `{"ok": true, "version", "dataDir", "adapters": [...], "target": {"sessionId","label"} or null}` |
 | `GET /target` | current delivery target, or `404 {"error":"no target"}` |
 | `POST /target` | set or clear delivery target |
@@ -392,10 +392,13 @@ Consumers map them back by multiplying with their own viewport dimensions.
 
 ## Versioning
 
-This is **schema v1.6**: backward compatible with v1.0 through v1.5. The
-v1.6 additions are additive and optional: the per-element `intent` /
-`severity` enums and the top-level `captureState` object; older payloads
-validate and store unchanged. Schema v1.5 extended
+This is **schema v1.8**: backward compatible with v1.0 through v1.7. The
+v1.8 additions are additive and optional: per-element `anchor` metadata
+recording the deterministic re-anchoring resolution state; older payloads
+validate and store unchanged. Schema v1.7 added optional per-element
+`frame` / `shadow` deep-picker metadata for shadow-root and iframe targets.
+Schema v1.6 added the per-element `intent` / `severity` enums and the
+top-level `captureState` object. Schema v1.5 extended
 `elements[].edits` with text-formatting keys. Schema v1.4 added optional
 `screenshot` / `screenshotFile`. Schema v1.1 added optional `elements[].edits`.
 Breaking changes (new required fields, coordinate semantics, endpoint removal)

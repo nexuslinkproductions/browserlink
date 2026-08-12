@@ -14,7 +14,7 @@ else `~/.browserlink/annotations`. Annotations are stored under
 
 | Route | Method | Response |
 |---|---|---|
-| `/health` | GET | `{ok: true, version: "2.5.0"}` |
+| `/health` | GET | `{ok: true, version: "2.6.0"}` |
 | `/status` | GET | `{ok, version, dataDir, adapters, target}` (target is `{sessionId,label}` or `null`) |
 | `/sessions` | GET | `{sessions: [{id,title,preview,updatedAt}]}` proxied from Hermes; `503` when `HERMES_API_URL`/`HERMES_API_KEY` are unset, `502` on upstream failure |
 
@@ -31,7 +31,7 @@ else `~/.browserlink/annotations`. Annotations are stored under
 | Route | Method | Body | Response |
 |---|---|---|---|
 | `/annotations` | GET | - | `{files: [{name, size, mtime}]}` newest first (JSON files only) |
-| `/annotations` | POST | annotation payload (schema v1.6) | `200 {ok: true, file: "<name>.json"}`; `400` validation error, `413` payload over 10 MB, `400` malformed JSON |
+| `/annotations` | POST | annotation payload (schema v1.8) | `200 {ok: true, file: "<name>.json"}`; `400` validation error, `413` payload over 10 MB, `400` malformed JSON |
 | `/annotations/<name>` | GET | - | stored annotation JSON or `404 {error: "not found"}` |
 | `/annotations/<name>/export.md` | GET | - | `200` Markdown AI brief (`text/markdown; charset=utf-8`) or `404` |
 | `/annotations/latest/export.md` | GET | - | `200` Markdown AI brief of the newest annotation or `404` |

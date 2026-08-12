@@ -3,7 +3,7 @@
 **Annotate in your browser. Deliver to any AI harness.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v2.5.0-4a9eff.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v2.6.0-4a9eff.svg)](CHANGELOG.md)
 [![CI](https://github.com/nexuslinkproductions/browserlink/actions/workflows/ci.yml/badge.svg)](https://github.com/nexuslinkproductions/browserlink/actions)
 [![MCP](https://img.shields.io/badge/MCP-server-ffd166.svg)](docs/mcp.md)
 [![Chromium](https://img.shields.io/badge/Chromium-MV3-ff5252.svg)](extension/manifest.json)

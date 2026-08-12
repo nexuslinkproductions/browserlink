@@ -4,7 +4,7 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [2.6.0] - 2026-08-12
 
 ### Added
 
