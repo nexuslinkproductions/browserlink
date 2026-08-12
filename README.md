@@ -121,128 +121,116 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
 
 ![Browserlink annotation and delivery capabilities](assets/infographics/browserlink-functions-github.png)
 
+### Annotate
+
 - **Draw annotations** - circles, arrows, scribbles; normalized coordinates
-  so annotations stay accurate across scroll and resize; undo/clear.
+  stay accurate across scroll and resize; undo/clear.
 - **Element picker** - DevTools-style hover highlight with `tag#id.class`
   chips; click to select; numbered markers; real element descriptors
   (tag, id, classes, text, href, cssPath, rect).
-- **Deep picker (shadow DOM + iframes)** - the picker reaches elements inside
-  open shadow roots (any depth) and same-origin iframes, including nested
-  frames: highlights, numbered markers, inspector placement, and element
-  crops are all translated into top-viewport coordinates, and descriptors
-  carry optional `frame`/`shadow` metadata. Cross-origin iframes degrade
-  explicitly: the frame itself becomes a bounded best-effort target with an
-  honest cross-origin label - browserlink never claims or attempts
-  inaccessible inner-DOM selection.
+- **Deep picker (shadow DOM + iframes)** - reaches elements inside open
+  shadow roots and same-origin iframes, including nested frames.
+  Cross-origin frames degrade explicitly to an honest bounded target.
+- **Multi-select** - Shift+click to select several elements at once; each
+  keeps its own instruction and edits; Send ships them all in one payload.
+- **Text-selection quick actions** - select any text to get Note, Ask AI,
+  and Highlight actions, all quote-linked via the `textQuote` descriptor.
+- **Element-crop screenshots** - sending captures the visible tab and crops
+  it to the selected elements, so the chat receives a screenshot of exactly
+  what you annotated.
+
+### Instruct
+
 - **Instruction chat** - a chat card per element: type your thoughts, edit on
   re-click, batch them all into one send.
 - **Intent and Priority** - optional per-element chips (fix/change/question/
-  approve and blocking/important/suggestion) that ship inside each element and
-  print as Intent/Priority labels in the harness message.
-- **Freeze State Capture** - one-click Freeze pauses CSS animations and
-  transitions for a clean, stable crop (active state is reported in the
-  send), and annotations carry structured `captureState` metadata: the frozen
-  flag plus the last hovered, focused, and open native details selectors.
-  Works on any site without app instrumentation; the injected freeze style is
-  always removed on exit.
-- **Persistent Drafts** - unsent strokes, queued notes, and element
-  instructions survive a refresh: drafts are stored locally per canonical
-  URL and restored with best-effort cssPath re-anchoring (unresolved markers
-  are counted, never dropped). No account, no cloud sync; a draft clears
-  only after a confirmed Send or Clear All.
-- **Anchor resilience (mutation-resistant re-anchoring)** - when a saved
-  element's exact cssPath no longer resolves (DOM drift, SPA route change,
-  refresh after a mutation), draft replay re-anchors it deterministically:
-  exact cssPath first, then stable attributes, then normalized text/aria
-  label, then prior rectangle proximity, above a documented confidence
-  threshold. Ambiguous or below-threshold targets stay unresolved - never
-  attached to a wrong element, never dropped - and render as ghost markers
-  at their prior spot with their instruction intact. SPA history changes
-  (pushState/replaceState/popstate) trigger one bounded re-anchor pass, and
-  markers show their state: amber for moved, gray ghost for unresolved.
-  Recovery is honest and best-effort: moved and unresolved markers stay
-  sendable as truthful context.
-- **Copy AI Brief** - one click copies the newest annotation as an AI-ready
-  Markdown brief: page URL/title/viewport, per-element cssPaths,
-  instructions, edits, Intent/Priority, capture state, notes, stroke
-  summary, and local `@file`/`@image` references (`GET
-  /annotations/latest/export.md`).
-- **Share link (read-only page)** - one click copies a local share URL for
-  the newest annotation; opening it renders a readable, read-only HTML page
-  with the page URL, label, notes, intent/priority chips, element
-  instructions and selectors, and the stored screenshot (`GET
-  /annotations/<name>/share`). The hub binds 127.0.0.1 by default, so the
-  link opens on this machine; other devices on your LAN can open it only if
-  you deliberately expose the hub. It is never a public link and needs no
-  account.
-- **Local save and backup** - the popup saves the newest capture as PNG or
-  JPEG (JPEG is converted locally in the browser) and downloads the newest
-  annotation bundle: a deterministic ZIP of the annotation JSON, the AI
-  brief Markdown, and the PNG when present, with a manifest naming the
-  schema and files (`GET /annotations/<name>/bundle`). A full-corpus backup
-  downloads one consistent snapshot of every stored annotation and its PNG
-  (`GET /annotations/backup.zip`), valid even when the corpus is empty.
-  Archives contain only safe relative paths; annotations without screenshots
-  declare the absent image instead of failing. Downloads are browser-native
-  (`chrome.downloads`): you pick the destination in the normal download
-  dialog, and nothing is uploaded anywhere - no account, no cloud. Missing
-  screenshots, empty corpora, offline hubs, and cancelled downloads are all
-  reported honestly. Copy AI Brief is unchanged.
-- **Activation toggle** - a master switch in the popup (default ON, persisted
-  per profile): deactivates the tool on the current page with one click, and
-  re-activates it straight from the popup.
-- **Collapsible, movable toolbar** - drag the toolbar anywhere on the page,
-  collapse it to a small chip, or exit the tool entirely with the power or
-  close button.
-- **Edge docking with animated morph** - drag the toolbar to a screen edge to
-  dock it: vertical bar on the left/right (slim icon buttons), horizontal bar
-  on the bottom; orientation changes morph with a GSAP-animated transition
-  (staggered children, spring settle), and the first launch docks centered on
-  the left edge.
-- **Annotation note queue** - the annotate tool pops a note card in the corner;
-  Enter queues notes with a live counter in the toolbar; Send ships the whole
-  batch (elements + notes) in one payload.
-- **Direct chat attachment delivery** - a sent annotation lands in the
-  selected Hermes chat's composer as real attachment chips (screenshot + JSON),
-  exactly like drag-and-drop, via the gateway's `composer.attach` injection;
-  the message also posts as a fallback so delivery never blocks.
-- **Chat selector drives delivery** - pick the target session in the extension
-  popup; the hub routes annotations to that chat (auto-connect on pick,
-  hardened endpoint resolution).
-- **Diagnostics** - `Ctrl+Shift+D` opens a live overlay (state, event ring
-  buffer, health codes D-1..D-6) for deterministic troubleshooting; the same
-  data is on `window.__browserlinkDiag`.
-- **On-demand injection** - the popup master switch now injects the extension
-  into the active tab on toggle (no page refresh needed) and reflects the
-  persisted state honestly.
-- **Element inspector with inline editing** - select an element in Element
-  mode to see its current computed styles, type desired values inline, and
-  ship them as structured `elements[].edits` in the annotation payload.
-- **Interactive inspector** - sliders, font dropdown (local fonts), color
-  pickers and selects that apply changes LIVE to the element; per-row Reset
-  and Reset All; hovering a property row highlights what it affects on the
-  page.
+  approve and blocking/important/suggestion) shipped inside each element and
+  printed as labels in the harness message.
+- **Element threads** - committed instructions form an ordered, append-only
+  reply thread (`threadId`/`parentId`), surviving refresh and replayable via
+  `GET /annotations/<name>/thread`.
+- **Element inspector with inline editing** - see computed styles, type
+  desired values inline, and ship them as structured `elements[].edits`.
+- **Interactive inspector** - sliders, font dropdown, color pickers and
+  selects that apply changes LIVE; per-row Reset and Reset All.
 - **Lightweight text editor** - multiline text editing with formatting
   controls (bold, italic, underline, alignment, text transform) that write
-  live styles and ship as structured `edits` (`textAlign`, `textTransform`,
-  `letterSpacing`, `wordSpacing`, `whiteSpace`, `verticalAlign`,
-  `textDecoration`, `fontStyle`, `textShadow`, plus existing font/color keys).
-- **Multi-select** - Shift+click to select several elements at once; each
-  keeps its own instruction and edits; Send ships them all in one payload.
-- **Element-crop screenshots** - sending captures the visible tab and crops
-  it to the selected elements, so the chat receives a screenshot of exactly
-  what you annotated (plus the annotation file as an attachment).
-- **Collapsible inspector categories** - inspector rows group under
-  Text / Layout / Appearance / Other headers; click a header to collapse or
-  expand the group; collapse state persists per tab.
-- **Element-mode hover boxes** - hovering in Element mode draws a clear
-  outline box around the element under the cursor (tracks scroll and resize),
-  so you can see exactly what you are about to select.
-- **Harness-neutral** - MCP server (works with every major harness), REST API,
-  and pluggable adapters (Hermes chat injection, generic webhooks).
-- **Your sessions stay yours** - the extension never touches page DOM beyond a
-  closed ShadowRoot; the hub is localhost-only; annotations are JSON files
-  with no tracking.
+  live styles and ship as structured `edits`.
+- **Annotation note queue** - Enter queues notes with a live counter in the
+  toolbar; Send ships the whole batch (elements + notes) in one payload.
+
+### Capture precisely
+
+- **Freeze State Capture** - one-click Freeze pauses CSS animations and
+  transitions for a clean, stable crop; annotations carry structured
+  `captureState` metadata (frozen flag plus last hovered, focused, and open
+  details selectors). The injected freeze style is always removed on exit.
+- **Persistent Drafts** - unsent strokes, queued notes, and element
+  instructions survive a refresh, stored locally per canonical URL. No
+  account, no cloud sync; a draft clears only after a confirmed Send or
+  Clear All.
+- **Anchor resilience** - when an exact cssPath no longer resolves (DOM
+  drift, SPA route change), draft replay re-anchors deterministically:
+  exact path, then stable attributes, then text/aria label, then prior
+  rectangle proximity. Ambiguous targets stay unresolved - never attached
+  to the wrong element, never dropped.
+- **Agent-ready context** - every annotation carries a schema v1.9
+  environment snapshot (capturedAt, url, viewport, userAgent, language,
+  devicePixelRatio, timezoneOffset) plus optional `textQuote` and thread
+  fields, rendered in the AI brief with explicit `(omitted)` states.
+
+### Deliver
+
+- **Direct chat attachment delivery** - a sent annotation lands in the
+  selected chat's composer as real attachment chips (screenshot + JSON),
+  exactly like drag-and-drop; a message fallback ensures delivery never
+  blocks.
+- **Chat selector drives delivery** - pick the target session in the popup;
+  the hub routes annotations to that chat.
+- **Copy AI Brief** - one click copies the newest annotation as an AI-ready
+  Markdown brief (page, per-element cssPaths, instructions, edits,
+  Intent/Priority, capture state, notes, stroke summary, `@file`/`@image`
+  references).
+- **Share link (read-only page)** - one click copies a local share URL
+  rendering a readable, read-only HTML page of the annotation. Local-only
+  by default (hub binds 127.0.0.1); never a public link, no account needed.
+- **Local save and backup** - save the newest capture as PNG or JPEG,
+  download a deterministic ZIP bundle of annotation + brief + PNG
+  (`/annotations/<name>/bundle`), or a full-corpus snapshot
+  (`/annotations/backup.zip`). Nothing is uploaded anywhere.
+- **Annotation recall** - local full-text search across all stored
+  annotations (`GET /annotations?q=`), mirrored in the MCP
+  `annotations_list` tool and the popup search box.
+- **Webhook handoff** - optional `BROWSERLINK_WEBHOOK_URL` emits one bounded
+  `annotation.thread.v1` JSON event per annotation; a webhook failure never
+  blocks local storage or other adapters.
+- **Programmatic control** - MCP `annotations_list` filters (q, url, since,
+  cssPathPrefix, hasEdits, intent, severity, limit) and per-route opt-out
+  for exact-origin or pathname-prefix pages.
+
+### Feel at home
+
+- **Activation toggle** - master switch in the popup (default ON, persisted
+  per profile); also injects on demand into the active tab without a refresh.
+- **First-run intro** - three coach marks (pick an element, add an
+  instruction, send), one-time local flag, replayable from the popup.
+- **Collapsible, movable toolbar** - drag anywhere, collapse to a small
+  chip, or exit entirely with the power or close button.
+- **Edge docking with animated morph** - drag to a screen edge to dock
+  (vertical bar left/right, horizontal bar bottom) with a GSAP-animated
+  transition.
+- **Element-mode hover boxes** - a clear outline around the element under
+  the cursor (tracks scroll and resize).
+- **Collapsible inspector categories** - rows group under
+  Text / Layout / Appearance / Other headers; collapse state persists.
+- **Diagnostics** - `Ctrl+Shift+D` opens a live overlay (state, event ring
+  buffer, health codes D-1..D-6); the same data is on
+  `window.__browserlinkDiag`.
+- **Harness-neutral** - MCP server (works with every major harness), REST
+  API, and pluggable adapters (Hermes chat injection, generic webhooks).
+- **Your sessions stay yours** - the extension never touches page DOM
+  beyond a closed ShadowRoot; the hub is localhost-only; annotations are
+  JSON files with no tracking.
 
 ## Docs
 
