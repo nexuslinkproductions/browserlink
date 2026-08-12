@@ -72,6 +72,88 @@ export function formatAnnotationMarkdown(
     );
   }
 
+  // Schema v1.9 (F4): Agent Context renders the strict optional env snapshot
+  // one-to-one (capturedAt, url, viewport, user agent, language, device
+  // pixel ratio, timezone offset). Missing optional environment values
+  // render an explicit "(omitted)" state; nothing is ever fabricated.
+  const env = annotation.env;
+  out.push("", "## Agent Context");
+  if (env !== null && typeof env === "object" && !Array.isArray(env)) {
+    const e = env as JsonObject;
+    const capturedAt = stringOf(e.capturedAt);
+    out.push(`- Captured at: ${capturedAt || "(omitted)"}`);
+    const envUrl = stringOf(e.url);
+    out.push(`- URL: ${envUrl || "(omitted)"}`);
+    const evp = e.viewport;
+    out.push(
+      evp !== null && typeof evp === "object" && !Array.isArray(evp)
+        ? `- Viewport: ${typeof (evp as JsonObject).w === "number" ? (evp as JsonObject).w : "?"}x${typeof (evp as JsonObject).h === "number" ? (evp as JsonObject).h : "?"}`
+        : "- Viewport: (omitted)",
+    );
+    const userAgent = stringOf(e.userAgent);
+    out.push(`- User agent: ${userAgent || "(omitted)"}`);
+    const language = stringOf(e.language);
+    out.push(`- Language: ${language || "(omitted)"}`);
+    const dpr = e.devicePixelRatio;
+    out.push(
+      `- Device pixel ratio: ${typeof dpr === "number" ? dpr : "(omitted)"}`,
+    );
+    const tz = e.timezoneOffsetMinutes;
+    out.push(
+      `- Timezone offset (minutes): ${typeof tz === "number" ? tz : "(omitted)"}`,
+    );
+  } else {
+    out.push("- Captured at: (omitted)");
+    out.push("- URL: (omitted)");
+    out.push("- Viewport: (omitted)");
+    out.push("- User agent: (omitted)");
+    out.push("- Language: (omitted)");
+    out.push("- Device pixel ratio: (omitted)");
+    out.push("- Timezone offset (minutes): (omitted)");
+  }
+
+  // Schema v1.9 (F4): Reproduction Context carries the steps and references
+  // an agent needs to replay the issue: the annotated page URL, the first
+  // committed element selector (when present), the textQuote (when present),
+  // and the stored screenshot file. Missing references render explicit
+  // "(omitted)" states, never fabricated values. The screenshot line uses
+  // the stored field name (screenshotFile) so absent captures stay an
+  // explicit omitted state without fabricating a reference.
+  out.push("", "## Reproduction Context");
+  out.push(`- URL: ${url || "(omitted)"}`);
+  let selector = "";
+  for (const el of elements) {
+    if (el !== null && typeof el === "object" && !Array.isArray(el)) {
+      const candidate = stringOf((el as JsonObject).cssPath);
+      if (candidate) {
+        selector = candidate;
+        break;
+      }
+    }
+  }
+  out.push(`- Selector: ${selector ? `\`${selector}\`` : "(omitted)"}`);
+  const textQuote = annotation.textQuote;
+  if (
+    textQuote !== null &&
+    typeof textQuote === "object" &&
+    !Array.isArray(textQuote)
+  ) {
+    const tq = textQuote as JsonObject;
+    const quote = stringOf(tq.quote);
+    out.push(`- Text quote: ${quote || "(omitted)"}`);
+    const prefix = stringOf(tq.prefix);
+    if (prefix) out.push(`- Quote prefix: ${prefix}`);
+    const suffix = stringOf(tq.suffix);
+    if (suffix) out.push(`- Quote suffix: ${suffix}`);
+  } else {
+    out.push("- Text quote: (omitted)");
+  }
+  out.push(
+    screenshotFile
+      ? `- Screenshot file: \`${screenshotFile}\``
+      : "- Screenshot file: (omitted)",
+  );
+
   out.push("", "## Label");
   out.push(label || "(none)");
 

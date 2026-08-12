@@ -652,6 +652,349 @@ describe("validatePayload", () => {
     p.captureState = ["animationsFrozen", true];
     assert.equal(validatePayload(p), "captureState must be an object");
   });
+
+  // ---- Schema v1.9 (F4): optional env snapshot, textQuote, thread fields ----
+
+  it("accepts a valid env block (schema v1.9)", () => {
+    const p = payload();
+    p.env = {
+      capturedAt: "2026-08-12T12:00:00.000Z",
+      url: "https://example.test/page",
+      viewport: { w: 1500, h: 993 },
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/137.0",
+      language: "en-US",
+      devicePixelRatio: 2,
+      timezoneOffsetMinutes: -420,
+    };
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts env with a positive offset and fractional millisecond timestamp", () => {
+    const p = payload();
+    p.env = {
+      capturedAt: "2026-08-12T12:00:00.123Z",
+      url: "https://example.test/page",
+      viewport: { w: 1280, h: 720 },
+      userAgent: "ua",
+      language: "de-DE",
+      devicePixelRatio: 1,
+      timezoneOffsetMinutes: 540,
+    };
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts env combined with textQuote, threadId, and parentId", () => {
+    const p = payload();
+    p.env = {
+      capturedAt: "2026-08-12T12:00:00.000Z",
+      url: "https://example.test/page",
+      viewport: { w: 1500, h: 993 },
+      userAgent: "ua",
+      language: "en-US",
+      devicePixelRatio: 1,
+      timezoneOffsetMinutes: 0,
+    };
+    p.textQuote = {
+      quote: "Button contrast looks off",
+      prefix: "The checkout",
+      suffix: "on the cart page",
+    };
+    p.threadId = "thr-20260812-0001";
+    p.parentId = "item-2";
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts per-element textQuote (schema v1.9)", () => {
+    const p = payload();
+    p.elements = [
+      {
+        index: 1,
+        tag: "span",
+        textQuote: { quote: "normalized quote", prefix: "before", suffix: "after" },
+      },
+      { index: 2, tag: "span", textQuote: { quote: "bare quote" } },
+    ];
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts legacy v1.8 payloads without env/textQuote/thread fields (backward compatible)", () => {
+    const p = payload();
+    assert.equal(validatePayload(p), null);
+    assert.equal("env" in p, false);
+    assert.equal("textQuote" in p, false);
+    assert.equal("threadId" in p, false);
+  });
+
+  it("rejects a non-object env", () => {
+    const p = payload();
+    p.env = "chrome";
+    assert.equal(validatePayload(p), "env must be an object");
+    const q = payload();
+    q.env = null;
+    assert.equal(validatePayload(q), "env must be an object");
+  });
+
+  it("rejects unknown env keys", () => {
+    const p = payload();
+    p.env = {
+      capturedAt: "2026-08-12T12:00:00.000Z",
+      url: "https://x",
+      viewport: { w: 100, h: 100 },
+      userAgent: "ua",
+      language: "en",
+      devicePixelRatio: 1,
+      timezoneOffsetMinutes: 0,
+      os: "macOS",
+    };
+    assert.equal(validatePayload(p), "env has unknown key 'os'");
+  });
+
+  it("rejects invalid env.capturedAt timestamps", () => {
+    for (const bad of ["not-a-date", "2026-13-99T99:99:99Z", "2026-08-12", 1723400000000, ""]) {
+      const p = payload();
+      p.env = {
+        capturedAt: bad,
+        url: "https://x",
+        viewport: { w: 100, h: 100 },
+        userAgent: "ua",
+        language: "en",
+        devicePixelRatio: 1,
+        timezoneOffsetMinutes: 0,
+      };
+      assert.equal(
+        validatePayload(p),
+        "env.capturedAt must be an ISO-8601 timestamp",
+        `capturedAt=${JSON.stringify(bad)}`,
+      );
+    }
+  });
+
+  it("rejects env missing required fields", () => {
+    const p = payload();
+    p.env = { capturedAt: "2026-08-12T12:00:00.000Z" };
+    assert.equal(
+      validatePayload(p),
+      "env.url must be a non-empty string of at most 2048 characters",
+    );
+    const q = payload();
+    q.env = {
+      capturedAt: "2026-08-12T12:00:00.000Z",
+      url: "https://x",
+      viewport: { w: 100, h: 100 },
+      userAgent: "ua",
+      language: "en",
+      devicePixelRatio: 1,
+    };
+    assert.equal(
+      validatePayload(q),
+      "env.timezoneOffsetMinutes must be an integer from -840 to 840",
+    );
+  });
+
+  it("rejects invalid env.viewport bounds", () => {
+    for (const vp of [{ w: 0, h: 100 }, { w: 1.5, h: 100 }, { w: 100, h: -1 }, "100x100"]) {
+      const p = payload();
+      p.env = {
+        capturedAt: "2026-08-12T12:00:00.000Z",
+        url: "https://x",
+        viewport: vp,
+        userAgent: "ua",
+        language: "en",
+        devicePixelRatio: 1,
+        timezoneOffsetMinutes: 0,
+      };
+      const err = validatePayload(p);
+      assert.ok(err !== null, `viewport=${JSON.stringify(vp)}`);
+      assert.match(err!, /env\.viewport/);
+    }
+  });
+
+  it("rejects invalid env.devicePixelRatio values", () => {
+    for (const dpr of [0, -1, "2", Number.NaN]) {
+      const p = payload();
+      p.env = {
+        capturedAt: "2026-08-12T12:00:00.000Z",
+        url: "https://x",
+        viewport: { w: 100, h: 100 },
+        userAgent: "ua",
+        language: "en",
+        devicePixelRatio: dpr,
+        timezoneOffsetMinutes: 0,
+      };
+      assert.equal(
+        validatePayload(p),
+        "env.devicePixelRatio must be a positive number",
+        `dpr=${JSON.stringify(dpr)}`,
+      );
+    }
+  });
+
+  it("rejects out-of-range and non-integer env.timezoneOffsetMinutes", () => {
+    for (const tz of [841, -841, 1.5, "0"]) {
+      const p = payload();
+      p.env = {
+        capturedAt: "2026-08-12T12:00:00.000Z",
+        url: "https://x",
+        viewport: { w: 100, h: 100 },
+        userAgent: "ua",
+        language: "en",
+        devicePixelRatio: 1,
+        timezoneOffsetMinutes: tz,
+      };
+      assert.equal(
+        validatePayload(p),
+        "env.timezoneOffsetMinutes must be an integer from -840 to 840",
+        `tz=${JSON.stringify(tz)}`,
+      );
+    }
+  });
+
+  it("rejects oversized env strings", () => {
+    const base = {
+      capturedAt: "2026-08-12T12:00:00.000Z",
+      url: "https://x",
+      viewport: { w: 100, h: 100 },
+      userAgent: "ua",
+      language: "en",
+      devicePixelRatio: 1,
+      timezoneOffsetMinutes: 0,
+    };
+    const longUrl = payload();
+    longUrl.env = { ...base, url: "u".repeat(2049) };
+    assert.equal(
+      validatePayload(longUrl),
+      "env.url must be a non-empty string of at most 2048 characters",
+    );
+    const longUa = payload();
+    longUa.env = { ...base, userAgent: "a".repeat(513) };
+    assert.equal(
+      validatePayload(longUa),
+      "env.userAgent must be a non-empty string of at most 512 characters",
+    );
+    const longLang = payload();
+    longLang.env = { ...base, language: "l".repeat(65) };
+    assert.equal(
+      validatePayload(longLang),
+      "env.language must be a non-empty string of at most 64 characters",
+    );
+    const emptyUa = payload();
+    emptyUa.env = { ...base, userAgent: "" };
+    assert.equal(
+      validatePayload(emptyUa),
+      "env.userAgent must be a non-empty string of at most 512 characters",
+    );
+  });
+
+  it("accepts textQuote with quote only and with prefix/suffix (schema v1.9)", () => {
+    const p = payload();
+    p.textQuote = { quote: "normalized quote" };
+    assert.equal(validatePayload(p), null);
+    const q = payload();
+    q.textQuote = { quote: "q", prefix: "before", suffix: "after" };
+    assert.equal(validatePayload(q), null);
+  });
+
+  it("rejects a non-object textQuote", () => {
+    const p = payload();
+    p.textQuote = "quote";
+    assert.equal(validatePayload(p), "textQuote must be an object");
+    const q = payload();
+    q.textQuote = null;
+    assert.equal(validatePayload(q), "textQuote must be an object");
+  });
+
+  it("rejects unknown textQuote keys", () => {
+    const p = payload();
+    p.textQuote = { quote: "q", context: "x" };
+    assert.equal(validatePayload(p), "textQuote has unknown key 'context'");
+    const el = payload();
+    el.elements = [{ index: 1, tag: "span", textQuote: { quote: "q", mode: "x" } }];
+    assert.equal(
+      validatePayload(el),
+      "elements[0].textQuote has unknown key 'mode'",
+    );
+  });
+
+  it("rejects missing, empty, and oversized textQuote.quote", () => {
+    const missing = payload();
+    missing.textQuote = { prefix: "p" };
+    assert.equal(
+      validatePayload(missing),
+      "textQuote.quote must be a non-empty string of at most 5000 characters",
+    );
+    const empty = payload();
+    empty.textQuote = { quote: "" };
+    assert.equal(
+      validatePayload(empty),
+      "textQuote.quote must be a non-empty string of at most 5000 characters",
+    );
+    const long = payload();
+    long.textQuote = { quote: "q".repeat(5001) };
+    assert.equal(
+      validatePayload(long),
+      "textQuote.quote must be a non-empty string of at most 5000 characters",
+    );
+    const el = payload();
+    el.elements = [{ index: 1, tag: "span", textQuote: {} }];
+    assert.equal(
+      validatePayload(el),
+      "elements[0].textQuote.quote must be a non-empty string of at most 5000 characters",
+    );
+  });
+
+  it("rejects oversized and non-string textQuote prefix/suffix", () => {
+    const longPrefix = payload();
+    longPrefix.textQuote = { quote: "q", prefix: "p".repeat(501) };
+    assert.equal(
+      validatePayload(longPrefix),
+      "textQuote.prefix must be a string of at most 500 characters",
+    );
+    const numSuffix = payload();
+    numSuffix.textQuote = { quote: "q", suffix: 42 };
+    assert.equal(
+      validatePayload(numSuffix),
+      "textQuote.suffix must be a string of at most 500 characters",
+    );
+    const el = payload();
+    el.elements = [{ index: 1, tag: "span", textQuote: { quote: "q", prefix: 7 } }];
+    assert.equal(
+      validatePayload(el),
+      "elements[0].textQuote.prefix must be a string of at most 500 characters",
+    );
+  });
+
+  it("rejects non-string, empty, and oversized threadId", () => {
+    for (const value of [42, "", "t".repeat(101)]) {
+      const p = payload();
+      p.threadId = value;
+      assert.equal(
+        validatePayload(p),
+        "threadId must be a non-empty string of at most 100 characters",
+        `threadId=${JSON.stringify(value)}`,
+      );
+    }
+  });
+
+  it("rejects non-string, empty, and oversized parentId", () => {
+    for (const value of [7, "", "p".repeat(101)]) {
+      const p = payload();
+      p.parentId = value;
+      assert.equal(
+        validatePayload(p),
+        "parentId must be a non-empty string of at most 100 characters",
+        `parentId=${JSON.stringify(value)}`,
+      );
+    }
+  });
+
+  it("accepts threadId and parentId independently (schema v1.9)", () => {
+    const p = payload();
+    p.threadId = "thr-1";
+    assert.equal(validatePayload(p), null);
+    const q = payload();
+    q.parentId = "item-2";
+    assert.equal(validatePayload(q), null);
+  });
 });
 
 describe("validateTargetBody", () => {

@@ -6738,6 +6738,27 @@
     };
   }
 
+  // Schema v1.9 (F4): browser environment snapshot captured ONCE at send
+  // start (send() reads environmentPayload() a single time while building
+  // the payload). Every value is real observed state: ISO-8601 capturedAt,
+  // the page URL, the CSS-pixel viewport, user agent, language, device
+  // pixel ratio, and the current timezone offset in minutes. The snapshot
+  // is never re-read after send begins and never fabricated.
+  function environmentPayload() {
+    const now = new Date();
+    let capturedAt = now.toISOString();
+    if (typeof capturedAt !== 'string' || !capturedAt) capturedAt = '';
+    return {
+      capturedAt: capturedAt,
+      url: String(location.href || ''),
+      viewport: { w: window.innerWidth, h: window.innerHeight },
+      userAgent: String(navigator.userAgent || ''),
+      language: String(navigator.language || ''),
+      devicePixelRatio: typeof window.devicePixelRatio === 'number' ? window.devicePixelRatio : 1,
+      timezoneOffsetMinutes: now.getTimezoneOffset(),
+    };
+  }
+
   // Return the visible union in CSS pixels. The service worker applies dpr
   // when it crops the captured bitmap, so this function never scales x/y/w/h.
   function computeCaptureRect(entries) {
@@ -6989,6 +7010,11 @@
     sendBusy = true;
     if (button) playMotion(button, 'send-press', 100);
     startSendPulse(button);
+    // Schema v1.9 (F4): capture the browser environment ONCE at send start
+    // so the stored annotation carries agent-ready context (capturedAt,
+    // url, viewport, userAgent, language, devicePixelRatio, timezone
+    // offset). Every new send includes env; legacy sends now carry it too.
+    const envSnapshot = environmentPayload();
     let label = '';
     try {
       const got = await chrome.storage.local.get('contextLabel');
@@ -7000,6 +7026,8 @@
       title: document.title || '',
       viewport: { w: window.innerWidth, h: window.innerHeight },
       label: label.slice(0, MAX_TEXT),
+      // Schema v1.9 (F4): env snapshot captured once at send start.
+      env: envSnapshot,
       // Committed annotation notes from the chat card note mode (annotate
       // tool). 'note' stays for backward compatibility (queue joined, capped);
       // 'notes' ships the full queue (each entry capped).

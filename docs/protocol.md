@@ -1,7 +1,16 @@
-# browserlink protocol - annotation schema v1.8
+# browserlink protocol - annotation schema v1.9
 
 The public contract between the extension, the hub, and any harness. Versioned;
 changes require a new minor or major version and a compatibility shim.
+
+**Schema v1.9** (backward compatible with v1.0 through v1.8): adds an optional
+top-level `env` snapshot (browser and viewport state captured once at send
+start), an optional `textQuote` descriptor (normalized page-text quote with
+bounded context, reserved for text-selection quick actions, accepted at the
+top level and per element), and optional top-level `threadId` / `parentId`
+thread identity fields (reserved for element threads). Wrong types, unknown
+keys, invalid timestamps, invalid bounds, and oversized strings return HTTP
+400; v1.8 payloads without any of them remain valid.
 
 **Schema v1.8** (backward compatible with v1.0 through v1.7): adds optional
 per-element `elements[].anchor` metadata recording how a stored element was
@@ -72,7 +81,16 @@ HTTP 400.
       "severity": "blocking",
       "edits": { "width": "48px", "fontSize": "16px", "color": "#0af",
                  "text": "Shop now" } }
-  ]
+  ],
+  "env": {
+    "capturedAt": "2026-08-12T12:00:00.000Z",
+    "url": "https://example.com/en/konfigurator/",
+    "viewport": { "w": 1500, "h": 993 },
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/137.0 Safari/537.36",
+    "language": "en-US",
+    "devicePixelRatio": 2,
+    "timezoneOffsetMinutes": -420
+  }
 }
 ```
 
@@ -86,9 +104,13 @@ HTTP 400.
 | `viewport` | object | required; `w`, `h` positive integers |
 | `label` | string | optional; user context label, ≤ 200 chars |
 | `strokes` | array | required; each: `color` string, `width` number > 0, `points` array of ≥ 2 `[x, y]` pairs, each coordinate in `[0, 1]` (normalized to the annotation viewport) |
-| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below), `frame`/`shadow` optional deep-picker objects (schema v1.7, see below), `anchor` optional object (schema v1.8, see below) |
+| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below), `frame`/`shadow` optional deep-picker objects (schema v1.7, see below), `anchor` optional object (schema v1.8, see below), `textQuote` optional object (schema v1.9, see below) |
 | `screenshot` | string | optional (schema v1.4); PNG data URL `data:image/png;base64,<data>`; max 10MB decoded; non-PNG or invalid base64 → HTTP 400 |
 | `captureState` | object | optional (schema v1.6); Freeze State Capture metadata, exactly four typed fields (see below); unknown keys → HTTP 400 |
+| `env` | object | optional (schema v1.9); browser environment snapshot captured once at send start, exactly seven typed fields (see below); unknown keys, invalid timestamps, invalid bounds, or oversized strings → HTTP 400 |
+| `textQuote` | object | optional (schema v1.9); normalized page-text quote with bounded context (see below); accepted at the top level and per element with the same shape and limits |
+| `threadId` | string | optional (schema v1.9); non-empty string of at most 100 characters; reserved for element threads |
+| `parentId` | string | optional (schema v1.9); non-empty string of at most 100 characters; references an existing item in the same thread |
 
 The hub stores the payload and may rewrite `screenshot` (see below). It may
 add `ts` (epoch ms) and `savedAt` (ISO-8601 UTC).
@@ -291,6 +313,102 @@ Rules:
   rely on them being live `querySelector` targets (elements may change
   between capture and consumption).
 
+### env (schema v1.9)
+
+Optional top-level object carrying the browser environment snapshot captured
+ONCE at send start by the extension. The snapshot is a deterministic record
+of the browser and viewport state at the moment Send began; the extension
+never re-reads or recomputes the values afterwards and never fabricates a
+missing value. Payloads without `env` are stored unchanged (backward
+compatible with every earlier schema).
+
+```json
+"env": {
+  "capturedAt": "2026-08-12T12:00:00.000Z",
+  "url": "https://example.com/en/konfigurator/",
+  "viewport": { "w": 1500, "h": 993 },
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/137.0 Safari/537.36",
+  "language": "en-US",
+  "devicePixelRatio": 2,
+  "timezoneOffsetMinutes": -420
+}
+```
+
+| Field | Type | Rules |
+|---|---|---|
+| `capturedAt` | string | **required** whenever `env` is present; ISO-8601 timestamp (`YYYY-MM-DDTHH:mm:ss[.mmm]Z` or with numeric offset), must parse to a valid date |
+| `url` | string | required; non-empty, at most 2048 characters |
+| `viewport` | object | required; `w`, `h` positive integers |
+| `userAgent` | string | required; non-empty, at most 512 characters |
+| `language` | string | required; non-empty, at most 64 characters |
+| `devicePixelRatio` | number | required; positive finite number |
+| `timezoneOffsetMinutes` | int | required; integer from -840 to 840 (UTC-14 through UTC+14) |
+
+Rules:
+
+- `env` must be an object with exactly these seven keys; unknown keys (e.g.
+  `"env": { "os": "macOS" }`) are rejected by hub validation with HTTP 400.
+- When `env` is present, every field is required; wrong types, invalid
+  timestamps, invalid bounds (non-positive or non-integer viewport, non-
+  positive devicePixelRatio, out-of-range timezone offset), and oversized or
+  empty strings are rejected with HTTP 400.
+- `env` is informational context for agents. `capturedAt` records when the
+  send started; it is independent of the hub-added `ts` and `savedAt`.
+
+### textQuote (schema v1.9)
+
+Optional descriptor carrying normalized selected page text plus bounded
+surrounding context. Reserved for text-selection quick actions; accepted at
+the top level (quote-linked notes) and per element (Ask AI / Highlight
+markers) with the same shape and limits at both levels. Legacy payloads
+without it are stored unchanged (backward compatible).
+
+```json
+"textQuote": {
+  "quote": "Button contrast looks off",
+  "prefix": "The checkout",
+  "suffix": "on the cart page"
+}
+```
+
+| Field | Type | Rules |
+|---|---|---|
+| `quote` | string | **required**; the normalized quote text, non-empty, at most 5000 characters |
+| `prefix` | string | optional; bounded context before the quote, at most 500 characters |
+| `suffix` | string | optional; bounded context after the quote, at most 500 characters |
+
+Rules:
+
+- `textQuote` must be an object with only the keys `quote`, `prefix`, and
+  `suffix`; unknown keys (e.g. `"textQuote": { "context": "..." }`) are
+  rejected by hub validation with HTTP 400.
+- Wrong types, missing or empty `quote`, and oversized `quote` / `prefix` /
+  `suffix` are rejected with HTTP 400.
+- At the element level the same rules apply under
+  `elements[N].textQuote` (for example
+  `elements[0].textQuote.quote must be a non-empty string of at most 5000 characters`).
+
+### threadId and parentId (schema v1.9)
+
+Optional top-level thread identity fields, reserved for element threads.
+`threadId` identifies the thread a committed element instruction belongs to;
+`parentId` references an existing item in the same thread (a reply). Both
+fields are independent and optional: a root annotation carries `threadId`
+only, a reply carries both, and legacy annotations carry neither.
+
+| Field | Type | Rules |
+|---|---|---|
+| `threadId` | string | optional; non-empty, at most 100 characters |
+| `parentId` | string | optional; non-empty, at most 100 characters |
+
+Rules:
+
+- Wrong types, empty strings, and oversized strings are rejected by hub
+  validation with HTTP 400 (for example
+  `threadId must be a non-empty string of at most 100 characters`).
+- The hub stores both fields as given; thread-cycle and parent-existence
+  semantics are enforced by the producer before send.
+
 ### Responses
 
 - `200` → `{"ok": true, "file": "<ts>.json"}`
@@ -392,13 +510,15 @@ Consumers map them back by multiplying with their own viewport dimensions.
 
 ## Versioning
 
-This is **schema v1.8**: backward compatible with v1.0 through v1.7. The
-v1.8 additions are additive and optional: per-element `anchor` metadata
-recording the deterministic re-anchoring resolution state; older payloads
-validate and store unchanged. Schema v1.7 added optional per-element
-`frame` / `shadow` deep-picker metadata for shadow-root and iframe targets.
-Schema v1.6 added the per-element `intent` / `severity` enums and the
-top-level `captureState` object. Schema v1.5 extended
+This is **schema v1.9**: backward compatible with v1.0 through v1.8. The
+v1.9 additions are additive and optional: the top-level `env` snapshot, the
+`textQuote` descriptor (top level and per element), and the `threadId` /
+`parentId` thread fields; older payloads validate and store unchanged.
+Schema v1.8 added optional per-element `anchor` metadata recording the
+deterministic re-anchoring resolution state. Schema v1.7 added optional
+per-element `frame` / `shadow` deep-picker metadata for shadow-root and
+iframe targets. Schema v1.6 added the per-element `intent` / `severity`
+enums and the top-level `captureState` object. Schema v1.5 extended
 `elements[].edits` with text-formatting keys. Schema v1.4 added optional
 `screenshot` / `screenshotFile`. Schema v1.1 added optional `elements[].edits`.
 Breaking changes (new required fields, coordinate semantics, endpoint removal)
