@@ -6,6 +6,10 @@ All notable changes to browserlink are documented here. Format follows
 
 ## [2.5.0] - Unreleased
 
+### Added
+
+- **Intent and Priority metadata** - optional per-element intent chips (`fix`, `change`, `question`, `approve`) and priority chips (`blocking`, `important`, `suggestion`) are stored in `elements[]` and rendered in harness fallback text.
+
 ### Fixed
 
 - **Text formatting edits now validate end-to-end (schema v1.5)** - the nine

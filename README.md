@@ -109,6 +109,9 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
   (tag, id, classes, text, href, cssPath, rect).
 - **Instruction chat** - a chat card per element: type your thoughts, edit on
   re-click, batch them all into one send.
+- **Intent and Priority** - optional per-element chips (fix/change/question/
+  approve and blocking/important/suggestion) that ship inside each element and
+  print as Intent/Priority labels in the harness message.
 - **Activation toggle** - a master switch in the popup (default ON, persisted
   per profile): deactivates the tool on the current page with one click, and
   re-activates it straight from the popup.

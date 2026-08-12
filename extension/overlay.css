@@ -380,6 +380,61 @@
   color: rgba(255, 209, 102, 0.95);
 }
 
+/* ---- intent/severity metadata chips (schema v1.6) ---- */
+.comet-chat-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.comet-chat-meta[hidden] {
+  display: none;
+}
+.comet-chat-meta-group {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.comet-chat-meta-label {
+  min-width: 46px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--bl-muted, #a3aab8);
+}
+.comet-chat-meta-chips {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.comet-meta-chip {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--bl-muted, #a3aab8);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.comet-meta-chip:hover {
+  border-color: rgba(255, 255, 255, 0.32);
+  color: var(--bl-text, #eef1f6);
+}
+.comet-meta-chip:focus-visible {
+  outline: none;
+  border-color: rgba(74, 158, 255, 0.8);
+  box-shadow: 0 0 0 2px rgba(74, 158, 255, 0.28);
+}
+.comet-meta-chip.is-selected {
+  border-color: rgba(74, 158, 255, 0.75);
+  background: rgba(74, 158, 255, 0.16);
+  color: #bfddff;
+}
+
 /* ---- element count chip in toolbar ---- */
 .comet-count {
   min-width: 64px;
@@ -2258,7 +2313,8 @@
 .comet-insp-reveal,
 .comet-mode-btn,
 .comet-insp-cat-header,
-.comet-insp-fmt-btn {
+.comet-insp-fmt-btn,
+.comet-meta-chip {
   transition: transform var(--bl-dur-fast) var(--bl-ease-spring),
               opacity var(--bl-dur-fast) var(--bl-ease-out),
               box-shadow var(--bl-dur) var(--bl-ease-soft),
@@ -2274,7 +2330,8 @@
 .comet-dock-btn:hover,
 .comet-insp-copy:hover,
 .comet-insp-reveal:hover,
-.comet-mode-btn:hover {
+.comet-mode-btn:hover,
+.comet-meta-chip:hover {
   transform: scale(1.04);
 }
 .comet-btn:active,
@@ -2518,7 +2575,8 @@
   .comet-inspector,
   .comet-hl,
   .comet-hover-box,
-  .comet-hl-chip {
+  .comet-hl-chip,
+  .comet-meta-chip {
     transition: none !important;
   }
   #hermes-annotate-host.is-entering,

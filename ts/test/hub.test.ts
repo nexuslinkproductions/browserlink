@@ -15,6 +15,7 @@ import {
   storeAnnotation,
 } from "../src/hub.ts";
 import {
+  buildComposerAttachments,
   formatMessage,
   register as registerHermes,
   resolveSessionId,
@@ -252,6 +253,78 @@ describe("hermes message format", () => {
         ),
       );
       assert.ok(msg.includes("1 stroke(s)"));
+    });
+  });
+
+  test("intent/severity survive storage and render as Intent/Priority labels", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const payload = samplePayload() as Record<string, unknown>;
+        payload.screenshot = TINY_PNG_DATA_URL;
+        payload.elements = [
+          {
+            index: 1,
+            tag: "button",
+            id: "submit",
+            className: "btn",
+            text: "Log in",
+            instruction: "Make primary",
+            edits: { width: "48px", fontSize: "16px" },
+            intent: "fix",
+            severity: "blocking",
+          },
+          {
+            index: 2,
+            tag: "span",
+            text: "hint",
+            instruction: "keep",
+          },
+        ];
+        const res = await request(hub.base, "POST", "/annotations", payload);
+        assert.equal(res.status, 200);
+        assert.equal(res.json.ok, true);
+
+        // Metadata survives storage byte-for-byte per element.
+        const stored = JSON.parse(
+          await readFile(path.join(dir, "annotations", res.json.file), "utf8"),
+        );
+        assert.equal(stored.elements[0].intent, "fix");
+        assert.equal(stored.elements[0].severity, "blocking");
+        assert.equal(stored.elements[1].intent, undefined);
+        assert.equal(stored.elements[1].severity, undefined);
+
+        // Fallback text carries Intent/Priority labels ONLY where present.
+        const msg = formatMessage(stored, path.join(dir, "annotations", res.json.file));
+        assert.ok(
+          msg.includes(
+            "E1: button#submit.btn 'Log in' - instruction: Make primary - edits: width=48px fontSize=16px - Intent: fix - Priority: blocking",
+          ),
+          "metadata labels appear on the annotated element",
+        );
+        assert.ok(
+          msg.includes("E2: span 'hint' - instruction: keep"),
+          "legacy element block unchanged",
+        );
+        assert.ok(
+          !msg.includes("E2: span 'hint' - instruction: keep - Intent:"),
+          "no Intent label when metadata absent",
+        );
+
+        // Composer attachment construction is untouched by metadata.
+        const pngName = stored.screenshotFile;
+        const jsonPath = path.join(dir, "annotations", res.json.file);
+        const attachments = buildComposerAttachments(stored, jsonPath);
+        assert.deepEqual(
+          attachments.map((a) => a.kind),
+          ["image", "file"],
+          "image + file chips unchanged by metadata",
+        );
+        assert.ok(attachments[0].path.endsWith(pngName));
+        assert.equal(attachments[1].path, path.resolve(jsonPath));
+      } finally {
+        await hub.close();
+      }
     });
   });
 });

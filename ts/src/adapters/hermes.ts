@@ -148,6 +148,11 @@ export function formatMessage(
       if (el.instruction) part += ` - instruction: ${String(el.instruction)}`;
       const editsStr = formatEdits(el.edits);
       if (editsStr) part += ` - edits: ${editsStr}`;
+      // Schema v1.6: optional intent/severity metadata. The wire key is
+      // `severity`; the user-facing label is Priority. Appended ONLY when
+      // present so legacy elements format exactly as before.
+      if (el.intent) part += ` - Intent: ${String(el.intent)}`;
+      if (el.severity) part += ` - Priority: ${String(el.severity)}`;
       contentLines.push(part);
     }
   }

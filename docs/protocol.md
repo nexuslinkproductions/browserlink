@@ -1,7 +1,12 @@
-# browserlink protocol - annotation schema v1.5
+# browserlink protocol - annotation schema v1.6
 
 The public contract between the extension, the hub, and any harness. Versioned;
 changes require a new minor or major version and a compatibility shim.
+
+**Schema v1.6** (backward compatible with v1.0 through v1.5): adds optional
+per-element `elements[].intent` and `elements[].severity` metadata chosen from
+strict enums (see below). Wrong types and unknown values return HTTP 400;
+payloads without either field remain valid.
 
 **Schema v1.5** (backward compatible with v1.0 through v1.4): extends
 `elements[].edits` with text-formatting keys used by the inspector editor
@@ -49,6 +54,8 @@ HTTP 400.
       "cssPath": "html body form button",
       "rect": { "x": 0.4, "y": 0.5, "w": 0.2, "h": 0.05 },
       "instruction": "Make this blue and round",
+      "intent": "fix",
+      "severity": "blocking",
       "edits": { "width": "48px", "fontSize": "16px", "color": "#0af",
                  "text": "Shop now" } }
   ]
@@ -65,7 +72,7 @@ HTTP 400.
 | `viewport` | object | required; `w`, `h` positive integers |
 | `label` | string | optional; user context label, ≤ 200 chars |
 | `strokes` | array | required; each: `color` string, `width` number > 0, `points` array of ≥ 2 `[x, y]` pairs, each coordinate in `[0, 1]` (normalized to the annotation viewport) |
-| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below) |
+| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below) |
 | `screenshot` | string | optional (schema v1.4); PNG data URL `data:image/png;base64,<data>`; max 10MB decoded; non-PNG or invalid base64 → HTTP 400 |
 
 The hub stores the payload and may rewrite `screenshot` (see below). It may
@@ -114,6 +121,27 @@ Rules:
 - Non-string values are rejected by hub validation with HTTP 400.
 - Consumers apply the edits onto the captured element; values are applied as
   given (CSS values for style properties, plain text for `text`/`href`).
+
+### elements[].intent and elements[].severity (schema v1.6)
+
+Optional per-element metadata picked in the element chat card and stored inside
+`elements[]` (never duplicated at the top level). Both fields are optional and
+independent: an element can carry either, both, or neither. The hub validates
+them as strict enums.
+
+| Field | Type | Allowed values |
+|---|---|---|
+| `intent` | string (enum) | `fix`, `change`, `question`, `approve` |
+| `severity` | string (enum) | `blocking`, `important`, `suggestion` |
+
+Rules:
+
+- Absent fields are always valid (backward compatible with all earlier
+  schemas); they mean "not specified".
+- Wrong types (e.g. `"intent": 42`) and unknown values (e.g.
+  `"severity": "urgent"`) are rejected by hub validation with HTTP 400.
+- The wire key is `severity`; harness-facing text renders it under the
+  user-facing label **Priority**.
 
 ### Responses
 
@@ -216,9 +244,11 @@ Consumers map them back by multiplying with their own viewport dimensions.
 
 ## Versioning
 
-This is **schema v1.5**: backward compatible with v1.0 through v1.4. The
-v1.5 text-formatting `edits` keys are additive; older payloads validate and
-store unchanged. Schema v1.4 added optional `screenshot` / `screenshotFile`.
-Schema v1.1 added optional `elements[].edits`. Breaking changes (new required
-fields, coordinate semantics, endpoint removal) bump to v2 with a deprecation
-window: the hub accepts both versions for one minor release.
+This is **schema v1.6**: backward compatible with v1.0 through v1.5. The
+v1.6 `elements[].intent` / `elements[].severity` enums are additive and
+optional; older payloads validate and store unchanged. Schema v1.5 extended
+`elements[].edits` with text-formatting keys. Schema v1.4 added optional
+`screenshot` / `screenshotFile`. Schema v1.1 added optional `elements[].edits`.
+Breaking changes (new required fields, coordinate semantics, endpoint removal)
+bump to v2 with a deprecation window: the hub accepts both versions for one
+minor release.

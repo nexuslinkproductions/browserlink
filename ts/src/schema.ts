@@ -1,4 +1,4 @@
-/** Shared annotation schema (v1.5), single source of truth for hub + MCP. */
+/** Shared annotation schema (v1.6), single source of truth for hub + MCP. */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -41,6 +41,14 @@ export const ALLOWED_EDIT_KEYS = new Set([
 ]);
 
 export const NAME_RE = /^[A-Za-z0-9._-]+$/;
+
+// Schema v1.6: optional per-element intent and severity. Both are optional
+// for full backward compatibility; when present they must be exact enum
+// values (wrong types and unknown values are rejected with HTTP 400).
+export const INTENT_VALUES = ["fix", "change", "question", "approve"] as const;
+export const SEVERITY_VALUES = ["blocking", "important", "suggestion"] as const;
+export type Intent = (typeof INTENT_VALUES)[number];
+export type Severity = (typeof SEVERITY_VALUES)[number];
 
 export type JsonValue =
   | null
@@ -323,6 +331,27 @@ export function validatePayload(payload: unknown): string | null {
           if (typeof value !== "string") {
             return `elements[${elementIndex}].edits.${key} must be a string`;
           }
+        }
+      }
+      // Schema v1.6: optional intent and severity, strict enums. Both are
+      // optional; absent fields stay valid (backward compatible). Wrong
+      // types and unknown values are rejected.
+      const intent = el.intent;
+      if (intent !== undefined) {
+        if (
+          typeof intent !== "string" ||
+          !(INTENT_VALUES as readonly string[]).includes(intent)
+        ) {
+          return `elements[${elementIndex}].intent must be one of fix, change, question, approve`;
+        }
+      }
+      const severity = el.severity;
+      if (severity !== undefined) {
+        if (
+          typeof severity !== "string" ||
+          !(SEVERITY_VALUES as readonly string[]).includes(severity)
+        ) {
+          return `elements[${elementIndex}].severity must be one of blocking, important, suggestion`;
         }
       }
     }

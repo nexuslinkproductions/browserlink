@@ -80,6 +80,10 @@
   const BRIDGE_OFFLINE = 'bridge offline';
   const MAX_TEXT = 200;
   const MAX_INSTR = 500;
+  // Schema v1.6: optional per-element intent and severity chips (both unset
+  // by default; exactly one of each may be selected per element).
+  const INTENTS = ['fix', 'change', 'question', 'approve'];
+  const SEVERITIES = ['blocking', 'important', 'suggestion'];
   const MAX_CSS_PATH = 8;
   const MAX_PARENT_WALK = 5;
   const HL_COLOR = '#4a9eff';
@@ -148,6 +152,7 @@
   let hoverBoxEl = null;     // stronger element-mode hover box (v1.6; coexists with hlEl)
   let hoverBoxRaf = 0;       // rAF throttle for scroll/resize box recompute
   let chatCard = null;
+  let chatMetaEl = null; // intent/severity chip row inside the chat card
   let chatHead = null;
   let chatInput = null;
   let chipEl = null;         // 48px collapsed chip
@@ -273,6 +278,18 @@
 
   // Lazy JSON snapshot of tool state. Nothing is cached; callers pay the cost
   // only when they ask (diag(), dump(), or the overlay panel).
+  function diagMetaCounts(key, values) {
+    const counts = {};
+    for (const v of values) counts[v] = 0;
+    for (const en of state.elements) {
+      const d = en && en.descriptor;
+      if (d && typeof d[key] === 'string' && Object.prototype.hasOwnProperty.call(counts, d[key])) {
+        counts[d[key]] += 1;
+      }
+    }
+    return counts;
+  }
+
   function diagDump() {
     return {
       tool: 'browserlink',
@@ -303,6 +320,11 @@
           tag: (en.descriptor && en.descriptor.tag) ? en.descriptor.tag : '',
           instructionLen: (en.descriptor && en.descriptor.instruction) ? en.descriptor.instruction.length : 0,
         })),
+        // Schema v1.6: committed metadata counts by intent and severity.
+        meta: {
+          intent: diagMetaCounts('intent', INTENTS),
+          severity: diagMetaCounts('severity', SEVERITIES),
+        },
       },
       annotNote: state.annotNote || '',
       annotNotes: state.annotNotes.length,
@@ -2268,8 +2290,48 @@
     }
     if (inspInput) inspInput.value = inspDesc.instruction || '';
     if (inspInput) inspInput.focus();
+    // Schema v1.6: show the intent/severity chip row and prefill it from the
+    // committed descriptor (edit mode re-click keeps existing metadata).
+    if (chatMetaEl) chatMetaEl.hidden = false;
+    syncChatMeta();
     syncInspAdd();
     updateSelectionUI();
+  }
+
+  // Schema v1.6: intent/severity chips live next to the instruction field.
+  // Selecting a chip sets the value on the pending descriptor; selecting
+  // the active chip again clears it (both fields stay optional). Rendering
+  // reads pending.descriptor so the edit path prefills on re-click.
+  function syncChatMeta() {
+    if (!chatMetaEl) return;
+    const desc = (pending && pending.descriptor) ? pending.descriptor : null;
+    const intent = desc && typeof desc.intent === 'string' ? desc.intent : '';
+    const severity = desc && typeof desc.severity === 'string' ? desc.severity : '';
+    const chips = chatMetaEl.querySelectorAll('.comet-meta-chip');
+    for (const chip of chips) {
+      const mine = chip.dataset.intent ? chip.dataset.intent === intent : chip.dataset.severity === severity;
+      chip.classList.toggle('is-selected', mine);
+      chip.setAttribute('aria-pressed', mine ? 'true' : 'false');
+    }
+  }
+
+  function onChatMetaClick(e) {
+    if (!pending || !pending.descriptor || !chatMetaEl) return;
+    const chip = e.target && e.target.closest ? e.target.closest('.comet-meta-chip') : null;
+    if (!chip || !chatMetaEl.contains(chip)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const d = pending.descriptor;
+    if (chip.dataset.intent) {
+      const value = chip.dataset.intent;
+      if (d.intent === value) delete d.intent;
+      else d.intent = value;
+    } else if (chip.dataset.severity) {
+      const value = chip.dataset.severity;
+      if (d.severity === value) delete d.severity;
+      else d.severity = value;
+    }
+    syncChatMeta();
   }
 
   function addChat() {
@@ -2292,6 +2354,11 @@
       committedIndex = state.elements.length - 1;
       state.activeIndex = committedIndex;
     }
+    // Schema v1.6: commit the chip metadata on the descriptor. Both are
+    // optional; anything outside the enums is dropped rather than shipped.
+    const metaDesc = pending.descriptor;
+    if (INTENTS.indexOf(metaDesc.intent) === -1) delete metaDesc.intent;
+    if (SEVERITIES.indexOf(metaDesc.severity) === -1) delete metaDesc.severity;
     pending = null;
     if (chatInput) chatInput.value = '';
     if (inspInput) inspInput.value = state.elements[committedIndex].descriptor.instruction || '';
@@ -2325,6 +2392,8 @@
     chatInput.value = state.annotNotes.join('\n'); // re-shows the committed notes
     chatCard.classList.add('comet-chat-note');
     chatCard.hidden = false;
+    // The intent/severity chips are element-only; note mode hides the row.
+    if (chatMetaEl) chatMetaEl.hidden = true;
     // Premium pop: layered scale + slide + opacity (MD3 Emphasized, 240ms).
     // Reduced motion -> gsapEnter snaps straight to the final state.
     gsapEnter(chatCard, {
@@ -4695,6 +4764,13 @@
   function descriptorForPayload(en) {
     const d = Object.assign({}, en.descriptor);
     d.instruction = String(d.instruction || '').trim().slice(0, MAX_INSTR);
+    // Schema v1.6: ship optional intent/severity inside elements[] (no
+    // top-level duplication); empty or invalid values are dropped.
+    for (const key of ['intent', 'severity']) {
+      const v = d[key];
+      if (typeof v !== 'string' || !v.trim()) delete d[key];
+      else d[key] = v.trim();
+    }
     if (d.edits) {
       const edits = {};
       for (const k of Object.keys(d.edits)) {
@@ -5536,6 +5612,27 @@
       '<div class="comet-chat-head"></div>' +
       '<textarea class="comet-chat-input" rows="3" ' +
       ' placeholder="Your thoughts/instructions for this element…"></textarea>' +
+      // Schema v1.6: per-element intent/severity chips (element mode only;
+      // hidden in annotate-note mode via showAnnotNoteCard).
+      '<div class="comet-chat-meta" hidden>' +
+      '  <div class="comet-chat-meta-group">' +
+      '    <span class="comet-chat-meta-label">Intent</span>' +
+      '    <div class="comet-chat-meta-chips" role="group" aria-label="Intent">' +
+      '      <button type="button" class="comet-meta-chip" data-intent="fix">Fix</button>' +
+      '      <button type="button" class="comet-meta-chip" data-intent="change">Change</button>' +
+      '      <button type="button" class="comet-meta-chip" data-intent="question">Question</button>' +
+      '      <button type="button" class="comet-meta-chip" data-intent="approve">Approve</button>' +
+      '    </div>' +
+      '  </div>' +
+      '  <div class="comet-chat-meta-group">' +
+      '    <span class="comet-chat-meta-label">Priority</span>' +
+      '    <div class="comet-chat-meta-chips" role="group" aria-label="Priority">' +
+      '      <button type="button" class="comet-meta-chip" data-severity="blocking">Blocking</button>' +
+      '      <button type="button" class="comet-meta-chip" data-severity="important">Important</button>' +
+      '      <button type="button" class="comet-meta-chip" data-severity="suggestion">Suggestion</button>' +
+      '    </div>' +
+      '  </div>' +
+      '</div>' +
       '<div class="comet-chat-actions">' +
       '  <button type="button" class="comet-btn" data-chat="cancel">Cancel</button>' +
       '  <button type="button" class="comet-btn comet-chat-add" data-chat="add">Add</button>' +
@@ -5618,6 +5715,7 @@
     noteCountEl = toolbar.querySelector('.comet-note-count');
     chatHead = chatCard.querySelector('.comet-chat-head');
     chatInput = chatCard.querySelector('.comet-chat-input');
+    chatMetaEl = chatCard.querySelector('.comet-chat-meta');
     inspRows = inspPanel.querySelector('.comet-insp-rows');
     inspCountEl = inspPanel.querySelector('.comet-insp-count');
     inspSelectionCountEl = inspPanel.querySelector('.comet-selection-count');
@@ -5830,6 +5928,7 @@
         else if (state.annotateOn && !state.elementMode) hideAnnotNoteCard();
       }
     });
+    chatCard.addEventListener('click', onChatMetaClick);
     chatInput.addEventListener('input', () => {
       if (pending && pending.descriptor) pending.descriptor.instruction = chatInput.value;
       if (inspInput) inspInput.value = chatInput.value;

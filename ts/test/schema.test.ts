@@ -125,6 +125,67 @@ describe("validatePayload", () => {
     assert.equal(validatePayload(p), "elements[0].edits must be an object");
   });
 
+  it("accepts all valid intent and severity enum values", () => {
+    for (const intent of ["fix", "change", "question", "approve"]) {
+      for (const severity of ["blocking", "important", "suggestion"]) {
+        const p = payload();
+        p.elements = [{ index: 1, tag: "button", intent, severity }];
+        assert.equal(validatePayload(p), null, `intent=${intent} severity=${severity}`);
+      }
+    }
+  });
+
+  it("accepts intent alone and severity alone (schema v1.6 optional fields)", () => {
+    const onlyIntent = payload();
+    onlyIntent.elements = [{ index: 1, tag: "button", intent: "question" }];
+    assert.equal(validatePayload(onlyIntent), null);
+    const onlySeverity = payload();
+    onlySeverity.elements = [{ index: 1, tag: "button", severity: "suggestion" }];
+    assert.equal(validatePayload(onlySeverity), null);
+  });
+
+  it("accepts legacy elements without intent/severity (backward compatible)", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", text: "Log in", edits: { width: "48px" } }];
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("rejects unknown intent values", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", intent: "bogus" }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].intent must be one of fix, change, question, approve",
+    );
+  });
+
+  it("rejects unknown severity values", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", severity: "urgent" }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].severity must be one of blocking, important, suggestion",
+    );
+  });
+
+  it("rejects non-string intent", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", intent: 42 }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].intent must be one of fix, change, question, approve",
+    );
+  });
+
+  it("rejects non-string severity", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", severity: 42 }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].severity must be one of blocking, important, suggestion",
+    );
+  });
+
   it("accepts a valid PNG data URL screenshot", () => {
     const p = payload();
     p.screenshot = TINY_PNG_DATA_URL;
