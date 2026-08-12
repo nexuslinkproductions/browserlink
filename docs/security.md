@@ -35,6 +35,16 @@
 - Adapter failures are isolated per delivery and logged to
   `browserlink-error.log` in the data dir; a failing adapter never blocks
   storage or other adapters.
+- **Read-only share pages** - `GET /annotations/<name>/share` renders an
+  annotation as a readable HTML page. Every annotation-derived value is
+  HTML-escaped and the page is served with a restrictive
+  Content-Security-Policy (`default-src 'none'`, same-origin images only),
+  so stored content cannot execute script. The page is read-only: no edit,
+  delete, reply, upload, account, or cloud controls, and no links. Because
+  the hub binds `127.0.0.1` by default, share links are same-machine; other
+  devices on your LAN can open them only if you deliberately start the hub
+  bound beyond loopback. Nothing in the page or the hub implies public
+  hosting.
 
 ## Data you keep
 

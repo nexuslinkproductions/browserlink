@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm, readFile, writeFile, mkdir } from "node:fs/promises";
+import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -12,6 +13,7 @@ import {
   isSafeName,
   proxyHermesSessions,
   reloadAdapters,
+  siblingPngName,
   storeAnnotation,
 } from "../src/hub.ts";
 import {
@@ -1060,6 +1062,346 @@ describe("export.md route", () => {
         );
         assert.equal(res.status, 404);
         assert.deepEqual(JSON.parse(res.text), { error: "not found" });
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * F5: GET /annotations/<name>/share (read-only HTML share page).
+ * Section kept separate from schema/hub suites so concurrent feature edits
+ * to other parts of this file never touch these probes.
+ * ------------------------------------------------------------------------- */
+describe("share page route", () => {
+  async function rawRequest(
+    base: string,
+    route: string,
+  ): Promise<{ status: number; contentType: string | null; csp: string | null; text: string }> {
+    const res = await fetch(`${base}${route}`);
+    return {
+      status: res.status,
+      contentType: res.headers.get("content-type"),
+      csp: res.headers.get("content-security-policy"),
+      text: await res.text(),
+    };
+  }
+
+  test("complete annotation renders read-only HTML with screenshot reference", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const payload = {
+          source: "test",
+          url: "https://example.test/page?q=1|2",
+          title: "Share fixture",
+          viewport: { w: 100, h: 100 },
+          label: "QA round 1",
+          notes: ["first note", "second note"],
+          note: "legacy joined",
+          strokes: [
+            { color: "#f00", width: 2, points: [[0.1, 0.2], [0.3, 0.4]] },
+            { color: "#0f0", width: 3, points: [[0.5, 0.6], [0.7, 0.8]] },
+          ],
+          elements: [
+            {
+              index: 1,
+              tag: "button",
+              cssPath: "html body form button",
+              text: "Shop now",
+              instruction: "Make this blue and round",
+              intent: "fix",
+              severity: "blocking",
+              edits: { color: "#0af", fontSize: "16px" },
+            },
+          ],
+          captureState: {
+            animationsFrozen: true,
+            hoveredSelector: "div.card:hover",
+            activeElementSelector: null,
+            openDetailsSelectors: ["details.a", "details.b"],
+          },
+          screenshot: TINY_PNG_DATA_URL,
+        };
+        const posted = await request(hub.base, "POST", "/annotations", payload);
+        assert.equal(posted.status, 200);
+        const jsonName = posted.json.file as string;
+
+        const first = await rawRequest(
+          hub.base,
+          `/annotations/${jsonName}/share`,
+        );
+        assert.equal(first.status, 200);
+        assert.equal(first.contentType, "text/html; charset=utf-8");
+        assert.ok(
+          first.csp && first.csp.includes("default-src 'none'"),
+          "no-script CSP present",
+        );
+        // Read-only: no forms, buttons, links, or scripts anywhere.
+        for (const forbidden of ["<button", "<form", "<input", "<a ", "href=", "<script"]) {
+          assert.ok(!first.text.includes(forbidden), `no ${forbidden} in share page`);
+        }
+        // Content sections.
+        assert.ok(first.text.includes("Browserlink annotation"));
+        assert.ok(first.text.includes(`Annotation file: <code>${jsonName}</code>`));
+        assert.ok(first.text.includes("https://example.test/page?q=1|2"));
+        assert.ok(first.text.includes("Share fixture"));
+        assert.ok(first.text.includes("100x100"));
+        assert.ok(first.text.includes("QA round 1"));
+        assert.ok(first.text.includes("first note"));
+        assert.ok(first.text.includes("second note"));
+        assert.ok(first.text.includes("Element 1"));
+        assert.ok(first.text.includes("button"));
+        assert.ok(first.text.includes("html body form button"));
+        assert.ok(first.text.includes("Shop now"));
+        assert.ok(first.text.includes("Make this blue and round"));
+        // Intent/severity chips.
+        assert.ok(first.text.includes('class="chip chip-intent"'));
+        assert.ok(first.text.includes(">fix</span>"));
+        assert.ok(first.text.includes('class="chip chip-severity"'));
+        assert.ok(first.text.includes(">blocking</span>"));
+        // Edits.
+        assert.ok(first.text.includes("<code>color</code>: #0af"));
+        // Capture state.
+        assert.ok(first.text.includes("Animations frozen"));
+        assert.ok(first.text.includes("details.a"));
+        // Strokes.
+        assert.ok(first.text.includes("Count: 2"));
+        assert.ok(first.text.includes("#f00"));
+        // Screenshot: same-origin reference, escaped alt.
+        assert.ok(
+          first.text.includes(
+            `<img src="/annotations/${jsonName}/share.png"`,
+          ),
+          "screenshot referenced via the share.png route",
+        );
+        assert.ok(!first.text.includes("No screenshot stored"));
+        // Reachability copy is local-first.
+        assert.ok(first.text.includes("not a public link"));
+        assert.ok(!first.text.includes("\u2014"), "no U+2014 in share page");
+
+        // The referenced PNG actually serves with PNG magic bytes.
+        const pngRes = await fetch(
+          `${hub.base}/annotations/${jsonName}/share.png`,
+        );
+        assert.equal(pngRes.status, 200);
+        assert.equal(pngRes.headers.get("content-type"), "image/png");
+        const bytes = Buffer.from(await pngRes.arrayBuffer());
+        assert.deepEqual(
+          bytes.subarray(0, 8),
+          Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+          "PNG magic bytes",
+        );
+        const storedPng = await readFile(
+          path.join(dir, "annotations", siblingPngName(jsonName)),
+        );
+        assert.deepEqual(bytes, storedPng, "share.png serves the stored bytes");
+
+        // Deterministic: repeated requests produce identical bytes.
+        const second = await rawRequest(
+          hub.base,
+          `/annotations/${jsonName}/share`,
+        );
+        assert.equal(second.status, 200);
+        assert.equal(second.text, first.text);
+
+        // Latest alias resolves to the same newest annotation.
+        const latest = await rawRequest(hub.base, "/annotations/latest/share");
+        assert.equal(latest.status, 200);
+        assert.equal(latest.text, first.text);
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("hostile stored content is HTML-escaped and cannot execute", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const payload = {
+          source: "test",
+          url: "javascript:alert(1)",
+          title: '<img src=x onerror="alert(1)">',
+          viewport: { w: 100, h: 100 },
+          label: '</label><script>alert("pwned")</script>',
+          notes: ["<script>alert(1)</script>", '<svg onload="alert(1)">'],
+          strokes: [],
+          elements: [
+            {
+              index: 1,
+              tag: "div",
+              cssPath: 'a > b & "c" \'d\'',
+              text: '"><script>bad()</script>',
+              instruction: "</script><script>alert(2)</script>",
+              intent: "fix",
+              severity: "suggestion",
+            },
+          ],
+        };
+        const posted = await request(hub.base, "POST", "/annotations", payload);
+        assert.equal(posted.status, 200);
+        const jsonName = posted.json.file as string;
+
+        const res = await rawRequest(
+          hub.base,
+          `/annotations/${jsonName}/share`,
+        );
+        assert.equal(res.status, 200);
+        // Raw payload markers never survive into the page: the hostile
+        // strings may appear as escaped text, but never as parseable tags.
+        assert.ok(!res.text.includes("<script"), "no raw script tag");
+        assert.ok(!res.text.includes("<img"), "no raw img tag");
+        assert.ok(!res.text.includes("<svg"), "no raw svg tag");
+        assert.ok(!res.text.includes("<a "), "no raw anchor tag");
+        assert.ok(!res.text.includes("href="), "no attribute ever carries the URL");
+        // Escaped forms are present.
+        assert.ok(res.text.includes("&lt;script&gt;"), "script escaped");
+        assert.ok(res.text.includes("&lt;img"), "img escaped");
+        assert.ok(res.text.includes("&quot;"), "double quote escaped");
+        assert.ok(res.text.includes("&#39;"), "single quote escaped");
+        assert.ok(res.text.includes("&amp;"), "ampersand escaped");
+        assert.ok(
+          res.text.includes("javascript:alert(1)"),
+          "URL shown as plain page text",
+        );
+        assert.ok(!res.text.includes("href="), "no attribute ever carries the URL");
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("no-screenshot annotation shows explicit no-screenshot state", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const posted = await request(hub.base, "POST", "/annotations", {
+          ...samplePayload(),
+          notes: ["text only"],
+        });
+        assert.equal(posted.status, 200);
+        const jsonName = posted.json.file as string;
+        const res = await rawRequest(
+          hub.base,
+          `/annotations/${jsonName}/share`,
+        );
+        assert.equal(res.status, 200);
+        assert.ok(
+          res.text.includes("No screenshot stored for this annotation."),
+          "explicit no-screenshot state",
+        );
+        assert.ok(!res.text.includes("<img"), "no broken image element");
+
+        // A screenshotFile that points at a missing PNG must degrade the
+        // same way instead of rendering a broken image.
+        const annPath = path.join(dir, "annotations", jsonName);
+        const ann = JSON.parse(await readFile(annPath, "utf8"));
+        ann.screenshotFile = "20260101-000000-000.png";
+        await writeFile(annPath, JSON.stringify(ann));
+        const degraded = await rawRequest(
+          hub.base,
+          `/annotations/${jsonName}/share`,
+        );
+        assert.equal(degraded.status, 200);
+        assert.ok(
+          degraded.text.includes("No screenshot stored for this annotation."),
+          "missing PNG degrades to the no-screenshot state",
+        );
+        assert.ok(!degraded.text.includes("<img"), "no broken image element");
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("unsafe names return 400", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        let res = await rawRequest(hub.base, "/annotations/a/b/share");
+        assert.equal(res.status, 400);
+        assert.deepEqual(JSON.parse(res.text), { error: "invalid annotation name" });
+        res = await rawRequest(hub.base, "/annotations/a/b/share.png");
+        assert.equal(res.status, 400);
+        assert.deepEqual(JSON.parse(res.text), { error: "invalid annotation name" });
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("missing safe names return 404", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        let res = await rawRequest(
+          hub.base,
+          "/annotations/20260101-000000-999.json/share",
+        );
+        assert.equal(res.status, 404);
+        assert.deepEqual(JSON.parse(res.text), { error: "not found" });
+        res = await rawRequest(
+          hub.base,
+          "/annotations/20260101-000000-999.json/share.png",
+        );
+        assert.equal(res.status, 404);
+        assert.deepEqual(JSON.parse(res.text), { error: "not found" });
+        res = await rawRequest(hub.base, "/annotations/latest/share");
+        assert.equal(res.status, 404);
+        assert.deepEqual(JSON.parse(res.text), { error: "not found" });
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("GET /share performs no writes", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const posted = await request(hub.base, "POST", "/annotations", {
+          ...samplePayload(),
+          screenshot: TINY_PNG_DATA_URL,
+        });
+        assert.equal(posted.status, 200);
+        const jsonName = posted.json.file as string;
+
+        const snapshot = () => {
+          const map = new Map<string, [number, number]>();
+          const walk = (d: string) => {
+            for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+              const p = path.join(d, entry.name);
+              if (entry.isDirectory()) walk(p);
+              else {
+                const st = fs.statSync(p);
+                map.set(p, [st.size, st.mtimeMs]);
+              }
+            }
+          };
+          walk(dir);
+          return map;
+        };
+        const stateBefore = snapshot();
+
+        for (const route of [
+          `/annotations/${jsonName}/share`,
+          `/annotations/${jsonName}/share.png`,
+          "/annotations/latest/share",
+        ]) {
+          const res = await rawRequest(hub.base, route);
+          assert.equal(res.status, 200);
+        }
+
+        const stateAfter = snapshot();
+        assert.equal(stateAfter.size, stateBefore.size, "no new files");
+        for (const [p, [size, mtime]] of stateBefore) {
+          const after = stateAfter.get(p);
+          assert.ok(after, `file still present: ${p}`);
+          assert.equal(after[0], size, `size unchanged: ${p}`);
+          assert.equal(after[1], mtime, `mtime unchanged: ${p}`);
+        }
       } finally {
         await hub.close();
       }

@@ -19,6 +19,9 @@
  *     switching ON re-activates it ({type:"browserlinkToggle", enabled:true}).
  *   - "Send test annotation": sends a 1-stroke test payload through the
  *     service worker to verify the whole popup -> SW -> hub chain.
+ *   - "Copy share link": copies the newest annotation's local read-only
+ *     share URL (<endpoint>/annotations/<name>/share); the success state
+ *     names the annotation.
  */
 'use strict';
 
@@ -407,6 +410,46 @@ async function copyLatestBrief() {
   }
 }
 
+/* Copy Share Link: copy the newest annotation's read-only share URL.
+ * Direct hub fetches only, same pattern as Copy AI Brief. The URL points
+ * at <endpoint>/annotations/<name>/share, a local read-only HTML page
+ * served by the hub (same-machine by default; LAN only when the hub was
+ * deliberately exposed). navigator.clipboard.writeText runs at the end of
+ * this click-gesture handler while the popup document stays focused. */
+async function copyShareLink() {
+  const out = $('shareResult');
+  out.textContent = 'copying…';
+  out.className = 'result';
+  let endpoint;
+  try {
+    endpoint = await resolveEndpoint();
+  } catch (_) {
+    out.textContent = 'failed: hub offline';
+    out.className = 'result err';
+    return;
+  }
+  try {
+    const listRes = await fetch(endpoint + '/annotations');
+    if (!listRes.ok) throw new Error('annotations list ' + listRes.status);
+    const body = await listRes.json();
+    const files = (body && Array.isArray(body.files)) ? body.files : [];
+    const newest = files[0]; // hub lists newest first (mtime desc)
+    if (!newest || !newest.name) {
+      out.textContent = 'no annotations yet';
+      out.className = 'result err';
+      return;
+    }
+    const shareUrl =
+      endpoint + '/annotations/' + encodeURIComponent(newest.name) + '/share';
+    await navigator.clipboard.writeText(shareUrl);
+    out.textContent = 'copied ' + newest.name + ' ✓';
+    out.className = 'result ok';
+  } catch (err) {
+    out.textContent = 'failed: ' + ((err && err.message) ? err.message : 'hub offline');
+    out.className = 'result err';
+  }
+}
+
 /* wiring */
 $('toolToggle').addEventListener('change', onToolToggle);
 $('saveEndpoint').addEventListener('click', saveEndpoint);
@@ -419,6 +462,7 @@ $('sessionSelect').addEventListener('change', onSessionChange);
 $('contextLabel').addEventListener('input', saveLabel);
 $('sendTest').addEventListener('click', sendTest);
 $('copyBrief').addEventListener('click', copyLatestBrief);
+$('copyShare').addEventListener('click', copyShareLink);
 checkHub();
 loadEndpoint();
 loadLabel();

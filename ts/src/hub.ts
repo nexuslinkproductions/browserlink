@@ -33,6 +33,7 @@ export {
   isSafeName,
   validatePayload,
   validateTargetBody,
+  siblingPngName,
   VERSION,
 };
 export type { JsonObject };
@@ -156,6 +157,289 @@ function sendEmpty(res: http.ServerResponse, status: number): void {
     "Access-Control-Allow-Headers": "Content-Type",
   });
   res.end();
+}
+
+/** Escape a value for safe inclusion in HTML text and attribute content. */
+function escapeHtml(value: unknown): string {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => {
+    switch (ch) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      default:
+        return "&#39;";
+    }
+  });
+}
+
+function stringOf(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+// The share page is static HTML with no scripts, no forms, and no external
+// resources; the CSP makes that a hard guarantee (only same-origin images
+// and the inline style element are permitted).
+const SHARE_CSP =
+  "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
+
+/** The sibling PNG of an annotation JSON file (both share the timestamp stem). */
+function siblingPngName(name: string): string {
+  return name.replace(/\.json$/, "") + ".png";
+}
+
+/**
+ * Render one stored annotation as a readable, read-only HTML share page.
+ *
+ * Pure function of (annotation, name, screenshotAvailable): identical inputs
+ * always produce identical bytes, so repeated GETs are deterministic.
+ * Every annotation-derived value (URL, title, label, notes, element text,
+ * selectors, instructions, edits, chips, capture state) is HTML-escaped, so
+ * stored content cannot execute script. The page contains no edit, delete,
+ * reply, upload, account, or cloud controls: no forms, no buttons, no links.
+ * No U+2014 em-dashes anywhere in the generated markup.
+ */
+function renderSharePage(
+  annotation: JsonObject,
+  name: string,
+  screenshotAvailable: boolean,
+): string {
+  const esc = escapeHtml;
+  const url = stringOf(annotation.url);
+  const title = stringOf(annotation.title);
+  const label = stringOf(annotation.label);
+
+  // Notes: prefer the committed notes queue ('notes'), fall back to the
+  // legacy joined 'note' string (same rule as the Markdown brief).
+  const notes: string[] = [];
+  if (Array.isArray(annotation.notes)) {
+    for (const n of annotation.notes) {
+      const s = stringOf(n).trim();
+      if (s) notes.push(s);
+    }
+  }
+  if (notes.length === 0) {
+    const legacy = stringOf(annotation.note).trim();
+    if (legacy) notes.push(legacy);
+  }
+
+  const strokes = Array.isArray(annotation.strokes) ? annotation.strokes : [];
+  const elements = Array.isArray(annotation.elements)
+    ? annotation.elements
+    : [];
+
+  const out: string[] = [];
+  out.push("<!DOCTYPE html>");
+  out.push('<html lang="en">');
+  out.push("<head>");
+  out.push('<meta charset="utf-8">');
+  out.push(`<title>Annotation ${esc(name)} - Browserlink</title>`);
+  out.push('<meta name="robots" content="noindex">');
+  out.push("<style>");
+  out.push(
+    ":root { color-scheme: dark; }",
+    "* { box-sizing: border-box; }",
+    "body { margin: 0; padding: 24px 16px; font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; background: #16181e; color: #e8eaed; }",
+    ".wrap { max-width: 720px; margin: 0 auto; }",
+    "h1 { margin: 0 0 4px; font-size: 20px; }",
+    "h2 { margin: 22px 0 8px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: #9aa0a6; }",
+    "h3 { margin: 12px 0 6px; font-size: 14px; }",
+    ".meta { margin: 0 0 12px; font-size: 12px; color: #9aa0a6; }",
+    ".reach { padding: 8px 10px; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 7px; background: rgba(255, 255, 255, 0.05); font-size: 12px; color: #9aa0a6; }",
+    "dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; }",
+    "dt { color: #9aa0a6; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }",
+    "dd { margin: 0; overflow-wrap: anywhere; }",
+    "code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: rgba(255, 255, 255, 0.07); padding: 1px 5px; border-radius: 5px; }",
+    ".element { padding: 12px; margin-top: 10px; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 9px; background: rgba(255, 255, 255, 0.03); }",
+    ".chips { margin: 0 0 8px; }",
+    ".chip { display: inline-block; padding: 2px 9px; margin-right: 6px; border-radius: 999px; font-size: 11px; font-weight: 600; }",
+    ".chip-intent { background: rgba(74, 158, 255, 0.18); color: #6ab0ff; }",
+    ".chip-severity { background: rgba(255, 210, 90, 0.16); color: #ffd25a; }",
+    "ul { margin: 4px 0; padding-left: 20px; }",
+    "img { max-width: 100%; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 9px; }",
+    ".noshot { color: #9aa0a6; font-style: italic; }",
+  );
+  out.push("</style>");
+  out.push("</head>");
+  out.push("<body>");
+  out.push('<main class="wrap">');
+  out.push("<header>");
+  out.push("<h1>Browserlink annotation</h1>");
+  out.push(`<p class="meta">Annotation file: <code>${esc(name)}</code></p>`);
+  out.push(
+    '<p class="reach">Served from your local browserlink hub. This page is ' +
+      "readable only on this machine (or your LAN only if you deliberately " +
+      "exposed the hub). It is not a public link.</p>",
+  );
+  out.push("</header>");
+
+  out.push("<section>");
+  out.push("<h2>Page</h2>");
+  out.push("<dl>");
+  out.push(`<dt>URL</dt><dd>${esc(url) || "(none)"}</dd>`);
+  out.push(`<dt>Title</dt><dd>${esc(title) || "(none)"}</dd>`);
+  const viewport = annotation.viewport;
+  if (
+    viewport !== null &&
+    typeof viewport === "object" &&
+    !Array.isArray(viewport)
+  ) {
+    const vp = viewport as JsonObject;
+    const w = typeof vp.w === "number" ? String(vp.w) : "?";
+    const h = typeof vp.h === "number" ? String(vp.h) : "?";
+    out.push(`<dt>Viewport</dt><dd>${w}x${h}</dd>`);
+  }
+  out.push("</dl>");
+  out.push("</section>");
+
+  out.push("<section>");
+  out.push("<h2>Label</h2>");
+  out.push(`<p>${esc(label) || "(none)"}</p>`);
+  out.push("</section>");
+
+  out.push("<section>");
+  out.push("<h2>Notes</h2>");
+  if (notes.length > 0) {
+    out.push("<ul>");
+    for (const n of notes) out.push(`<li>${esc(n)}</li>`);
+    out.push("</ul>");
+  } else {
+    out.push("<p>None.</p>");
+  }
+  out.push("</section>");
+
+  out.push("<section>");
+  out.push("<h2>Elements</h2>");
+  if (elements.length > 0) {
+    for (let i = 0; i < elements.length; i++) {
+      const el = elements[i];
+      if (el === null || typeof el !== "object" || Array.isArray(el)) continue;
+      const record = el as JsonObject;
+      const index = typeof record.index === "number" ? record.index : i + 1;
+      out.push('<article class="element">');
+      out.push(`<h3>Element ${index}</h3>`);
+      const chips: string[] = [];
+      if (record.intent !== undefined && record.intent !== null) {
+        chips.push(
+          `<span class="chip chip-intent">${esc(stringOf(record.intent))}</span>`,
+        );
+      }
+      if (record.severity !== undefined && record.severity !== null) {
+        chips.push(
+          `<span class="chip chip-severity">${esc(stringOf(record.severity))}</span>`,
+        );
+      }
+      if (chips.length > 0) out.push(`<p class="chips">${chips.join("")}</p>`);
+      out.push("<dl>");
+      if (record.tag !== undefined && record.tag !== null) {
+        out.push(`<dt>Tag</dt><dd>${esc(stringOf(record.tag))}</dd>`);
+      }
+      if (record.cssPath !== undefined && record.cssPath !== null) {
+        out.push(
+          `<dt>Selector</dt><dd><code>${esc(stringOf(record.cssPath))}</code></dd>`,
+        );
+      }
+      if (record.text !== undefined && record.text !== null) {
+        const text = stringOf(record.text).trim();
+        if (text) out.push(`<dt>Text</dt><dd>${esc(text)}</dd>`);
+      }
+      if (record.instruction !== undefined && record.instruction !== null) {
+        out.push(
+          `<dt>Instruction</dt><dd>${esc(stringOf(record.instruction))}</dd>`,
+        );
+      }
+      const edits = record.edits;
+      if (edits !== null && typeof edits === "object" && !Array.isArray(edits)) {
+        const entries = Object.entries(edits as Record<string, unknown>);
+        if (entries.length > 0) {
+          out.push("<dt>Edits</dt><dd>");
+          out.push("<ul>");
+          for (const [key, value] of entries) {
+            out.push(
+              `<li><code>${esc(key)}</code>: ${esc(stringOf(value))}</li>`,
+            );
+          }
+          out.push("</ul>");
+          out.push("</dd>");
+        }
+      }
+      out.push("</dl>");
+      out.push("</article>");
+    }
+  } else {
+    out.push("<p>None.</p>");
+  }
+  out.push("</section>");
+
+  const captureState = annotation.captureState;
+  if (
+    captureState !== null &&
+    typeof captureState === "object" &&
+    !Array.isArray(captureState)
+  ) {
+    const cs = captureState as JsonObject;
+    out.push("<section>");
+    out.push("<h2>Capture State</h2>");
+    out.push("<dl>");
+    out.push(
+      `<dt>Animations frozen</dt><dd>${cs.animationsFrozen === true ? "true" : "false"}</dd>`,
+    );
+    out.push(
+      `<dt>Hovered selector</dt><dd><code>${esc(stringOf(cs.hoveredSelector ?? "null"))}</code></dd>`,
+    );
+    out.push(
+      `<dt>Active element selector</dt><dd><code>${esc(stringOf(cs.activeElementSelector ?? "null"))}</code></dd>`,
+    );
+    const openDetails = Array.isArray(cs.openDetailsSelectors)
+      ? (cs.openDetailsSelectors as unknown[])
+      : [];
+    out.push(
+      `<dt>Open details selectors</dt><dd>${openDetails.length > 0 ? openDetails.map((d) => `<code>${esc(stringOf(d))}</code>`).join(", ") : "none"}</dd>`,
+    );
+    out.push("</dl>");
+    out.push("</section>");
+  }
+
+  out.push("<section>");
+  out.push("<h2>Strokes</h2>");
+  out.push(`<p>Count: ${strokes.length}</p>`);
+  const colors = new Set<string>();
+  for (const stroke of strokes) {
+    if (
+      stroke !== null &&
+      typeof stroke === "object" &&
+      !Array.isArray(stroke)
+    ) {
+      const color = (stroke as JsonObject).color;
+      if (typeof color === "string" && color) colors.add(color);
+    }
+  }
+  if (colors.size > 0) {
+    out.push(
+      `<p>Colors: ${Array.from(colors).map((c) => `<code>${esc(c)}</code>`).join(", ")}</p>`,
+    );
+  }
+  out.push("</section>");
+
+  out.push("<section>");
+  out.push("<h2>Screenshot</h2>");
+  if (screenshotAvailable) {
+    out.push(
+      `<img src="/annotations/${name}/share.png" alt="Annotation screenshot for ${esc(name)}">`,
+    );
+  } else {
+    out.push('<p class="noshot">No screenshot stored for this annotation.</p>');
+  }
+  out.push("</section>");
+
+  out.push("</main>");
+  out.push("</body>");
+  out.push("</html>");
+  return out.join("\n") + "\n";
 }
 
 function requestPathname(reqUrl: string | undefined): string {
@@ -343,6 +627,63 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
     }
   }
 
+  // Serve one stored annotation as a readable, read-only HTML share page.
+  // Reads only: no writes, no target changes, no adapter dispatch.
+  function serveSharePage(res: http.ServerResponse, name: string): void {
+    const filePath = path.join(annotationsDir(), name);
+    try {
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+        sendJson(res, 404, { error: "not found" });
+        return;
+      }
+      const annotation = JSON.parse(
+        fs.readFileSync(filePath, "utf8"),
+      ) as JsonObject;
+      // Show the screenshot only when the sibling PNG the <img> would fetch
+      // actually exists, so a missing file renders the explicit
+      // no-screenshot state instead of a broken image.
+      const pngPath = path.join(annotationsDir(), siblingPngName(name));
+      const screenshotAvailable =
+        fs.existsSync(pngPath) && fs.statSync(pngPath).isFile();
+      const html = renderSharePage(annotation, name, screenshotAvailable);
+      const body = Buffer.from(html, "utf8");
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Length": body.length,
+        "Content-Security-Policy": SHARE_CSP,
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+      });
+      res.end(body);
+    } catch {
+      sendJson(res, 404, { error: "not found" });
+    }
+  }
+
+  // Serve the stored screenshot PNG referenced by a share page.
+  function serveSharePng(res: http.ServerResponse, name: string): void {
+    const pngPath = path.join(annotationsDir(), siblingPngName(name));
+    try {
+      if (!fs.existsSync(pngPath) || !fs.statSync(pngPath).isFile()) {
+        sendJson(res, 404, { error: "not found" });
+        return;
+      }
+      const body = fs.readFileSync(pngPath);
+      res.writeHead(200, {
+        "Content-Type": "image/png",
+        "Content-Length": body.length,
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+      });
+      res.end(body);
+    } catch {
+      sendJson(res, 404, { error: "not found" });
+    }
+  }
+
+
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? "GET";
     const pathname = requestPathname(req.url);
@@ -446,6 +787,64 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
           return;
         }
         serveExportMd(res, name);
+        return;
+      }
+      // Share page: convenience alias for the newest stored annotation.
+      if (pathname === "/annotations/latest/share") {
+        const directory = annotationsDir();
+        let newest: string | null = null;
+        try {
+          if (fs.existsSync(directory) && fs.statSync(directory).isDirectory()) {
+            const files: Array<{ name: string; mtime: number }> = [];
+            for (const name of fs.readdirSync(directory)) {
+              if (!name.endsWith(".json") || !NAME_RE.test(name)) continue;
+              const filePath = path.join(directory, name);
+              try {
+                const st = fs.statSync(filePath);
+                if (st.isFile()) files.push({ name, mtime: st.mtimeMs });
+              } catch {
+                continue;
+              }
+            }
+            files.sort((a, b) => b.mtime - a.mtime);
+            newest = files.length > 0 ? files[0].name : null;
+          }
+        } catch {
+          newest = null;
+        }
+        if (newest === null) {
+          sendJson(res, 404, { error: "not found" });
+          return;
+        }
+        serveSharePage(res, newest);
+        return;
+      }
+      if (pathname.startsWith("/annotations/") && pathname.endsWith("/share")) {
+        const name = pathname.slice(
+          "/annotations/".length,
+          -"/share".length,
+        );
+        // Unsafe names (any "/", "\", or "..") answer 400; missing files 404.
+        if (!isSafeName(name)) {
+          sendJson(res, 400, { error: "invalid annotation name" });
+          return;
+        }
+        serveSharePage(res, name);
+        return;
+      }
+      if (
+        pathname.startsWith("/annotations/") &&
+        pathname.endsWith("/share.png")
+      ) {
+        const name = pathname.slice(
+          "/annotations/".length,
+          -"/share.png".length,
+        );
+        if (!isSafeName(name)) {
+          sendJson(res, 400, { error: "invalid annotation name" });
+          return;
+        }
+        serveSharePng(res, name);
         return;
       }
       if (pathname.startsWith("/annotations/")) {

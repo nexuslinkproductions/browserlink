@@ -4,6 +4,25 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Share link (local read-only annotation page)** - `GET
+  /annotations/<name>/share` renders one stored annotation as a readable,
+  read-only HTML page: page URL, title, viewport, label, notes, per-element
+  Intent/Priority chips, instruction and selector details, capture state,
+  stroke summary, and the stored screenshot (referenced via
+  `/annotations/<name>/share.png`, with an explicit no-screenshot state
+  when absent). Annotation-derived text is HTML-escaped and the page is
+  served with a restrictive CSP, so stored content cannot execute script;
+  the page has no edit/delete/reply/account/cloud controls and labels its
+  reachability as same-machine (hub binds 127.0.0.1 by default) unless the
+  hub was deliberately exposed for LAN use. `GET /annotations/latest/share`
+  aliases the newest annotation. The popup gains a **Copy share link**
+  button that copies the newest annotation's share URL with a success state
+  naming the annotation.
+
 ## [2.5.0] - 2026-08-12
 
 ### Added

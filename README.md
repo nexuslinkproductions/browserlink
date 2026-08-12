@@ -128,6 +128,14 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
   instructions, edits, Intent/Priority, capture state, notes, stroke
   summary, and local `@file`/`@image` references (`GET
   /annotations/latest/export.md`).
+- **Share link (read-only page)** - one click copies a local share URL for
+  the newest annotation; opening it renders a readable, read-only HTML page
+  with the page URL, label, notes, intent/priority chips, element
+  instructions and selectors, and the stored screenshot (`GET
+  /annotations/<name>/share`). The hub binds 127.0.0.1 by default, so the
+  link opens on this machine; other devices on your LAN can open it only if
+  you deliberately expose the hub. It is never a public link and needs no
+  account.
 - **Activation toggle** - a master switch in the popup (default ON, persisted
   per profile): deactivates the tool on the current page with one click, and
   re-activates it straight from the popup.
