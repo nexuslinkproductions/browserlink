@@ -1166,6 +1166,13 @@
    */
   const DRAFT_PERSIST_MS = 300; // debounce window for writeDraft
   const DRAFT_SAVE_VERSION = 1;
+  // Bounded draft retention: chrome.storage.local has a 10MB quota and
+  // 'draft:<url>' keys would otherwise accumulate forever, eventually
+  // killing draft persistence AND popup config writes. Cap the draft set,
+  // evicting oldest-first by savedAt.
+  const DRAFT_MAX_COUNT = 25;
+  const DRAFT_SWEEP_MIN_MS = 15000; // throttle: at most one sweep per window
+  let lastDraftSweepAt = 0;
   let draftTimer = 0;
   // Restore bookkeeping for diagnostics: null until a restore attempt ran.
   let draftStats = null;
@@ -1293,6 +1300,46 @@
     };
   }
 
+  // Bounded eviction for the draft set (H7): read every 'draft:<url>' key,
+  // and when more than DRAFT_MAX_COUNT exist, evict the oldest ones by
+  // savedAt so storage.local can never fill its quota with drafts. Throttled
+  // to at most one sweep per DRAFT_SWEEP_MIN_MS window (persistDraft fires
+  // on every mutation); also runs once at startup. Never throws: a failed
+  // sweep leaves storage untouched and is logged.
+  async function sweepDrafts() {
+    const now = Date.now();
+    if (now - lastDraftSweepAt < DRAFT_SWEEP_MIN_MS) return;
+    lastDraftSweepAt = now;
+    let all = null;
+    try {
+      all = await chrome.storage.local.get(null);
+    } catch (_) { return; }
+    const drafts = [];
+    for (const k of Object.keys(all || {})) {
+      if (typeof k !== 'string' || k.indexOf('draft:') !== 0) continue;
+      const d = all[k];
+      if (!d || typeof d !== 'object' || Array.isArray(d)) continue;
+      // Unparseable/missing savedAt sorts as oldest: such a draft is the
+      // most likely to be stale, so it is evicted first.
+      const t = typeof d.savedAt === 'string' ? Date.parse(d.savedAt) : 0;
+      drafts.push({
+        key: k,
+        savedAt: Number.isFinite(t) ? t : 0,
+      });
+    }
+    if (drafts.length <= DRAFT_MAX_COUNT) return;
+    drafts.sort((a, b) => a.savedAt - b.savedAt);
+    const evict = drafts.slice(0, drafts.length - DRAFT_MAX_COUNT).map((d) => d.key);
+    try {
+      await chrome.storage.local.remove(evict);
+      console.warn('[browserlink] draft sweep evicted ' + evict.length
+        + ' oldest draft(s); cap=' + DRAFT_MAX_COUNT);
+    } catch (err) {
+      console.error('[browserlink] draft sweep failed: '
+        + ((err && err.message) ? err.message : String(err)));
+    }
+  }
+
   function writeDraft() {
     draftTimer = 0;
     const key = draftKey();
@@ -1304,8 +1351,15 @@
     try {
       const obj = {};
       obj[key] = draft;
-      chrome.storage.local.set(obj).catch(() => {});
+      chrome.storage.local.set(obj).catch((err) => {
+        // H7: surface persist failures (typically the storage.local quota)
+        // instead of silently losing the draft.
+        console.error('[browserlink] draft persist failed (storage quota?): '
+          + ((err && err.message) ? err.message : String(err)));
+      });
     } catch (_) { /* storage unavailable */ }
+    // H7: bounded draft set - evict oldest drafts past the cap (throttled).
+    sweepDrafts();
   }
 
   // Debounced persist: every state mutation schedules one write.
@@ -1691,37 +1745,46 @@
     return null;
   }
 
-  // After a confirmed send, learn the stored annotation id from the hub
-  // (GET /annotations, newest first; the annotation we just posted is the
-  // newest, guarded by a 15s mtime sanity bound) and stamp it on every
-  // item that shipped, so the next send carries a valid parentId. Never
-  // throws: a hub that is offline or slow just leaves items unsent and the
-  // next send stays a root in the same thread.
-  async function threadLearnSentId() {
+  // After a confirmed send, stamp the stored annotation id on every item
+  // that shipped, so the next send carries a valid parentId. The preferred
+  // source is the hub POST response (fromResponse, the exact file we just
+  // stored - race-free even when two tabs send within seconds). When the
+  // response lacks it (older hub), fall back to GET /annotations (newest
+  // first; the annotation we just posted is the newest, guarded by a 15s
+  // mtime sanity bound). Never throws: a hub that is offline or slow just
+  // leaves items unsent and the next send stays a root in the same thread.
+  async function threadLearnSentId(fromResponse) {
     if (!thread.id || !thread.items.length) return;
-    let endpoint = 'http://127.0.0.1:8787';
-    try {
-      const got = await chrome.storage.local.get('endpoint');
-      if (got && typeof got.endpoint === 'string' && got.endpoint) endpoint = got.endpoint;
-    } catch (_) { /* storage unavailable: default endpoint */ }
-    try {
-      const res = await fetch(endpoint.replace(/\/+$/, '') + '/annotations');
-      if (!res.ok) return;
-      const body = await res.json();
-      const files = body && Array.isArray(body.files) ? body.files : [];
-      if (!files.length || !files[0] || typeof files[0].name !== 'string') return;
-      const name = files[0].name;
-      const mtime = Number(files[0].mtime) || 0;
-      if (Date.now() / 1000 - mtime > 15) return; // not the annotation we just sent
-      let stamped = false;
-      for (const it of thread.items) {
-        if (!it.sent) { it.sent = name; stamped = true; }
-      }
-      if (stamped) {
-        diagLog('thread:sent', 'thread=' + thread.id + ' annotation=' + name);
-        refreshThreadPanel();
-      }
-    } catch (_) { /* hub offline: keep prior state, next send stays a root */ }
+    let name = (typeof fromResponse === 'string' && fromResponse) ? fromResponse : null;
+    if (!name) {
+      let endpoint = 'http://127.0.0.1:8787';
+      try {
+        const got = await chrome.storage.local.get('endpoint');
+        if (got && typeof got.endpoint === 'string' && got.endpoint) endpoint = got.endpoint;
+      } catch (_) { /* storage unavailable: default endpoint */ }
+      try {
+        const res = await fetch(endpoint.replace(/\/+$/, '') + '/annotations');
+        if (!res.ok) return;
+        const body = await res.json();
+        const files = body && Array.isArray(body.files) ? body.files : [];
+        if (!files.length || !files[0] || typeof files[0].name !== 'string') return;
+        const mtime = Number(files[0].mtime) || 0;
+        if (Date.now() / 1000 - mtime > 15) return; // not the annotation we just sent
+        name = files[0].name;
+      } catch (_) { /* hub offline: keep prior state, next send stays a root */ }
+    }
+    if (!name) return;
+    // Canonical id form: the hub stores ids as the file stem without the
+    // .json suffix (it accepts both forms as parentId).
+    if (name.endsWith('.json')) name = name.slice(0, -5);
+    let stamped = false;
+    for (const it of thread.items) {
+      if (!it.sent) { it.sent = name; stamped = true; }
+    }
+    if (stamped) {
+      diagLog('thread:sent', 'thread=' + thread.id + ' annotation=' + name);
+      refreshThreadPanel();
+    }
   }
 
   // Render the inspector thread panel: the ordered reply history of the
@@ -8165,8 +8228,11 @@
       // next batch starts without a stale top-level textQuote.
       clearSelQuoteState();
       // F8: stamp the stored annotation id on every shipped thread item so
-      // the next send carries a valid parentId (fire-and-forget).
-      threadLearnSentId();
+      // the next send carries a valid parentId. Prefer the exact id the hub
+      // returned in the POST response (race-free across concurrent tabs);
+      // fall back to the newest-mtime heuristic only when the response
+      // lacked it (older hub).
+      threadLearnSentId(resp && typeof resp.file === 'string' ? resp.file : null);
       // Nothing left to send: let the button collapse away after 2.5s.
       sendHideTimer = setTimeout(hideSendButton, 2500);
     } else {
@@ -8614,6 +8680,9 @@
     // replayed via redraw, element markers re-anchored best-effort). Fire
     // and forget: a storage failure must never block toolbar restore.
     restoreDraftIfAny();
+    // H7: bounded draft set - run the oldest-first eviction sweep once per
+    // activation so over-quota drafts cannot silently kill persistence.
+    sweepDrafts();
     // Toolbar edge dock is per-tab (null = floating). Apply before collapse so
     // the chip/toolbar land on the docked edge when restoring collapsed state.
     // Default dock: first run (no saved dock) pins the toolbar to the LEFT
