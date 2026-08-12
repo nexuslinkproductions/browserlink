@@ -53,6 +53,13 @@ Extension QA hooks are conditional. Set `window.__BL_TEST__` before injection; o
 
 ## Git and release workflow
 
+Two standing branches: `main` (release truth, changes arrive only via PRs) and `Development` (clean integration branch).
+
+- Create every work branch off `Development`, never off `main`.
+- Ship a completed branch as a PR into `Development`.
+- Releases are PRs from `Development` into `main` (Development is the staging branch; main only receives release PRs).
+- Delete the branch after its PR merges. Keep branches short-lived.
+
 Use scoped commits. Add the corresponding `CHANGELOG.md` entry in the same commit, using Keep a Changelog sections and ordering. Before release, verify the README version badge matches the CHANGELOG head, and verify docs match executable behavior. Review `git diff`, run mandatory gates, and report the actual outputs.
 
 ## Diagnostics
