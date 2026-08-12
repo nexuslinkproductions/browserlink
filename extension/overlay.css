@@ -33,9 +33,11 @@
 :host([data-capturing='partial']) .comet-hl,
 :host([data-capturing='partial']) .comet-hover-box,
 :host([data-capturing='partial']) canvas,
+:host([data-capturing='partial']) .comet-frame-shield,
 :host([data-capturing='full']) .comet-hl,
 :host([data-capturing='full']) .comet-hover-box,
-:host([data-capturing='full']) canvas {
+:host([data-capturing='full']) canvas,
+:host([data-capturing='full']) .comet-frame-shield {
   visibility: hidden !important;
 }
 
@@ -1790,6 +1792,40 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* Deep pick (F1): per-row frame/shadow depth + cross-origin limitation badges. */
+.comet-selection-badge {
+  display: inline-block;
+  flex: 0 0 auto;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: rgba(74, 158, 255, 0.14);
+  color: #9cc9ff;
+  font: 600 9.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.comet-selection-badge.is-crossorigin {
+  background: rgba(255, 190, 92, 0.16);
+  color: #ffd28f;
+}
+/* Deep pick (F1): transparent shield over each cross-origin iframe. The top
+   document receives no mouse events over an iframe and the frame can never
+   be entered, so the shield is the only event path that presents the bounded
+   best-effort frame target. It exists only in element mode (display toggled
+   by content.js), sits below every other surface (canvas, toolbar, chip),
+   and is hidden from captures via the data-capturing rules above. */
+.comet-frame-shield {
+  position: fixed;
+  z-index: 2147483645;
+  box-sizing: border-box;
+  background: rgba(74, 158, 255, 0.05);
+  outline: 1px dashed rgba(74, 158, 255, 0.55);
+  cursor: crosshair;
+  pointer-events: auto;
+  display: none;
 }
 .comet-selection-remove {
   appearance: none;

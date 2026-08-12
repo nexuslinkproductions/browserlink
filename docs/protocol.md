@@ -1,7 +1,13 @@
-# browserlink protocol - annotation schema v1.6
+# browserlink protocol - annotation schema v1.7
 
 The public contract between the extension, the hub, and any harness. Versioned;
 changes require a new minor or major version and a compatibility shim.
+
+**Schema v1.7** (backward compatible with v1.0 through v1.6): adds optional
+per-element `elements[].frame` and `elements[].shadow` deep-pick metadata
+carrying same-origin iframe and open shadow-root reach information (see
+below). Wrong types, unknown nested keys, and out-of-range values return HTTP
+400; elements without either field remain valid.
 
 **Schema v1.6** (backward compatible with v1.0 through v1.5): adds optional
 per-element `elements[].intent` and `elements[].severity` metadata chosen from
@@ -73,7 +79,7 @@ HTTP 400.
 | `viewport` | object | required; `w`, `h` positive integers |
 | `label` | string | optional; user context label, ≤ 200 chars |
 | `strokes` | array | required; each: `color` string, `width` number > 0, `points` array of ≥ 2 `[x, y]` pairs, each coordinate in `[0, 1]` (normalized to the annotation viewport) |
-| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below) |
+| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below), `frame`/`shadow` optional deep-picker objects (schema v1.7, see below) |
 | `screenshot` | string | optional (schema v1.4); PNG data URL `data:image/png;base64,<data>`; max 10MB decoded; non-PNG or invalid base64 → HTTP 400 |
 | `captureState` | object | optional (schema v1.6); Freeze State Capture metadata, exactly four typed fields (see below); unknown keys → HTTP 400 |
 
@@ -144,6 +150,55 @@ Rules:
   `"severity": "urgent"`) are rejected by hub validation with HTTP 400.
 - The wire key is `severity`; harness-facing text renders it under the
   user-facing label **Priority**.
+
+### elements[].frame and elements[].shadow (schema v1.7)
+
+Optional per-element deep-pick metadata emitted by the F1 deep picker. Both
+fields are independent and optional: an element can carry either, both, or
+neither. Legacy elements without them are stored unchanged (backward
+compatible with every earlier schema).
+
+`frame` describes the same-origin iframe chain between the top document and
+the element's document:
+
+| Field | Type | Rules |
+|---|---|---|
+| `path` | array of ints | optional; iframe index chain from the top document to the element's document (`[]` or absent = top document); each entry is the index of the frame element among all `iframe`/`frame` elements in its parent document (document order); at most 8 entries, each a non-negative integer |
+| `crossOrigin` | boolean | optional; `true` marks a bounded best-effort target: the element IS a cross-origin frame element whose inner DOM is not accessible, and `path` describes the chain to the document containing that frame element. The extension never claims or attempts inner-DOM access for such targets |
+
+`shadow` describes the open shadow-host boundary chain between the document
+and the element:
+
+| Field | Type | Rules |
+|---|---|---|
+| `depth` | int | optional; number of open shadow boundaries crossed (0 or absent = flat DOM element); integer from 0 to 8 |
+| `hosts` | array of strings | optional; cssPath of each shadow host from the document outward (hosts[0] is the outermost host, in the document; hosts[last] directly contains the element). Each entry is a non-empty string of at most 500 characters; at most 8 entries. Closed shadow roots are never represented |
+
+Example:
+
+```json
+{ "index": 1, "tag": "span", "cssPath": "div > span:nth-of-type(2)",
+  "frame": { "path": [0, 1] },
+  "shadow": { "depth": 2, "hosts": ["#widget-host", "#inner-host"] } }
+```
+
+Rules:
+
+- `frame` must be an object with only the keys `path` and `crossOrigin`;
+  unknown nested keys (e.g. `"frame": { "url": "..." }`) are rejected by hub
+  validation with HTTP 400.
+- `shadow` must be an object with only the keys `depth` and `hosts`; unknown
+  nested keys are rejected with HTTP 400.
+- Wrong types, negative or non-integer `path` entries, overlong `path`/`hosts`
+  lists, out-of-range `depth`, and empty/overlong host selectors are rejected
+  with HTTP 400.
+- `cssPath` stays root-relative: for shadow elements it resolves inside the
+  innermost shadow root named by `hosts`, and for frame elements inside the
+  document named by `frame.path`. Consumers replay in order: frame path, then
+  shadow hosts, then cssPath.
+- `rect` is always normalized to the TOP annotation viewport, including for
+  elements inside same-origin iframes (the extension translates child-frame
+  rectangles into top-level viewport coordinates).
 
 ### captureState (schema v1.6)
 

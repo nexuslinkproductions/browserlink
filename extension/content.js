@@ -38,7 +38,8 @@
  *               setPointerCapture draws strokes. Coordinates are stored
  *               NORMALIZED (x/innerWidth, y/innerHeight) so resizes just
  *               re-render from data. pointercancel handled. UNCHANGED (v2).
- *   Element  -> DevTools-style picker (v2.1): canvas pointer-events: none so
+ *   Element  -> DevTools-style picker (v2.1, deep pick v1.7): canvas
+ *               pointer-events: none so
  *               the page receives the mouse. A rAF-throttled mousemove runs
  *               document.elementFromPoint(x, y), resolves the nearest
  *               meaningful element (has id/class/role/name/href; walk up max
@@ -58,6 +59,27 @@
  *               all selections. While the picker is active, page clicks are
  *               swallowed (preventDefault + stopPropagation) so links/buttons
  *               don't fire.
+ *   Deep pick (F1, schema v1.7): the picker opens OPEN shadow roots
+ *               (elementFromPoint pierces them; the meaningful walk crosses
+ *               each shadow boundary via its host) and SAME-ORIGIN iframes
+ *               (recursive elementFromPoint descent with frame-index paths;
+ *               registered frames get window/document listeners because the
+ *               top document receives no mouse events over an iframe; every
+ *               child-frame rect is translated into top viewport coordinates
+ *               by summing frame-element rects, so highlights, outlines,
+ *               inspector placement, and element crops are correct in nested
+ *               frames, under iframe scroll offsets, CSS zoom, and DPR).
+ *               Descriptors gain optional `frame` {path, crossOrigin} and
+ *               `shadow` {depth, hosts} metadata. CROSS-ORIGIN iframes are
+ *               never entered: a transparent shield over each inaccessible
+ *               frame (top document, element mode only) captures the events
+ *               the top document otherwise never sees over an iframe, so the
+ *               picker resolves the frame element itself as a bounded
+ *               best-effort target, labels it honestly ("cross-origin" chip
+ *               + badge), and stores frame.crossOrigin: true without
+ *               claiming inner-DOM access.
+ *               Our own UI stays unreachable (closed shadow root + host
+ *               exclusion); extension UI nodes never appear in descriptors.
  *
  * Send -> chrome.runtime.sendMessage({type:"annotate", payload}) with the
  * spec payload {source, url, title, viewport, label, strokes, elements};
@@ -92,6 +114,10 @@
   const SEVERITIES = ['blocking', 'important', 'suggestion'];
   const MAX_CSS_PATH = 8;
   const MAX_PARENT_WALK = 5;
+  // Deep pick (F1, schema v1.7): bounded frame/shadow descent so picker and
+  // restore loops always terminate on hostile or cyclic page structures.
+  const MAX_FRAME_DEPTH = 8;
+  const MAX_SHADOW_DEPTH = 8;
   const HL_COLOR = '#4a9eff';
   const SEL_COLOR = '#ff5252';
   const CHIP_MAX = 40;
@@ -141,6 +167,7 @@
   // Selection awaiting Add/Cancel: {descriptor, el, isEdit, editIndex, outlineEl}
   let pending = null;
   let hoveredEl = null;      // meaningful element currently under the cursor
+  let hoveredCrossOrigin = false; // cursor is over an inaccessible (cross-origin) frame
   let mouse = null;          // last clientX/clientY
   let mouseDirty = false;
   let hoverLoopRaf = 0;
@@ -361,6 +388,17 @@
       annotNote: state.annotNote || '',
       annotNotes: state.annotNotes.length,
       strokes: state.strokes.length,
+      // Deep pick (F1): frame registry diagnostics. One listener set per
+      // same-origin frame; cross-origin frames are never entered - each has
+      // a shield presenting the bounded best-effort target in element mode.
+      deep: {
+        sameOriginFrames: frameCounters.sameOrigin,
+        frameListeners: frameCounters.sameOrigin,
+        crossOriginFrames: frameCounters.crossOrigin,
+        shields: shields.length,
+        selectedInFrames: state.elements.filter((en) => en.descriptor && en.descriptor.frame).length,
+        selectedWithShadow: state.elements.filter((en) => en.descriptor && en.descriptor.shadow).length,
+      },
       captureRect: diagLastCaptureRect,
       // Freeze State Capture: frozen flag + last observed hovered selector.
       freeze: {
@@ -606,6 +644,19 @@
         // Schema v1.6: optional per-element intent/severity survive the draft.
         if (INTENTS.indexOf(d.intent) !== -1) out.intent = d.intent;
         if (SEVERITIES.indexOf(d.severity) !== -1) out.severity = d.severity;
+        // Schema v1.7 (F1): optional frame/shadow metadata survive the draft.
+        if (d.frame && (d.frame.crossOrigin === true || (Array.isArray(d.frame.path) && d.frame.path.length))) {
+          out.frame = {
+            path: Array.isArray(d.frame.path) ? d.frame.path.slice(0, MAX_FRAME_DEPTH) : [],
+            crossOrigin: d.frame.crossOrigin === true,
+          };
+        }
+        if (d.shadow && d.shadow.depth && Array.isArray(d.shadow.hosts) && d.shadow.hosts.length) {
+          out.shadow = {
+            depth: Math.min(Number(d.shadow.depth) || d.shadow.hosts.length, MAX_SHADOW_DEPTH),
+            hosts: d.shadow.hosts.slice(0, MAX_SHADOW_DEPTH),
+          };
+        }
         return out;
       }),
     };
@@ -721,8 +772,10 @@
       let el = null;
       if (typeof desc.cssPath === 'string' && desc.cssPath) {
         try {
-          const found = document.querySelector(desc.cssPath);
-          if (found && found.nodeType === 1 && found.getRootNode() === document) el = found;
+          // Deep pick (F1): re-anchor across same-origin frames and open
+          // shadow roots; legacy flat descriptors resolve exactly as before.
+          const found = resolveByDescriptor(desc);
+          if (found && found.nodeType === 1) el = found;
         } catch (_) { el = null; }
       }
       if (!el) { unresolved += 1; continue; }
@@ -740,6 +793,24 @@
       };
       if (INTENTS.indexOf(desc.intent) !== -1) d2.intent = desc.intent;
       if (SEVERITIES.indexOf(desc.severity) !== -1) d2.severity = desc.severity;
+      // Schema v1.7 (F1): restore optional frame/shadow metadata so the
+      // descriptor stays truthful after refresh (bounded, sanitized).
+      if (desc.frame && typeof desc.frame === 'object' && !Array.isArray(desc.frame)) {
+        const f = desc.frame;
+        const fp = Array.isArray(f.path)
+          ? f.path.filter((n) => Number.isInteger(n) && n >= 0).slice(0, MAX_FRAME_DEPTH)
+          : [];
+        if (f.crossOrigin === true || fp.length) {
+          d2.frame = { path: fp, crossOrigin: f.crossOrigin === true };
+        }
+      }
+      if (desc.shadow && typeof desc.shadow === 'object' && !Array.isArray(desc.shadow)) {
+        const s = desc.shadow;
+        const hosts = Array.isArray(s.hosts)
+          ? s.hosts.filter((h) => typeof h === 'string' && h).slice(0, MAX_SHADOW_DEPTH)
+          : [];
+        if (hosts.length) d2.shadow = { depth: hosts.length, hosts };
+      }
       const outlineEl = createOutline(d2.index);
       state.elements.push({ descriptor: d2, el, outlineEl });
       restored += 1;
@@ -1438,7 +1509,7 @@
     const ih = inspPanel.offsetHeight || 0;
     const pad = POS_PAD + 8; // breathing room around the element
     let r = null;
-    if (el) { try { r = el.getBoundingClientRect(); } catch (_) { r = null; } }
+    if (el) { try { r = viewportRectOf(el); } catch (_) { r = null; } }
     let left = Math.round((vw - iw) / 2);
     let top = Math.max(POS_PAD, Math.round((vh - ih) / 2));
     if (r && r.width > 1 && r.height > 1) {
@@ -1927,7 +1998,7 @@
     ctx.lineWidth = 3;
     for (const en of state.elements) {
       let r = null;
-      try { r = en.el.getBoundingClientRect(); } catch (_) { r = null; }
+      try { r = viewportRectOf(en.el); } catch (_) { r = null; }
       if (!r || r.width < 1 || r.height < 1) continue;
       ctx.strokeRect(r.left - 3, r.top - 3, r.width + 6, r.height + 6);
     }
@@ -2013,28 +2084,570 @@
   // Nearest meaningful element under the cursor: skip elements without
   // id/class/role/name/href (walk up max MAX_PARENT_WALK parents), never
   // html/body, never the extension's own shadow UI. Our UI lives in a CLOSED
-  // shadow root, so host.contains() cannot see inside it (closed shadow
-  // boundaries are opaque to light-tree traversal); getRootNode() returns the
-  // ShadowRoot for our elements and document for page elements, which is the
-  // reliable exclusion. If nothing meaningful is found in the walk, fall back
+  // shadow root, so elementFromPoint never returns anything inside it (closed
+  // boundaries are opaque); the host element itself and any light-tree
+  // children are excluded here. OPEN page shadow roots are traversable:
+  // elementFromPoint pierces them, and the walk crosses each boundary via
+  // the host element, so elements inside one or more open roots resolve like
+  // flat-DOM elements. If nothing meaningful is found in the walk, fall back
   // to the raw hit element (DevTools-style) so hover always works over plain
   // page content.
   function resolveMeaningful(hit) {
     if (!hit || hit.nodeType !== 1) return null;
-    if (hit.getRootNode() !== document) return null; // inside our closed shadow root
-    if (host && host.contains(hit)) return null;     // host itself / light-tree children
+    if (host && (hit === host || host.contains(hit))) return null; // our UI host / light children
     let el = hit;
     for (let i = 0; i <= MAX_PARENT_WALK; i++) {
       if (!el || el.nodeType !== 1) break;           // walked off the tree
-      if (el === document.documentElement || el === document.body) break; // never html/body
+      const root = el.getRootNode();
+      const doc = (root && root.nodeType === 9) ? root : el.ownerDocument;
+      if (doc && (el === doc.documentElement || el === doc.body)) break; // never html/body
       if (hasMeaning(el)) return el;
-      el = el.parentElement;
+      // Cross an open shadow boundary: the host is a normal element in the
+      // outer tree, so the walk continues through it. Closed roots are
+      // opaque here (no host is reachable), which only happens for elements
+      // elementFromPoint cannot see in the first place.
+      el = el.parentElement
+        || ((root && root.nodeType === 11 && root.host) ? root.host : null);
     }
     // No meaningful element within MAX_PARENT_WALK: fall back to the deepest
     // page element under the cursor (never html/body, never our own UI), so
     // hover always works over plain page content.
     if (hit === document.documentElement || hit === document.body) return null;
+    if (hit.ownerDocument && hit.ownerDocument.documentElement
+      && (hit === hit.ownerDocument.documentElement || hit === hit.ownerDocument.body)) {
+      return null;
+    }
     return hit;
+  }
+
+  /* ---------------- deep pick: open shadow roots + same-origin frames ---------------- */
+  // F1 (schema v1.7). elementFromPoint already pierces open shadow roots, so
+  // shadow support is: (a) let the meaningful walk cross shadow boundaries,
+  // (b) record the host chain as optional descriptor metadata. Iframe support
+  // needs more machinery: the top document receives NO mouse events while the
+  // cursor is over an iframe, so every same-origin frame is registered with
+  // its own window/document listeners that forward translated events to the
+  // top-frame picker. Cross-origin frames are never entered.
+
+  // Probe a frame element: {doc} when its document is same-origin accessible,
+  // {crossOrigin:true} when access is denied, null when not a frame element.
+  function probeFrameDoc(frameEl) {
+    if (!frameEl || (frameEl.tagName !== 'IFRAME' && frameEl.tagName !== 'FRAME')) return null;
+    try {
+      const d = frameEl.contentDocument;
+      return d ? { doc: d } : { crossOrigin: false };
+    } catch (_) {
+      return { crossOrigin: true };
+    }
+  }
+
+  // Index of a frame element among all iframe/frame elements in its own
+  // document (document order). Detached elements fall back to 0.
+  function frameIndexIn(frameEl) {
+    let frames = null;
+    try { frames = frameEl.ownerDocument.querySelectorAll('iframe, frame'); } catch (_) { frames = null; }
+    if (!frames) return 0;
+    for (let i = 0; i < frames.length; i++) {
+      if (frames[i] === frameEl) return i;
+    }
+    return 0;
+  }
+
+  // Iframe index chain from the top document to a given document.
+  function framePathOf(doc) {
+    const path = [];
+    let d = doc;
+    let guard = 0;
+    while (d && d !== document && guard++ < MAX_FRAME_DEPTH) {
+      const win = d.defaultView;
+      const fe = win && win.frameElement;
+      if (!fe) break;
+      path.unshift(frameIndexIn(fe));
+      d = fe.ownerDocument;
+    }
+    return path;
+  }
+
+  // Frame elements from the top document down to a given document.
+  function chainFrameElsOf(doc) {
+    const els = [];
+    let d = doc;
+    let guard = 0;
+    while (d && d !== document && guard++ < MAX_FRAME_DEPTH) {
+      const fe = d.defaultView && d.defaultView.frameElement;
+      if (!fe) break;
+      els.unshift(fe);
+      d = fe.ownerDocument;
+    }
+    return els;
+  }
+
+  // Translate a child-document rect into TOP viewport coordinates by summing
+  // the getBoundingClientRect offset of every frame element in the chain.
+  // Each frame rect is expressed in its own parent viewport, so the sum is
+  // the exact top-viewport translation; this inherently accounts for iframe
+  // scroll offsets, CSS zoom on the frame element, and nested same-origin
+  // frames. Elements in the top document translate by (0, 0) and behave
+  // exactly like the pre-F1 code path.
+  function frameOffsetOf(el) {
+    let off = { x: 0, y: 0 };
+    let doc = el.ownerDocument;
+    let guard = 0;
+    while (doc && doc !== document && guard++ < MAX_FRAME_DEPTH) {
+      const fe = doc.defaultView && doc.defaultView.frameElement;
+      if (!fe) break;
+      let r = null;
+      try { r = fe.getBoundingClientRect(); } catch (_) { r = null; }
+      if (r) { off.x += r.left; off.y += r.top; }
+      doc = fe.ownerDocument;
+    }
+    return off;
+  }
+
+  // getBoundingClientRect translated to the TOP viewport (the coordinate
+  // space of the overlay, crops, and normalized rects).
+  function viewportRectOf(el) {
+    const r = el.getBoundingClientRect();
+    const off = frameOffsetOf(el);
+    return {
+      left: r.left + off.x,
+      top: r.top + off.y,
+      right: r.right + off.x,
+      bottom: r.bottom + off.y,
+      width: r.width,
+      height: r.height,
+    };
+  }
+
+  // Shadow-host boundary chain: walk up through OPEN shadow roots, recording
+  // each host. hosts[0] is the outermost host (in the document or a frame's
+  // document); hosts[last] directly contains the element. Closed roots and
+  // detached fragments stop the walk (the boundary is opaque).
+  function shadowMetaOf(el) {
+    const hosts = [];
+    let cur = el;
+    let guard = 0;
+    while (cur && cur.nodeType === 1 && guard++ < MAX_SHADOW_DEPTH) {
+      const root = cur.getRootNode();
+      if (root === document || root === cur.ownerDocument) break;
+      if (root.nodeType !== 11) break; // not a DocumentFragment root
+      const host = root.host;
+      if (!host) break;
+      // Serialize the HOST as a cssPath string (resolvable inside the
+      // containing document/root), never as a live element: descriptors are
+      // JSON and must survive storage, drafts, and sends.
+      let p = null;
+      try { p = cssPath(host); } catch (_) { p = null; }
+      if (!p) break;
+      hosts.unshift(p);
+      cur = host;
+    }
+    return { depth: hosts.length, hosts };
+  }
+
+  // Resolve the element under a point in a document, descending into
+  // same-origin iframes under the cursor (recursively, bounded). Returns
+  // {hit, doc, path, crossOrigin}: hit is the deepest element
+  // elementFromPoint returned in doc; path is the frame-index chain from the
+  // top document to doc; crossOrigin is true when hit is a frame element
+  // whose inner document is NOT accessible, in which case the frame element
+  // itself is the bounded best-effort target (no inner-DOM claim).
+  function resolveAtPoint(x, y, doc, path) {
+    let d = doc || document;
+    let p = path || [];
+    for (let guard = 0; guard < MAX_FRAME_DEPTH; guard++) {
+      let hit = null;
+      try { hit = d.elementFromPoint(x, y); } catch (_) { hit = null; }
+      if (!hit || hit.nodeType !== 1) {
+        return { hit: null, doc: d, path: p, crossOrigin: false };
+      }
+      const probe = probeFrameDoc(hit);
+      if (!probe) {
+        return { hit, doc: d, path: p, crossOrigin: false }; // not a frame
+      }
+      if (probe.crossOrigin) {
+        // Cross-origin frame: bounded frame-level target, honestly marked.
+        // The path is INCLUSIVE (parent frames + this frame's own index) so
+        // the stored descriptor identifies the target on its own.
+        return { hit, doc: d, path: p.concat([frameIndexIn(hit)]), crossOrigin: true };
+      }
+      const childDoc = probe.doc;
+      if (!childDoc || childDoc.defaultView === window || childDoc.defaultView === d.defaultView) {
+        return { hit, doc: d, path: p, crossOrigin: false }; // frame without a doc yet
+      }
+      let r = null;
+      try { r = hit.getBoundingClientRect(); } catch (_) { r = null; }
+      if (!r || r.width < 1 || r.height < 1) {
+        return { hit, doc: d, path: p, crossOrigin: false };
+      }
+      const lx = x - r.left;
+      const ly = y - r.top;
+      if (lx < 0 || ly < 0 || lx > r.width || ly > r.height) {
+        return { hit, doc: d, path: p, crossOrigin: false };
+      }
+      const nextPath = p.concat([frameIndexIn(hit)]);
+      ensureFrameRegistered(hit, nextPath);
+      d = childDoc;
+      p = nextPath;
+      x = lx;
+      y = ly;
+    }
+    return { hit: null, doc: d, path: p, crossOrigin: false };
+  }
+
+  // Re-resolve a stored descriptor to a live element across same-origin
+  // frames and open shadow roots. Returns the element or null. Used by draft
+  // restore and by harness assertions; never throws.
+  function resolveByDescriptor(desc) {
+    if (!desc || typeof desc !== 'object') return null;
+    let doc = document;
+    const fp = desc.frame && Array.isArray(desc.frame.path) ? desc.frame.path : [];
+    for (const idx of fp) {
+      let frames = null;
+      try { frames = doc.querySelectorAll('iframe, frame'); } catch (_) { frames = null; }
+      if (!frames || !frames[idx]) return null;
+      const probe = probeFrameDoc(frames[idx]);
+      if (!probe || !probe.doc) return null;
+      doc = probe.doc;
+    }
+    let root = doc;
+    const hosts = desc.shadow && Array.isArray(desc.shadow.hosts) ? desc.shadow.hosts : [];
+    for (const hostSel of hosts) {
+      let host = null;
+      try { host = root.querySelector(hostSel); } catch (_) { host = null; }
+      if (!host || !host.shadowRoot) return null;
+      root = host.shadowRoot;
+    }
+    if (typeof desc.cssPath !== 'string' || !desc.cssPath) return null;
+    let el = null;
+    try { el = root.querySelector(desc.cssPath); } catch (_) { el = null; }
+    if (!el || el.nodeType !== 1) return null;
+    if (el.getRootNode() !== root) return null; // selector escaped the expected root
+    return el;
+  }
+
+  // Stable identity key for a descriptor: frame path + cross-origin flag +
+  // shadow host chain + intra-root cssPath. Used for re-click/edit matching
+  // so an element keeps its identity across frames and shadow boundaries.
+  function descriptorKey(d) {
+    const fp = (d && d.frame && Array.isArray(d.frame.path)) ? d.frame.path.join(',') : '';
+    const cs = (d && d.frame && d.frame.crossOrigin === true) ? 'x' : '';
+    const hosts = (d && d.shadow && Array.isArray(d.shadow.hosts)) ? d.shadow.hosts.join('|') : '';
+    return fp + ';' + cs + ';' + hosts + ';' + (d.cssPath || '');
+  }
+
+  /* ---------------- deep pick: same-origin frame registry ---------------- */
+  // One listener set per frame element, attached exactly once (WeakSet
+  // guard). Entries live in frameEntries (frame element -> entry) for
+  // diagnostics. Counters feed the diag dump (G4 listener diagnostics).
+  const frameListeners = new WeakSet();
+  const frameEntries = new Map();
+  const frameCounters = { sameOrigin: 0, crossOrigin: 0 };
+
+  // Translate a child-window event into TOP viewport coordinates (computed
+  // live, so parent scrolls and frame moves between events stay correct).
+  function translateFramePoint(entry, x, y) {
+    let ox = 0;
+    let oy = 0;
+    for (const fe of entry.frameEls) {
+      let r = null;
+      try { r = fe.getBoundingClientRect(); } catch (_) { r = null; }
+      if (r) { ox += r.left; oy += r.top; }
+    }
+    return { x: x + ox, y: y + oy };
+  }
+
+  // Child-frame listeners: the picker would otherwise be blind inside the
+  // frame (no mouse events reach the top document over an iframe). All
+  // handlers are no-ops unless element mode is active, and the picker
+  // swallows page reactions exactly like the top-document handlers.
+  function attachFrameListeners(entry) {
+    const d = entry.doc;
+    const w = entry.win;
+    const onMove = (e) => {
+      if (!state.elementMode) return;
+      const t = translateFramePoint(entry, e.clientX, e.clientY);
+      mouse = { x: t.x, y: t.y };
+      mouseDirty = true;
+      if (isReducedMotion()) hoverTick();
+    };
+    const onDown = (e) => {
+      if (!state.elementMode) return;
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    const onClick = (e) => {
+      if (!state.elementMode) return;
+      e.preventDefault();
+      e.stopPropagation();
+      let r = null;
+      try { r = resolveAtPoint(e.clientX, e.clientY, d, entry.path); } catch (_) { r = null; }
+      handlePickResult(r, e);
+    };
+    // Frame keydowns never reach the top document once the iframe holds
+    // focus: forward the picker's two global keys (Escape cancels the
+    // pending element, Enter commits it). All other keys reach the page.
+    const onKey = (e) => {
+      if (!state.elementMode) return;
+      if (e.key === 'Escape' && pending) {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelChat();
+      } else if (e.key === 'Enter' && !e.shiftKey && pending) {
+        e.preventDefault();
+        e.stopPropagation();
+        addChat();
+      }
+    };
+    // Scrolls INSIDE the frame do not bubble to the top document: re-anchor
+    // cross-origin shields whose position depends on the frame's scroll.
+    const onScroll = () => { if (state.elementMode) scheduleShieldSync(); };
+    w.addEventListener('mousemove', onMove);
+    w.addEventListener('mousedown', onDown, true);
+    w.addEventListener('click', onClick, true);
+    w.addEventListener('keydown', onKey, true);
+    d.addEventListener('scroll', onScroll, true);
+    entry.handlers = { onMove, onDown, onClick, onKey, onScroll };
+    frameCounters.sameOrigin += 1;
+  }
+
+  // Remove one frame's listener set (navigation refresh, registry prune,
+  // teardown). Idempotent; safe when the frame window already died.
+  function detachFrameListeners(frameEl) {
+    const entry = frameEntries.get(frameEl);
+    if (!entry || !entry.handlers) return;
+    const h = entry.handlers;
+    try {
+      entry.win.removeEventListener('mousemove', h.onMove);
+      entry.win.removeEventListener('mousedown', h.onDown, true);
+      entry.win.removeEventListener('click', h.onClick, true);
+      entry.win.removeEventListener('keydown', h.onKey, true);
+    } catch (_) { /* window may be gone */ }
+    try {
+      entry.doc.removeEventListener('scroll', h.onScroll, true);
+    } catch (_) { /* doc may be gone */ }
+    frameEntries.delete(frameEl);
+    frameListeners.delete(frameEl);
+    if (frameCounters.sameOrigin > 0) frameCounters.sameOrigin -= 1;
+  }
+
+  // Teardown: remove every frame listener set and reset the counters.
+  function detachAllFrameListeners() {
+    for (const fe of Array.from(frameEntries.keys())) {
+      detachFrameListeners(fe);
+      frameEntries.delete(fe);
+    }
+    frameCounters.sameOrigin = 0;
+    frameCounters.crossOrigin = 0;
+  }
+
+  // Register one frame element (idempotent). Cross-origin frames are counted
+  // but never entered: they get a shield that presents the bounded
+  // best-effort frame target when element mode is active.
+  function ensureFrameRegistered(frameEl, path) {
+    if (!frameEl) return;
+    const probe = probeFrameDoc(frameEl);
+    if (!probe) return;
+    if (probe.crossOrigin) {
+      const existing = frameEntries.get(frameEl);
+      if (!existing || !existing.crossOrigin) {
+        // `path` is the INCLUSIVE index chain (parent frames + this frame).
+        frameEntries.set(frameEl, { crossOrigin: true, frameEl, path: path || [] });
+        frameCounters.crossOrigin += 1;
+      }
+      if (state.elementMode) createShieldFor(frameEntries.get(frameEl));
+      return;
+    }
+    if (!probe.doc) return;
+    if (frameListeners.has(frameEl)) {
+      // Same frame element, but the document may have changed under it
+      // (iframe navigation): listeners on the window survive navigation,
+      // yet hit-testing against the detached document would silently stop
+      // picking, so re-register against the CURRENT document.
+      const entry = frameEntries.get(frameEl);
+      if (entry && entry.doc === probe.doc) return;
+      detachFrameListeners(frameEl);
+    }
+    frameListeners.add(frameEl);
+    const entry = {
+      frameEl,
+      win: frameEl.contentWindow || probe.doc.defaultView,
+      doc: probe.doc,
+      frameEls: chainFrameElsOf(probe.doc),
+      path: path || framePathOf(probe.doc),
+    };
+    frameEntries.set(frameEl, entry);
+    attachFrameListeners(entry);
+  }
+
+  // Register every same-origin frame reachable from the top document
+  // (bounded depth). Called at init, on element-mode entry, and on a
+  // periodic timer; idempotent. Prunes entries whose frame left the tree
+  // and refreshes cross-origin shields.
+  function refreshFrameRegistry() {
+    const seen = new Set();
+    const visit = (doc, path) => {
+      let frames = null;
+      try { frames = doc.querySelectorAll('iframe, frame'); } catch (_) { frames = null; }
+      if (!frames) return;
+      for (const fe of frames) {
+        if (path.length >= MAX_FRAME_DEPTH) continue;
+        const probe = probeFrameDoc(fe);
+        if (probe && probe.doc && probe.doc.defaultView !== window) {
+          ensureFrameRegistered(fe, path.concat([frameIndexIn(fe)]));
+          seen.add(fe);
+          visit(probe.doc, path.concat([frameIndexIn(fe)]));
+        } else if (probe && probe.crossOrigin) {
+          ensureFrameRegistered(fe, path.concat([frameIndexIn(fe)]));
+          seen.add(fe);
+        }
+      }
+    };
+    try { visit(document, []); } catch (_) { /* never break the host page */ }
+    // Prune entries for frames that left the document tree (removed or
+    // replaced): their listeners died with the window, so drop the bookkeeping.
+    for (const fe of Array.from(frameEntries.keys())) {
+      if (seen.has(fe)) continue;
+      const entry = frameEntries.get(fe);
+      if (entry && entry.crossOrigin && frameCounters.crossOrigin > 0) {
+        frameCounters.crossOrigin -= 1;
+      }
+      detachFrameListeners(fe);
+      frameEntries.delete(fe);
+    }
+    if (state.elementMode) syncShields();
+  }
+
+  /* ---------------- deep pick: cross-origin frame shields ---------------- */
+  // The top document receives NO mouse events while the cursor is over ANY
+  // iframe, and a cross-origin frame can never be entered or listened to.
+  // Each inaccessible frame gets a transparent shield box in the TOP
+  // document (inside our closed shadow root, so it never appears in page
+  // hit tests): the shield is the only event path that can present the
+  // bounded best-effort frame target with an explicit cross-origin label
+  // and zero inner-DOM claims. Shields exist only in element mode.
+  const shields = []; // [{shield, frameEl, path}]
+  let shieldSyncRaf = 0;
+  let frameScanTimer = 0;
+  const FRAME_SCAN_MS = 1000; // periodic registry refresh while picking
+
+  function createShieldFor(entry) {
+    if (!shadow || !entry || !entry.frameEl || !entry.crossOrigin) return null;
+    if (shields.some((s) => s.frameEl === entry.frameEl)) return null;
+    const shield = document.createElement('div');
+    shield.className = 'comet-frame-shield';
+    shield.setAttribute('role', 'presentation');
+    shield.addEventListener('mousemove', (e) => {
+      if (!state.elementMode) return;
+      mouse = { x: e.clientX, y: e.clientY };
+      mouseDirty = true;
+      if (isReducedMotion()) hoverTick();
+    });
+    shield.addEventListener('mousedown', (e) => {
+      if (!state.elementMode) return;
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    shield.addEventListener('click', (e) => {
+      if (!state.elementMode) return;
+      e.preventDefault();
+      e.stopPropagation();
+      handlePickResult({
+        hit: entry.frameEl,
+        doc: entry.frameEl.ownerDocument,
+        path: entry.path || [],
+        crossOrigin: true,
+      }, e);
+    });
+    shield.style.display = 'none';
+    shadow.appendChild(shield);
+    shields.push({ shield, frameEl: entry.frameEl, path: entry.path || [] });
+    return shield;
+  }
+
+  // Position every shield over its frame's current top-viewport box.
+  function syncShields() {
+    if (shieldSyncRaf) return;
+    shieldSyncRaf = requestAnimationFrame(() => {
+      shieldSyncRaf = 0;
+      for (const s of shields) {
+        if (!s.shield || !s.shield.parentNode) continue;
+        let r = null;
+        try { r = viewportRectOf(s.frameEl); } catch (_) { r = null; }
+        if (!state.elementMode || !r || r.width < 1 || r.height < 1) {
+          s.shield.style.display = 'none';
+          continue;
+        }
+        s.shield.style.display = 'block';
+        s.shield.style.left = r.left + 'px';
+        s.shield.style.top = r.top + 'px';
+        s.shield.style.width = r.width + 'px';
+        s.shield.style.height = r.height + 'px';
+      }
+    });
+  }
+
+  function scheduleShieldSync() {
+    if (state.elementMode) syncShields();
+  }
+
+  // The shield box under a point (top viewport), or null.
+  function shieldAt(x, y) {
+    for (const s of shields) {
+      if (!s.shield || s.shield.style.display === 'none') continue;
+      const r = s.shield.getBoundingClientRect();
+      if (r && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return s;
+    }
+    return null;
+  }
+
+  function clearShields() {
+    for (const s of shields) {
+      if (s.shield && s.shield.parentNode) {
+        try { s.shield.parentNode.removeChild(s.shield); } catch (_) { /* ok */ }
+      }
+    }
+    shields.length = 0;
+    if (shieldSyncRaf) {
+      cancelAnimationFrame(shieldSyncRaf);
+      shieldSyncRaf = 0;
+    }
+  }
+
+  // Element-mode lifecycle: refresh the frame registry, rebuild shields,
+  // and keep both fresh while the picker is active (pages add, remove, and
+  // navigate frames at any time).
+  function startFrameScan() {
+    refreshFrameRegistry();
+    if (!frameScanTimer) {
+      frameScanTimer = setInterval(() => {
+        refreshFrameRegistry();
+      }, FRAME_SCAN_MS);
+    }
+  }
+
+  function stopFrameScan() {
+    if (frameScanTimer) {
+      clearInterval(frameScanTimer);
+      frameScanTimer = 0;
+    }
+    clearShields();
+  }
+
+  // Lazy registration: when the cursor crosses INTO an iframe, the top
+  // document fires mouseover at the frame boundary (it receives no
+  // mousemove over the frame), so register the frame here and let its own
+  // listeners take over from the first child-frame mousemove.
+  function onDocMouseOver(e) {
+    if (!state.elementMode) return;
+    const path = e.composedPath();
+    for (let i = 0; i < path.length && i <= MAX_FRAME_DEPTH; i++) {
+      const node = path[i];
+      if (node && node.nodeType === 1 && (node.tagName === 'IFRAME' || node.tagName === 'FRAME')) {
+        ensureFrameRegistered(node, framePathOf(node.ownerDocument).concat([frameIndexIn(node)]));
+        return; // outermost frame in the composed path is enough
+      }
+    }
   }
 
   function cssPath(el) {
@@ -2070,8 +2683,11 @@
   // active and the hover box is showing. A hovered element that is already
   // committed shows its own queue number (E<n>); any other element shows the
   // total queued count, so the queue length is always visible while picking.
+  // A cross-origin frame under the cursor is labeled honestly (bounded
+  // best-effort target: the frame itself, never a claim of inner-DOM access).
   function hoverChipLabel(el) {
     let label = chipFromEl(el);
+    if (hoveredCrossOrigin) label += ' · cross-origin';
     if (!state.elementMode || !state.elements.length) return label;
     const qi = state.elements.findIndex((en) => en.el === el);
     if (qi !== -1) {
@@ -2089,7 +2705,10 @@
     // last meaningful hovered element; keep its selector for captureState.
     retainHoveredSelector(el);
     const tag = el.tagName.toLowerCase();
-    const r = el.getBoundingClientRect();
+    // Deep pick (F1): rect is translated to the TOP viewport, so descriptors
+    // stay normalized to the annotation viewport even for same-origin frame
+    // elements (correct under iframe scroll offsets and nested frames).
+    const vr = viewportRectOf(el);
     let cls = '';
     try { cls = el.getAttribute('class') || ''; } catch (_) { /* svg etc. */ }
     if (typeof cls !== 'string' && typeof el.className === 'string') cls = el.className;
@@ -2102,7 +2721,7 @@
     let ariaLabel = '';
     try { ariaLabel = el.getAttribute('aria-label') || ''; } catch (_) { /* ok */ }
     const n = (v) => Math.round(clamp01(v) * 1e6) / 1e6;
-    return {
+    const d = {
       index: state.nextIndex,
       tag,
       id: el.id || '',
@@ -2112,13 +2731,22 @@
       ariaLabel,
       cssPath: cssPath(el),
       rect: {
-        x: n(r.x / window.innerWidth),
-        y: n(r.y / window.innerHeight),
-        w: n(r.width / window.innerWidth),
-        h: n(r.height / window.innerHeight),
+        x: n(vr.left / window.innerWidth),
+        y: n(vr.top / window.innerHeight),
+        w: n(vr.width / window.innerWidth),
+        h: n(vr.height / window.innerHeight),
       },
       instruction: '', // filled on Add (trimmed, cap 500)
     };
+    // Deep pick (F1, schema v1.7): optional frame + shadow metadata. Both are
+    // omitted for flat top-document elements, so legacy descriptors are
+    // byte-compatible. shadow.hosts is the open shadow-host chain
+    // (outermost first), cssPath stays root-relative for replay.
+    const framePath = framePathOf(el.ownerDocument);
+    if (framePath.length) d.frame = { path: framePath, crossOrigin: false };
+    const sm = shadowMetaOf(el);
+    if (sm.depth) d.shadow = { depth: sm.depth, hosts: sm.hosts };
+    return d;
   }
 
   /* ---------------- element mode: overlay positioning ---------------- */
@@ -2182,7 +2810,7 @@
       return;
     }
     let r = null;
-    try { r = hoveredEl.getBoundingClientRect(); } catch (_) { r = null; }
+    try { r = viewportRectOf(hoveredEl); } catch (_) { r = null; }
     const box = rectBox(r);
     if (!box) {
       hideHoverOutlineBox();
@@ -2244,7 +2872,7 @@
       return;
     }
     let r = null;
-    try { r = hoveredEl.getBoundingClientRect(); } catch (_) { r = null; }
+    try { r = viewportRectOf(hoveredEl); } catch (_) { r = null; }
     const target = rectBox(r);
     if (!target) {
       cancelHoverLerp();
@@ -2279,12 +2907,12 @@
     for (const en of state.elements) {
       if (!en.outlineEl) continue;
       let r = null;
-      try { r = en.el.getBoundingClientRect(); } catch (_) { r = null; }
+      try { r = viewportRectOf(en.el); } catch (_) { r = null; }
       placeRect(en.outlineEl, r);
     }
     if (pending && pending.outlineEl) {
       let r = null;
-      try { r = pending.el.getBoundingClientRect(); } catch (_) { r = null; }
+      try { r = viewportRectOf(pending.el); } catch (_) { r = null; }
       placeRect(pending.outlineEl, r);
     }
   }
@@ -2292,6 +2920,9 @@
   function repositionAll() {
     positionHover();
     positionSelections();
+    // Deep pick (F1): cross-origin shields follow their frames on scroll
+    // and resize (frame-internal scrolls arrive via per-frame listeners).
+    scheduleShieldSync();
     // rAF-throttled hover-box recompute on scroll/resize (element mode only).
     scheduleHoverOutlineBox();
     if (hintProp) scheduleRedraw();
@@ -2349,9 +2980,26 @@
           }
           if (hoverBoxEl) hoverBoxEl.style.display = 'none';
         } else {
-          let hit = null;
-          try { hit = document.elementFromPoint(mouse.x, mouse.y); } catch (_) { hit = null; }
-          try { hoveredEl = resolveMeaningful(hit); } catch (_) { hoveredEl = null; }
+          // Deep pick (F1): resolveAtPoint descends into same-origin frames
+          // under the cursor (elementFromPoint pierces open shadow roots).
+          // A cross-origin shield (if any) is the exact hit area of its
+          // bounded frame-level target.
+          const shieldHit = shieldAt(mouse.x, mouse.y);
+          let r = null;
+          if (shieldHit) {
+            hoveredEl = shieldHit.frameEl;
+            hoveredCrossOrigin = true;
+          } else {
+            try { r = resolveAtPoint(mouse.x, mouse.y, document, []); } catch (_) { r = null; }
+            hoveredCrossOrigin = !!(r && r.crossOrigin);
+            if (r && r.crossOrigin) {
+              // Bounded best-effort target: the frame element itself, never
+              // a meaningful ancestor around an inaccessible frame.
+              try { hoveredEl = r.hit; } catch (_) { hoveredEl = null; }
+            } else {
+              try { hoveredEl = resolveMeaningful(r ? r.hit : null); } catch (_) { hoveredEl = null; }
+            }
+          }
           // Retain the last meaningful hovered selector (Freeze State
           // Capture): only real page hover targets update it, and it is
           // never cleared by moving over our own UI or empty page areas.
@@ -2393,6 +3041,7 @@
     cancelHoverLerp();
     hoverTargetRect = null;
     hoverVisualRect = null;
+    hoveredCrossOrigin = false;
     if (hlEl) hlEl.style.display = 'none';
     hideHoverOutlineBox();
   }
@@ -2444,6 +3093,32 @@
       labelSpan.className = 'comet-selection-label';
       labelSpan.textContent = label;
       main.appendChild(labelSpan);
+      // Deep pick (F1): per-row badges for frame depth, shadow depth, and the
+      // honest cross-origin limitation (frame-level target only).
+      const desc = en.descriptor || {};
+      const badges = [];
+      let crossOriginBadge = false;
+      if (desc.frame && typeof desc.frame === 'object') {
+        if (desc.frame.crossOrigin === true) {
+          badges.push('cross-origin');
+          crossOriginBadge = true;
+        }
+        if (Array.isArray(desc.frame.path) && desc.frame.path.length) {
+          badges.push('frame ' + desc.frame.path.join('.'));
+        }
+      }
+      if (desc.shadow && typeof desc.shadow === 'object' && desc.shadow.depth) {
+        badges.push('shadow ' + desc.shadow.depth);
+      }
+      if (badges.length) {
+        const badgeSpan = document.createElement('span');
+        badgeSpan.className = 'comet-selection-badge' + (crossOriginBadge ? ' is-crossorigin' : '');
+        badgeSpan.textContent = badges.join(' · ');
+        main.appendChild(badgeSpan);
+        if (crossOriginBadge) {
+          main.title = 'Edit ' + label + ' (cross-origin frame: inner DOM is not accessible; the frame itself is the target)';
+        }
+      }
       const note = String((en.descriptor && en.descriptor.instruction) || '').replace(/\s+/g, ' ').trim();
       if (note) {
         const noteSpan = document.createElement('span');
@@ -2561,7 +3236,11 @@
       state.activeIndex = -1;
     }
     pending = { descriptor, el, isEdit, editIndex, outlineEl };
-    chatHead.textContent = chipFromEl(el) + (isEdit ? ' - edit instruction' : '');
+    // Deep pick (F1): a cross-origin frame target carries an honest label in
+    // the chat head so the limitation is visible, never silently implied.
+    const coSuffix = (descriptor && descriptor.frame && descriptor.frame.crossOrigin === true)
+      ? ' · cross-origin' : '';
+    chatHead.textContent = chipFromEl(el) + coSuffix + (isEdit ? ' - edit instruction' : '');
     chatInput.value = isEdit ? (state.elements[editIndex].descriptor.instruction || '') : '';
     // Element instructions live in the inspector, not the bottom-right chat
     // card (the card is annotate-note only). The panel opens below via
@@ -2757,16 +3436,38 @@
     // Picker semantics: the page must not react to selection clicks.
     e.preventDefault();
     e.stopPropagation();
-    let hit = null;
-    try { hit = document.elementFromPoint(e.clientX, e.clientY); } catch (_) { hit = null; }
-    const el = resolveMeaningful(hit);
+    let r = null;
+    try { r = resolveAtPoint(e.clientX, e.clientY, document, []); } catch (_) { r = null; }
+    handlePickResult(r, e);
+  }
+
+  // Shared selection logic for top-document and same-origin frame clicks.
+  // `r` is the resolveAtPoint result (may carry a cross-origin frame hit).
+  function handlePickResult(r, e) {
+    if (!r || !r.hit) return;
+    let el = null;
+    if (r.crossOrigin) {
+      // Bounded best-effort target: the cross-origin frame element itself.
+      // No meaningful-walk here (its light-DOM ancestors are NOT the target)
+      // and no inner-DOM claim is ever made or stored.
+      el = r.hit;
+    } else {
+      try { el = resolveMeaningful(r.hit); } catch (_) { el = null; }
+    }
     if (!el) return;
     const d = describeElement(el);
-    const existingIdx = state.elements.findIndex((en) => en.descriptor.cssPath === d.cssPath);
+    if (r.crossOrigin) {
+      // frame.path is the inclusive index chain (parent frames + this
+      // frame), so the stored descriptor identifies the bounded target on
+      // its own; crossOrigin:true honestly marks the limitation.
+      d.frame = { path: r.path || [], crossOrigin: true };
+    }
+    const key = descriptorKey(d);
+    const existingIdx = state.elements.findIndex((en) => descriptorKey(en.descriptor) === key);
 
     // Shift+click is the additive toggle. Additions commit immediately so a
     // second shift-click can toggle them out without a chat-card round trip.
-    if (e.shiftKey) {
+    if (e && e.shiftKey) {
       if (existingIdx !== -1) {
         removeSelectionAt(existingIdx);
         return;
@@ -2774,7 +3475,7 @@
       if (pending && !pending.isEdit) cancelChat();
       d.index = state.nextIndex++;
       const outlineEl = createOutline(d.index);
-      state.elements.push({ descriptor: d, el, outlineEl });
+      state.elements.push({ descriptor: d, el, outlineEl, crossOrigin: r.crossOrigin === true });
       state.activeIndex = state.elements.length - 1;
       updateCount();
       updateSelectionPulse();
@@ -2787,11 +3488,10 @@
     // already-committed element keeps the whole queue and enters edit mode;
     // the committed selection list always persists (queue-first model).
     if (existingIdx !== -1) {
-      const idx = state.elements.findIndex((en) => en.descriptor.cssPath === d.cssPath);
-      openChat(d, el, true, idx);
+      openChat(d, el, true, existingIdx);
       return;
     }
-    if (pending && pending.descriptor.cssPath === d.cssPath) {
+    if (pending && descriptorKey(pending.descriptor) === key) {
       if (inspInput) inspInput.focus(); // same pending element -> just refocus
       return;
     }
@@ -3071,7 +3771,7 @@
     // Temporary outline when the element is not yet in the selection list.
     if (!selLayer || isReducedMotion()) return;
     let r = null;
-    try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+    try { r = viewportRectOf(el); } catch (_) { r = null; }
     if (!r || r.width < 1 || r.height < 1) return;
     const tmp = document.createElement('div');
     tmp.className = 'comet-el comet-el-reveal-pulse';
@@ -3102,7 +3802,7 @@
 
   function formatRectReadout(el) {
     let r = null;
-    try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+    try { r = viewportRectOf(el); } catch (_) { r = null; }
     const sx = window.scrollX || window.pageXOffset || 0;
     const sy = window.scrollY || window.pageYOffset || 0;
     if (!r) {
@@ -3437,7 +4137,7 @@
   function inspectorProps(el) {
     const out = [];
     let r = null;
-    try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+    try { r = viewportRectOf(el); } catch (_) { r = null; }
     let cs = null;
     try { cs = getComputedStyle(el); } catch (_) { cs = null; }
     const fontSizePx = cs ? parsePx(cs.fontSize) : 16;
@@ -4752,7 +5452,7 @@
       }
     } catch (_) { /* fall through */ }
     try {
-      const r = el.getBoundingClientRect();
+      const r = viewportRectOf(el);
       return { left: r.left, top: r.top, width: r.width, height: r.height };
     } catch (_) {
       return null;
@@ -4783,7 +5483,7 @@
     if (inspPanel) {
       try {
         const pr = inspPanel.getBoundingClientRect();
-        const er = el.getBoundingClientRect();
+        const er = viewportRectOf(el);
         if (pr && er && er.width > 0 && er.height > 0
           && er.left >= pr.left && er.top >= pr.top
           && er.right <= pr.right && er.bottom <= pr.bottom) {
@@ -4799,7 +5499,7 @@
     const el = inspector.el;
     if (isEditorInternalTarget(el)) return;
     let box = null;
-    try { box = el.getBoundingClientRect(); } catch (_) { box = null; }
+    try { box = viewportRectOf(el); } catch (_) { box = null; }
     if (!box) return;
     let cs = null;
     try { cs = getComputedStyle(el); } catch (_) { cs = null; }
@@ -4964,15 +5664,21 @@
       if (chatCard) chatCard.hidden = true;
       closeInspector();
       stopHoverLoop();
+      stopFrameScan(); // deep pick (F1): shields + periodic frame scan end
       mouse = null;
       mouseDirty = false;
       hoveredEl = null;
+      hoveredCrossOrigin = false;
     }
     state.elementMode = on;
     if (on) {
       state.annotateOn = false;
       hideAnnotNoteCard(); // note card is annotate-only; committed note kept
       startHoverLoop();
+      // Deep pick (F1): (re)scan the frame tree and rebuild cross-origin
+      // shields when the picker starts; the periodic timer keeps both fresh
+      // while pages add, remove, and navigate frames.
+      startFrameScan();
     }
     applyMode();
     updateSelectionPulse();
@@ -5148,7 +5854,7 @@
     let bottom = -Infinity;
     for (const en of selected) {
       let r = null;
-      try { r = en && en.el && en.el.getBoundingClientRect(); } catch (_) { r = null; }
+      try { r = viewportRectOf(en.el); } catch (_) { r = null; }
       if (!r) continue;
       const l = Number(r.left);
       const t = Number(r.top);
@@ -5197,6 +5903,26 @@
       }
       if (Object.keys(edits).length) d.edits = edits;
       else delete d.edits;
+    }
+    // Schema v1.7 (F1): ship optional frame/shadow metadata in a canonical
+    // shape; empty or malformed values are dropped so payloads stay valid
+    // under the hub's strict nested-key validation.
+    if (d.frame && typeof d.frame === 'object') {
+      const fp = Array.isArray(d.frame.path) ? d.frame.path : [];
+      if (!fp.length && d.frame.crossOrigin !== true) delete d.frame;
+      else {
+        d.frame = {
+          path: fp.filter((n) => Number.isInteger(n) && n >= 0).slice(0, MAX_FRAME_DEPTH),
+          crossOrigin: d.frame.crossOrigin === true,
+        };
+      }
+    }
+    if (d.shadow && typeof d.shadow === 'object') {
+      const hosts = Array.isArray(d.shadow.hosts)
+        ? d.shadow.hosts.filter((h) => typeof h === 'string' && h).slice(0, MAX_SHADOW_DEPTH)
+        : [];
+      if (!hosts.length) delete d.shadow;
+      else d.shadow = { depth: hosts.length, hosts };
     }
     return d;
   }
@@ -5624,6 +6350,10 @@
   function teardownHost() {
     stopInspectorRingTween();
     removeFreeze(); // Freeze State Capture: always remove the injected style
+    // Deep pick (F1): drop frame listeners, cross-origin shields, and the
+    // element-mode frame scan so nothing of ours survives the teardown.
+    stopFrameScan();
+    detachAllFrameListeners();
     toolbarDockLayoutToken += 1;
     stopToolbarOrientationMorph();
     if (toolbarDragRaf) {
@@ -6413,6 +7143,11 @@
     window.addEventListener('click', onPageClick, true);
     window.addEventListener('keydown', onKeyDown, true);
     document.addEventListener('scroll', repositionAll, true); // incl. inner scrollers
+    // Deep pick (F1): lazily register same-origin frames the cursor crosses
+    // into (mouseover fires at the frame boundary in the top document even
+    // though mousemove does not). Idempotent via the WeakSet guard, so no
+    // duplicate frame listeners can accumulate on refresh or reinjection.
+    document.addEventListener('mouseover', onDocMouseOver);
     window.addEventListener('resize', onWindowResize);
     window.addEventListener('orientationchange', onWindowResize);
     window.addEventListener('pagehide', onPageHide); // F3: flush draft on refresh
@@ -6461,6 +7196,10 @@
       bindEvents();
       await injectShadowStyles();
       restoreTabState(st);
+      // Deep pick (F1): register same-origin frames up front so picking works
+      // inside them immediately (idempotent; also refreshed lazily on
+      // mouseover and on demand by resolveAtPoint).
+      refreshFrameRegistry();
       diagAttach();
       const health = diagHealth(true);
       diagLog('init:done',
@@ -6532,6 +7271,22 @@
       computeCaptureRect,
       send,
       updateMotionPreference,
+      // Deep pick (F1): harness-accessible picker primitives for behavioral
+      // verification of shadow-DOM, same-origin iframe, and cross-origin
+      // degradation behavior.
+      resolveAtPoint,
+      viewportRectOf,
+      resolveByDescriptor,
+      descriptorKey,
+      describeElement,
+      handlePickResult,
+      refreshFrameRegistry,
+      ensureFrameRegistered,
+      get frameEntriesSize() { return frameEntries.size; },
+      get frameCounters() { return Object.assign({}, frameCounters); },
+      get hoveredCrossOrigin() { return hoveredCrossOrigin; },
+      get hoveredEl() { return hoveredEl; },
+      get crossOriginShieldCount() { return shields.length; },
     };
   }
 

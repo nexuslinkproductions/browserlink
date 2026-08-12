@@ -107,6 +107,14 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
 - **Element picker** - DevTools-style hover highlight with `tag#id.class`
   chips; click to select; numbered markers; real element descriptors
   (tag, id, classes, text, href, cssPath, rect).
+- **Deep picker (shadow DOM + iframes)** - the picker reaches elements inside
+  open shadow roots (any depth) and same-origin iframes, including nested
+  frames: highlights, numbered markers, inspector placement, and element
+  crops are all translated into top-viewport coordinates, and descriptors
+  carry optional `frame`/`shadow` metadata. Cross-origin iframes degrade
+  explicitly: the frame itself becomes a bounded best-effort target with an
+  honest cross-origin label - browserlink never claims or attempts
+  inaccessible inner-DOM selection.
 - **Instruction chat** - a chat card per element: type your thoughts, edit on
   re-click, batch them all into one send.
 - **Intent and Priority** - optional per-element chips (fix/change/question/

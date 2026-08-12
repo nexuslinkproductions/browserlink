@@ -1,4 +1,4 @@
-/** Shared annotation schema (v1.6), single source of truth for hub + MCP. */
+/** Shared annotation schema (v1.7), single source of truth for hub + MCP. */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -49,6 +49,21 @@ export const INTENT_VALUES = ["fix", "change", "question", "approve"] as const;
 export const SEVERITY_VALUES = ["blocking", "important", "suggestion"] as const;
 export type Intent = (typeof INTENT_VALUES)[number];
 export type Severity = (typeof SEVERITY_VALUES)[number];
+
+// Schema v1.7 (F1 deep pick): optional per-element frame and shadow metadata.
+// frame.path is the same-origin iframe index chain from the top document to
+// the element's document ([] = top document); frame.crossOrigin marks a
+// bounded best-effort frame-level target whose inner DOM is not accessible.
+// shadow.depth/hosts describe the open shadow-host boundary chain
+// (hosts[0] is the outermost host). Both fields are optional and strictly
+// validated: unknown nested keys, wrong types, and out-of-range values are
+// rejected with HTTP 400, while legacy elements without them stay valid.
+export const MAX_FRAME_DEPTH = 8;
+export const MAX_SHADOW_DEPTH = 8;
+export const MAX_HOSTS = 8;
+export const MAX_HOST_SELECTOR = 500;
+export type FrameMetadata = { path?: number[]; crossOrigin?: boolean };
+export type ShadowMetadata = { depth?: number; hosts?: string[] };
 
 // Schema v1.6: optional top-level capture state (Freeze State Capture).
 // Only these four fields are accepted; unknown keys are rejected with
@@ -365,6 +380,81 @@ export function validatePayload(payload: unknown): string | null {
           !(SEVERITY_VALUES as readonly string[]).includes(severity)
         ) {
           return `elements[${elementIndex}].severity must be one of blocking, important, suggestion`;
+        }
+      }
+      // Schema v1.7: optional frame metadata (deep pick). Must be an object;
+      // unknown nested keys, wrong types, negative/non-integer path entries,
+      // and overlong paths are rejected. Legacy elements without frame stay
+      // valid (backward compatible).
+      const frame = el.frame;
+      if (frame !== undefined) {
+        if (frame === null || typeof frame !== "object" || Array.isArray(frame)) {
+          return `elements[${elementIndex}].frame must be an object`;
+        }
+        const fo = frame as Record<string, unknown>;
+        for (const key of Object.keys(fo)) {
+          if (key !== "path" && key !== "crossOrigin") {
+            return `elements[${elementIndex}].frame has unknown key '${key}'`;
+          }
+        }
+        if (fo.path !== undefined) {
+          if (!Array.isArray(fo.path)) {
+            return `elements[${elementIndex}].frame.path must be a list`;
+          }
+          if (fo.path.length > MAX_FRAME_DEPTH) {
+            return `elements[${elementIndex}].frame.path must have at most ${MAX_FRAME_DEPTH} entries`;
+          }
+          for (let i = 0; i < fo.path.length; i++) {
+            const n = fo.path[i];
+            if (typeof n !== "number" || !Number.isInteger(n) || n < 0) {
+              return `elements[${elementIndex}].frame.path[${i}] must be a non-negative integer`;
+            }
+          }
+        }
+        if (fo.crossOrigin !== undefined && typeof fo.crossOrigin !== "boolean") {
+          return `elements[${elementIndex}].frame.crossOrigin must be a boolean`;
+        }
+      }
+      // Schema v1.7: optional shadow metadata (deep pick). Must be an object;
+      // unknown nested keys, wrong types, out-of-range depth, and non-string
+      // hosts are rejected. Legacy elements without shadow stay valid.
+      const shadow = el.shadow;
+      if (shadow !== undefined) {
+        if (shadow === null || typeof shadow !== "object" || Array.isArray(shadow)) {
+          return `elements[${elementIndex}].shadow must be an object`;
+        }
+        const so = shadow as Record<string, unknown>;
+        for (const key of Object.keys(so)) {
+          if (key !== "depth" && key !== "hosts") {
+            return `elements[${elementIndex}].shadow has unknown key '${key}'`;
+          }
+        }
+        if (so.depth !== undefined) {
+          if (
+            typeof so.depth !== "number" ||
+            !Number.isInteger(so.depth) ||
+            so.depth < 0 ||
+            so.depth > MAX_SHADOW_DEPTH
+          ) {
+            return `elements[${elementIndex}].shadow.depth must be an integer from 0 to ${MAX_SHADOW_DEPTH}`;
+          }
+        }
+        if (so.hosts !== undefined) {
+          if (!Array.isArray(so.hosts)) {
+            return `elements[${elementIndex}].shadow.hosts must be a list`;
+          }
+          if (so.hosts.length > MAX_HOSTS) {
+            return `elements[${elementIndex}].shadow.hosts must have at most ${MAX_HOSTS} entries`;
+          }
+          for (let i = 0; i < so.hosts.length; i++) {
+            if (
+              typeof so.hosts[i] !== "string" ||
+              so.hosts[i].length === 0 ||
+              so.hosts[i].length > MAX_HOST_SELECTOR
+            ) {
+              return `elements[${elementIndex}].shadow.hosts[${i}] must be a non-empty string of at most ${MAX_HOST_SELECTOR} characters`;
+            }
+          }
         }
       }
     }

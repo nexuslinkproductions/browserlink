@@ -186,6 +186,160 @@ describe("validatePayload", () => {
     );
   });
 
+  // ---- Schema v1.7 (F1 deep pick): optional frame/shadow metadata ----
+
+  it("accepts elements with valid frame metadata (schema v1.7)", () => {
+    const p = payload();
+    p.elements = [
+      { index: 1, tag: "button", frame: { path: [0, 1] } },
+      { index: 2, tag: "iframe", frame: { path: [], crossOrigin: true } },
+      { index: 3, tag: "div", frame: { path: [2], crossOrigin: false } },
+    ];
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts elements with valid shadow metadata (schema v1.7)", () => {
+    const p = payload();
+    p.elements = [
+      { index: 1, tag: "span", shadow: { depth: 2, hosts: ["#host-a", "div.x > #host-b"] } },
+      { index: 2, tag: "span", shadow: { depth: 0, hosts: [] } },
+    ];
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts frame and shadow metadata together", () => {
+    const p = payload();
+    p.elements = [
+      {
+        index: 1,
+        tag: "button",
+        frame: { path: [1, 0], crossOrigin: false },
+        shadow: { depth: 1, hosts: ["#outer-host"] },
+      },
+    ];
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts legacy elements without frame/shadow (backward compatible)", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", cssPath: "html body button" }];
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("rejects a non-object frame", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", frame: "iframe0" }];
+    assert.equal(validatePayload(p), "elements[0].frame must be an object");
+  });
+
+  it("rejects unknown nested frame keys", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", frame: { path: [0], url: "https://x" } }];
+    assert.equal(validatePayload(p), "elements[0].frame has unknown key 'url'");
+  });
+
+  it("rejects a non-list frame.path", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", frame: { path: "0" } }];
+    assert.equal(validatePayload(p), "elements[0].frame.path must be a list");
+  });
+
+  it("rejects negative and non-integer frame.path entries", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", frame: { path: [0, -1] } }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].frame.path[1] must be a non-negative integer",
+    );
+    p.elements = [{ index: 1, tag: "button", frame: { path: [0, 1.5] } }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].frame.path[1] must be a non-negative integer",
+    );
+  });
+
+  it("rejects overlong frame.path", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", frame: { path: [0, 1, 2, 3, 4, 5, 6, 7, 8] } }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].frame.path must have at most 8 entries",
+    );
+  });
+
+  it("rejects non-boolean frame.crossOrigin", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", frame: { crossOrigin: "yes" } }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].frame.crossOrigin must be a boolean",
+    );
+  });
+
+  it("rejects a non-object shadow", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", shadow: 3 }];
+    assert.equal(validatePayload(p), "elements[0].shadow must be an object");
+  });
+
+  it("rejects unknown nested shadow keys", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", shadow: { depth: 1, mode: "open" } }];
+    assert.equal(validatePayload(p), "elements[0].shadow has unknown key 'mode'");
+  });
+
+  it("rejects non-integer and out-of-range shadow.depth", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", shadow: { depth: 1.5 } }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].shadow.depth must be an integer from 0 to 8",
+    );
+    p.elements = [{ index: 1, tag: "button", shadow: { depth: 9 } }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].shadow.depth must be an integer from 0 to 8",
+    );
+    p.elements = [{ index: 1, tag: "button", shadow: { depth: -1 } }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].shadow.depth must be an integer from 0 to 8",
+    );
+  });
+
+  it("rejects non-list shadow.hosts", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", shadow: { hosts: "#a" } }];
+    assert.equal(validatePayload(p), "elements[0].shadow.hosts must be a list");
+  });
+
+  it("rejects non-string and empty shadow.hosts entries", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", shadow: { hosts: ["#a", 7] } }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].shadow.hosts[1] must be a non-empty string of at most 500 characters",
+    );
+    p.elements = [{ index: 1, tag: "button", shadow: { hosts: [""] } }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].shadow.hosts[0] must be a non-empty string of at most 500 characters",
+    );
+  });
+
+  it("rejects overlong shadow.hosts lists and entries", () => {
+    const p = payload();
+    p.elements = [
+      { index: 1, tag: "button", shadow: { hosts: ["#a", "#b", "#c", "#d", "#e", "#f", "#g", "#h", "#i"] } },
+    ];
+    assert.equal(validatePayload(p), "elements[0].shadow.hosts must have at most 8 entries");
+    p.elements = [{ index: 1, tag: "button", shadow: { hosts: ["#" + "x".repeat(501)] } }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].shadow.hosts[0] must be a non-empty string of at most 500 characters",
+    );
+  });
+
   it("accepts a valid PNG data URL screenshot", () => {
     const p = payload();
     p.screenshot = TINY_PNG_DATA_URL;
