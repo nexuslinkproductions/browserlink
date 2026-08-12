@@ -8,6 +8,12 @@ All notable changes to browserlink are documented here. Format follows
 
 ### Added
 
+- **Freeze State Capture** - one-click Freeze pauses page CSS animations and
+  transitions (transition duration/delay zeroed) for a clean, stable crop;
+  the annotation payload carries optional `captureState` metadata with the
+  frozen flag plus the last observed hovered selector, the focused element
+  selector, and open native details selectors. Works on any site without app
+  instrumentation, and the injected freeze style is always removed on exit.
 - **Intent and Priority metadata** - optional per-element intent chips (`fix`, `change`, `question`, `approve`) and priority chips (`blocking`, `important`, `suggestion`) are stored in `elements[]` and rendered in harness fallback text.
 
 ### Fixed

@@ -116,6 +116,7 @@
     collapsedCats: {},   // { Text: true, Layout: false, ... } inspector category collapse
     dock: null,          // inspector edge dock: 'left'|'top'|'right'|'bottom'|null (null = floating popup)
     inspSize: null,      // {w, h} inspector panel size from the corner resize handle
+    frozen: false,       // Freeze State Capture: page motion paused for the capture period
   };
 
   // Element inspector: {el, descriptor} - descriptor is the object that
@@ -190,6 +191,31 @@
   let selectionPulseRaf = 0;
   let selectionPulseStarted = 0;
   let lastSelectionCount = -1;
+
+  /* ---------------- Freeze State Capture (schema v1.6) ----------------
+   * One extension-owned style element pauses CSS animations and zeroes
+   * transition duration/delay for the capture period. State is reported,
+   * never emulated: we retain the last meaningful hovered selector from the
+   * element-mode hover tracking and sample document.activeElement plus open
+   * native <details> at send time. The style element is ALWAYS removed on
+   * fullExit/teardown; nothing is written into author styles. */
+  const FREEZE_STYLE_ID = 'browserlink-freeze-style';
+  // :root gives the rule (0,1,0) specificity: it beats element-level author
+  // !important rules and ties class-level ones (we are appended last in the
+  // cascade, so ties resolve in our favor). Appending to documentElement
+  // (after <body>) is the last author stylesheet position. Page styles with
+  // id-level !important animation rules can still win; rewriting every
+  // stylesheet rule is explicitly out of scope, this is a capture aid.
+  const FREEZE_CSS =
+    ':root *,' +
+    ':root *::before,:root *::after{' +
+    'animation-play-state:paused !important;' +
+    'transition-duration:0s !important;' +
+    'transition-delay:0s !important;' +
+    '}';
+  const MAX_OPEN_DETAILS = 50; // defensive cap on reported selectors
+  let freezeStyleEl = null;    // the injected style element (extension-owned)
+  let lastHoveredSelector = null; // last meaningful hovered selector observed
 
   /* ---------------- drag + per-tab persistence ---------------- */
   let drag = null;             // active toolbar/chip pointer drag
@@ -330,6 +356,11 @@
       annotNotes: state.annotNotes.length,
       strokes: state.strokes.length,
       captureRect: diagLastCaptureRect,
+      // Freeze State Capture: frozen flag + last observed hovered selector.
+      freeze: {
+        frozen: !!(state.frozen && freezeInjected()),
+        hoveredSelector: lastHoveredSelector,
+      },
       canvasCtx: !!(canvas && ctx),
       messagesBound: messagesBound,
       health: diagHealth(false),
@@ -1804,6 +1835,9 @@
   }
 
   function describeElement(el) {
+    // Freeze State Capture: an element picked under the cursor is also the
+    // last meaningful hovered element; keep its selector for captureState.
+    retainHoveredSelector(el);
     const tag = el.tagName.toLowerCase();
     const r = el.getBoundingClientRect();
     let cls = '';
@@ -2068,6 +2102,10 @@
           let hit = null;
           try { hit = document.elementFromPoint(mouse.x, mouse.y); } catch (_) { hit = null; }
           try { hoveredEl = resolveMeaningful(hit); } catch (_) { hoveredEl = null; }
+          // Retain the last meaningful hovered selector (Freeze State
+          // Capture): only real page hover targets update it, and it is
+          // never cleared by moving over our own UI or empty page areas.
+          if (hoveredEl) retainHoveredSelector(hoveredEl);
         }
       }
       try { positionHover(); } catch (_) {
@@ -4721,6 +4759,125 @@
     redraw();
   }
 
+  /* ---------------- Freeze State Capture (schema v1.6) ---------------- */
+  function freezeInjected() {
+    return !!(freezeStyleEl && freezeStyleEl.parentNode);
+  }
+
+  // Toolbar active state for the Freeze control (explicit on/off, like the
+  // mode buttons). Called after every freeze state change and on build.
+  function syncFreezeBtn() {
+    if (!toolbar) return;
+    const btn = toolbar.querySelector('[data-act="freeze"]');
+    if (!btn) return;
+    btn.classList.toggle('active', !!(state.frozen && freezeInjected()));
+  }
+
+  // Retain the last meaningful hovered selector for captureState. Only page
+  // elements (never our closed shadow UI, never html/body) are recorded;
+  // later hovers replace it, but moving off the page never clears it, so the
+  // reported value is always the last state actually observed.
+  function retainHoveredSelector(el) {
+    if (!el || el.nodeType !== 1) return;
+    try {
+      if (el.getRootNode() !== document) return;
+      if (el === document.documentElement || el === document.body) return;
+      if (host && host.contains(el)) return;
+    } catch (_) { return; }
+    try { lastHoveredSelector = cssPath(el); } catch (_) { /* keep prior */ }
+  }
+
+  // Inject the ONE extension-owned style element pausing animations and
+  // zeroing transition duration/delay. Appended to documentElement so it is
+  // last in the author cascade. Idempotent; never touches author styles.
+  function injectFreezeStyle() {
+    if (freezeInjected()) return freezeStyleEl;
+    const el = document.createElement('style');
+    el.id = FREEZE_STYLE_ID;
+    el.setAttribute('data-browserlink-owner', 'freeze');
+    el.textContent = FREEZE_CSS;
+    try {
+      document.documentElement.appendChild(el);
+      freezeStyleEl = el;
+    } catch (_) {
+      // Injection failed (detached document, etc.): stay unfrozen and honest.
+      freezeStyleEl = null;
+    }
+    return freezeStyleEl;
+  }
+
+  // ALWAYS removes the injected freeze style. Called from setFrozen(false),
+  // fullExit, and teardownHost, so every exit/error path (power, popup off,
+  // reinject while exiting, init failure) leaves the page exactly as found.
+  function removeFreeze() {
+    if (freezeStyleEl && freezeStyleEl.parentNode) {
+      try { freezeStyleEl.parentNode.removeChild(freezeStyleEl); } catch (_) { /* ok */ }
+    }
+    freezeStyleEl = null;
+    state.frozen = false;
+    syncFreezeBtn();
+  }
+
+  function setFrozen(on) {
+    if (on) {
+      if (injectFreezeStyle()) {
+        state.frozen = true;
+        syncFreezeBtn();
+        diagLog('freeze', 'on');
+      } else {
+        diagLog('freeze', 'on-failed');
+      }
+    } else if (state.frozen || freezeStyleEl) {
+      removeFreeze();
+      diagLog('freeze', 'off');
+    }
+  }
+
+  function toggleFreeze() {
+    setFrozen(!(state.frozen && freezeInjected()));
+  }
+
+  // Live capture-state metadata for send(). Returns null when nothing is
+  // reportable (legacy payload parity) and always reports animationsFrozen
+  // when the freeze is active. Selectors are OBSERVED state: the retained
+  // hover selector, the current document.activeElement when it is a real
+  // page element, and any open native <details> elements, exactly as they
+  // appear in the page. No pseudo-class emulation, no synthesized events.
+  function captureStatePayload() {
+    const frozen = !!(state.frozen && freezeInjected());
+    let hoveredSelector = null;
+    if (lastHoveredSelector) hoveredSelector = lastHoveredSelector;
+    let activeElementSelector = null;
+    try {
+      const ae = document.activeElement;
+      if (ae && ae.nodeType === 1 && ae.getRootNode() === document) {
+        if (ae !== document.documentElement && ae !== document.body) {
+          if (!(host && host.contains(ae))) {
+            activeElementSelector = cssPath(ae);
+          }
+        }
+      }
+    } catch (_) { /* keep null */ }
+    let openDetailsSelectors = [];
+    try {
+      openDetailsSelectors = Array.from(document.querySelectorAll('details[open]'))
+        .slice(0, MAX_OPEN_DETAILS)
+        .map((d) => {
+          try { return cssPath(d); } catch (_) { return null; }
+        })
+        .filter((s) => !!s);
+    } catch (_) { /* keep [] */ }
+    if (!frozen && !hoveredSelector && !activeElementSelector && !openDetailsSelectors.length) {
+      return null; // nothing observed: legacy payload without captureState
+    }
+    return {
+      animationsFrozen: frozen,
+      hoveredSelector: hoveredSelector,
+      activeElementSelector: activeElementSelector,
+      openDetailsSelectors: openDetailsSelectors,
+    };
+  }
+
   // Return the visible union in CSS pixels. The service worker applies dpr
   // when it crops the captured bitmap, so this function never scales x/y/w/h.
   function computeCaptureRect(entries) {
@@ -4953,10 +5110,16 @@
     const captureRect = computeCaptureRect(state.elements);
     if (captureRect) payload.captureRect = captureRect;
     diagLastCaptureRect = captureRect;
+    // Schema v1.6: optional captureState (freeze flag + observed hovered,
+    // focused, and open native details selectors). Omitted entirely when
+    // nothing was observed, so legacy sends stay byte-compatible.
+    const captureState = captureStatePayload();
+    if (captureState) payload.captureState = captureState;
     const sendStartMs = Date.now();
     diagLog('send:start', 'elements=' + state.elements.length
       + ' strokes=' + state.strokes.length
-      + ' captureRect=' + (captureRect ? 'yes' : 'no'));
+      + ' captureRect=' + (captureRect ? 'yes' : 'no')
+      + ' captureState=' + (captureState ? 'yes' : 'no'));
     setStatus('sending…', '');
     let ok = false;
     // Hide the tool surface (toolbar, chip, hover box, canvas) so the
@@ -5058,6 +5221,7 @@
       case 'power': fullExit(); break;
       case 'annotate': toggleAnnotate(); break;
       case 'element': toggleElement(); break;
+      case 'freeze': toggleFreeze(); break;
       case 'color': cycleColor(); break;
       case 'undo': undo(); break;
       case 'clear': clearAll(); break;
@@ -5199,6 +5363,7 @@
 
   function teardownHost() {
     stopInspectorRingTween();
+    removeFreeze(); // Freeze State Capture: always remove the injected style
     toolbarDockLayoutToken += 1;
     stopToolbarOrientationMorph();
     if (toolbarDragRaf) {
@@ -5275,6 +5440,7 @@
     state.toolbarDock = null;
     state.dock = null;
     state.collapsedCats = {};
+    lastHoveredSelector = null; // freeze capture: no stale hover across sessions
     window.__hermesAnnotateInjected = false;
     window.__browserlinkInjected = false;
   }
@@ -5282,6 +5448,10 @@
   // Full exit: animate the host out, then remove it and all listeners.
   function fullExit() {
     if (exitTimer) return;
+    // Freeze State Capture: unfreeze immediately so the page keeps running
+    // during the exit animation (teardownHost also calls removeFreeze, so
+    // every exit/error path is covered; this call is simply the early one).
+    removeFreeze();
     // Cancel any pending pointer capture (draw strokes + drag handles).
     if (state.capturedPointerId != null && canvas) {
       try {
@@ -5549,6 +5719,7 @@
       '  <button type="button" data-act="annotate" class="comet-btn comet-mode-btn" title="Toggle drawing" aria-label="Annotate">✎</button>' +
       '  <button type="button" data-act="element" class="comet-btn comet-mode-btn" title="Element picker: hover to highlight, click to select + instruct" aria-label="Element">▣</button>' +
       '</span>' +
+      '<button type="button" data-act="freeze" class="comet-btn comet-icon-btn comet-freeze" title="Freeze: pause page animations and transitions for a clean capture. Active state is reported in the send; click again to resume." aria-label="Freeze page motion">⏸</button>' +
       '<button type="button" data-act="color" class="comet-swatch" title="Cycle color">' +
       '  <span class="dot" style="background:#ff5252"></span>' +
       '  <span class="dot" style="background:#4a9eff"></span>' +
@@ -6066,6 +6237,12 @@
       get activeElement() { return inspector.el; },
       get hoverBoxEl() { return hoverBoxEl; },
       get hlEl() { return hlEl; },
+      setFrozen,
+      toggleFreeze,
+      freezeInjected,
+      captureStatePayload,
+      get frozen() { return !!(state.frozen && freezeInjected()); },
+      get lastHoveredSelector() { return lastHoveredSelector; },
       onPageClick,
       onPageMouseDown,
       onMouseMove,

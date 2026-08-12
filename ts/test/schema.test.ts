@@ -208,6 +208,130 @@ describe("validatePayload", () => {
       "strokes[0].points must contain at least two points",
     );
   });
+
+  it("accepts a full captureState object (schema v1.6)", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: true,
+      hoveredSelector: "p#format-me",
+      activeElementSelector: "input#big-input",
+      openDetailsSelectors: ["#open-me"],
+    };
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts captureState with null selectors and empty details list", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: false,
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: [],
+    };
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts captureState with only animationsFrozen", () => {
+    const p = payload();
+    p.captureState = { animationsFrozen: true };
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts legacy payloads without captureState (backward compatible)", () => {
+    const p = payload();
+    assert.equal(validatePayload(p), null);
+    assert.equal("captureState" in p, false);
+  });
+
+  it("rejects unknown captureState keys", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: true,
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: [],
+      bogusKey: "x",
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState has unknown key 'bogusKey'",
+    );
+  });
+
+  it("rejects non-boolean animationsFrozen", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: "true",
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: [],
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState.animationsFrozen must be a boolean",
+    );
+  });
+
+  it("rejects captureState missing animationsFrozen", () => {
+    const p = payload();
+    p.captureState = {
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: [],
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState.animationsFrozen must be a boolean",
+    );
+  });
+
+  it("rejects non-string hoveredSelector", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: true,
+      hoveredSelector: 42,
+      activeElementSelector: null,
+      openDetailsSelectors: [],
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState.hoveredSelector must be a string or null",
+    );
+  });
+
+  it("rejects non-list openDetailsSelectors", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: true,
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: "#open-me",
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState.openDetailsSelectors must be a list",
+    );
+  });
+
+  it("rejects non-string entries in openDetailsSelectors", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: true,
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: ["#ok", 7],
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState.openDetailsSelectors[1] must be a string",
+    );
+  });
+
+  it("rejects a non-object captureState", () => {
+    const p = payload();
+    p.captureState = ["animationsFrozen", true];
+    assert.equal(validatePayload(p), "captureState must be an object");
+  });
 });
 
 describe("validateTargetBody", () => {

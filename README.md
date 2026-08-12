@@ -112,6 +112,12 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
 - **Intent and Priority** - optional per-element chips (fix/change/question/
   approve and blocking/important/suggestion) that ship inside each element and
   print as Intent/Priority labels in the harness message.
+- **Freeze State Capture** - one-click Freeze pauses CSS animations and
+  transitions for a clean, stable crop (active state is reported in the
+  send), and annotations carry structured `captureState` metadata: the frozen
+  flag plus the last hovered, focused, and open native details selectors.
+  Works on any site without app instrumentation; the injected freeze style is
+  always removed on exit.
 - **Activation toggle** - a master switch in the popup (default ON, persisted
   per profile): deactivates the tool on the current page with one click, and
   re-activates it straight from the popup.
