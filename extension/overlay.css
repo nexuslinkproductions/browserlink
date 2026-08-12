@@ -2863,3 +2863,114 @@
   word-break: break-word;
   color: #9aa0a6;
 }
+
+/* ---------------- onboarding coach marks (F6) ---------------- */
+/* The tour card and spotlight live inside the closed shadow root; the host
+ * is pointer-events:none, so the interactive parts opt back in. The ring is
+ * purely visual and never blocks the control it highlights. */
+.comet-tour {
+  position: fixed;
+  inset: 0;
+  /* Paints above the toolbar/chat layer (2147483647) so the ring around a
+   * toolbar control and the card near the note card are never occluded. */
+  z-index: 2147483647;
+  pointer-events: none;
+}
+
+.comet-tour-ring {
+  position: fixed;
+  z-index: 1;
+  pointer-events: none;
+  border: 2px solid #4a9eff;
+  border-radius: 10px;
+  box-shadow:
+    0 0 0 2px rgba(74, 158, 255, 0.25),
+    0 0 24px rgba(74, 158, 255, 0.35);
+  transition: left 0.18s ease, top 0.18s ease, width 0.18s ease, height 0.18s ease;
+}
+
+.comet-tour-card {
+  position: fixed;
+  z-index: 2;
+  pointer-events: auto;
+  box-sizing: border-box;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(28, 31, 39, 0.97);
+  color: #e8eaed;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  animation: comet-tour-pop 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+
+@keyframes comet-tour-pop {
+  from { opacity: 0; transform: translateY(8px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.comet-tour-card:focus {
+  outline: 2px solid #4a9eff;
+  outline-offset: 2px;
+}
+
+.comet-tour-step {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #4a9eff;
+  margin-bottom: 6px;
+}
+
+.comet-tour-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.comet-tour-body {
+  font-size: 12px;
+  color: #c6cad1;
+  margin-bottom: 10px;
+}
+
+.comet-tour-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.comet-tour-actions .comet-btn {
+  width: auto;
+  padding: 6px 14px;
+  font-size: 12px;
+}
+
+.comet-tour-actions .comet-btn:focus-visible {
+  outline: 2px solid #4a9eff;
+  outline-offset: 2px;
+}
+
+.comet-tour-skip {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.comet-tour-skip:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.comet-tour-trust {
+  margin-top: 8px;
+  font-size: 10.5px;
+  color: #9aa0a6;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .comet-tour-card,
+  .comet-tour-ring {
+    animation: none;
+    transition: none;
+  }
+}

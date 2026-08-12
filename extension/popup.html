@@ -156,11 +156,20 @@
 <body>
   <h1>Browserlink - Browser Annotate &amp; Connect</h1>
   <p class="sub">Annotate any page &rarr; delivered to your hub</p>
+  <div id="pageState" class="hint" hidden></div>
 
   <div class="row switch-row">
     <label class="switch-label" for="toolToggle">Tool active</label>
     <input id="toolToggle" type="checkbox" role="switch" checked>
   </div>
+
+  <div class="row switch-row">
+    <label class="switch-label" for="alwaysOnToggle">Always on for this browser session</label>
+    <input id="alwaysOnToggle" type="checkbox" role="switch">
+  </div>
+  <div id="alwaysOnHint" class="hint">Off: the tool activates per page. On:
+    newly loaded eligible pages activate automatically for the rest of this
+    session; browser-internal pages never do.</div>
 
   <div class="row">
     <span id="hubStatus" class="status">Hub: checking&hellip;</span>
@@ -216,6 +225,17 @@
 
   <button id="downloadBackup" type="button" title="Download one snapshot of every stored annotation">Backup all annotations</button>
   <div id="backupResult" class="result"></div>
+
+  <div class="gap"></div>
+  <p class="note">No account, no cloud: annotations, drafts, and downloads
+    stay on this machine. The tool uses only its existing permissions
+    (activeTab, storage, scripting, alarms, downloads), never runs on
+    browser-internal pages, and activates there only when you ask.</p>
+  <div class="row">
+    <button id="replayIntro" type="button" class="mini"
+            title="Remove the one-time intro flag and show the three-step intro on the active tab">Replay intro</button>
+  </div>
+  <div id="introResult" class="result"></div>
 
   <script src="popup.js"></script>
 </body>

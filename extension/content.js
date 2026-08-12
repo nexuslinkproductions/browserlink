@@ -102,6 +102,21 @@
  * clears only after a confirmed successful Send or Clear All; live CSS/text
  * edits are never stored or replayed.
  *
+ * Onboarding (F6): the first activation shows exactly three coach marks in
+ * order - pick an element (Element picker button), add an instruction (the
+ * visible instruction field), then send (toolbar Send). Each mark targets
+ * the actual control it names and can be advanced or dismissed by pointer
+ * (Next/Skip) or keyboard (Enter advances, Escape dismisses, Tab moves
+ * within the card). Completing or skipping stores a one-time local flag
+ * (chrome.storage.local "browserlinkOnboarded") so refresh, reinjection,
+ * extension reload, and browser restart never replay the tour unless the
+ * popup explicitly resets it. Activation: a freshly loaded page with no
+ * per-tab state stays dormant unless the popup "Always on for this browser
+ * session" toggle (chrome.storage.session "browserlinkAlwaysOn") is on;
+ * per-tab state (user exit or manual activation) always wins, and pages
+ * where Chrome blocks content scripts (chrome://, web store, ...) never
+ * see the tool or repeated injection attempts.
+ *
  * The page DOM is NEVER touched beyond appending the shadow host.
  */
 'use strict';
@@ -268,6 +283,297 @@
   let toolbarMorphTimeline = null;
   let toolbarMorphCleanup = null;
   let messagesBound = false;   // chrome.runtime.onMessage registered once
+
+  /* ---------------- onboarding tour + session always-on (F6) ----------------
+   * First-run coach marks: exactly three marks in order - pick an element
+   * (Element picker button), add an instruction (the visible instruction
+   * field), then send (toolbar Send). Completing or skipping stores a
+   * one-time local flag so the tour never replays across refresh,
+   * reinjection, extension reload, or browser restart; the popup "Replay
+   * intro" removes the flag and asks the active tab to show the tour again.
+   * The tour card and spotlight live inside the closed shadow root, never
+   * touch page DOM, and attach at most one card and one listener set per
+   * page context. Session always-on: "browserlinkAlwaysOn" in
+   * chrome.storage.session decides whether a freshly loaded eligible page
+   * (no per-tab state) activates automatically; it is cleared when the
+   * browser restarts. Per-tab state always wins over the flag, and pages
+   * where Chrome blocks content scripts never run here at all.
+   */
+  const ONBOARDED_KEY = 'browserlinkOnboarded'; // chrome.storage.local
+  const ALWAYS_ON_KEY = 'browserlinkAlwaysOn';  // chrome.storage.session
+  const TOUR_COPY = [
+    {
+      title: 'Pick an element',
+      body: 'Click the Element button (▣), then hover and click the element on this page you want to annotate.',
+    },
+    {
+      title: 'Add an instruction',
+      body: 'Type what should change about the element (or add a page note), then press Add. Your instruction ships with the element.',
+    },
+    {
+      title: 'Send',
+      body: 'Send delivers the whole annotation to your local hub and harness session. No account, no cloud - nothing leaves your machine.',
+    },
+  ];
+  let tourCard = null;          // the coach-mark card (inside the shadow root)
+  let tourStep = -1;            // -1 idle; 0..2 active step index
+  let tourShownCount = 0;       // shows per page context (one-instance diag)
+  let tourSuppressed = false;   // flag read said "already onboarded"
+  let onboardedFlag = null;     // null unknown; true/false after a read
+  let onboardingAlwaysOn = false; // session flag as seen at init/reinject
+  let tourFocusBefore = null;   // element focused before the tour took focus
+  let tourOpenedNoteCard = false; // tour opened the note card for step 2
+  let tourKeyHandler = null;
+  let tourRepositionHandler = null;
+
+  // Resolve the control each step targets: the ACTUAL current control.
+  function tourTargetForStep(step) {
+    if (!toolbar) return null;
+    if (step === 0) return toolbar.querySelector('[data-act="element"]');
+    if (step === 1) {
+      // Instruction surface: the element inspector field when an element is
+      // selected, otherwise the annotation note card input.
+      if (inspInput && inspPanel && !inspPanel.hidden) return inspInput;
+      if (chatInput && chatCard && !chatCard.hidden) return chatInput;
+      return null;
+    }
+    if (step === 2) return toolbar.querySelector('.comet-send');
+    return null;
+  }
+
+  // Make the step-2 instruction control visible without touching tool state
+  // beyond opening the note card (restored on dismissal).
+  function tourPrepareStep(step) {
+    if (step !== 1) return;
+    if (inspInput && inspPanel && !inspPanel.hidden) return; // inspector open
+    if (chatCard && !chatCard.hidden) return;                // note card open
+    if (!chatCard || !chatInput) return;
+    chatHead.textContent = 'Annotation note';
+    chatInput.placeholder = 'Your thoughts/instructions for this annotation…';
+    chatInput.value = state.annotNotes.join('\n');
+    chatCard.classList.add('comet-chat-note');
+    chatCard.hidden = false;
+    tourOpenedNoteCard = true;
+  }
+
+  // Restore any UI the tour opened (note card) when it leaves.
+  function tourRestorePreparedUI() {
+    if (tourOpenedNoteCard) {
+      tourOpenedNoteCard = false;
+      hideAnnotNoteCard();
+    }
+  }
+
+  function tourPosition() {
+    if (!tourCard || !tourCard.parentNode) return;
+    const target = tourTargetForStep(tourStep);
+    const ring = tourCard.querySelector('.comet-tour-ring');
+    const cardEl = tourCard.querySelector('.comet-tour-card');
+    if (ring && target) {
+      let r = null;
+      try { r = target.getBoundingClientRect(); } catch (_) { r = null; }
+      if (r && (r.width > 0 || r.height > 0)) {
+        const pad = 6;
+        ring.style.left = Math.round(r.left - pad) + 'px';
+        ring.style.top = Math.round(r.top - pad) + 'px';
+        ring.style.width = Math.round(r.width + pad * 2) + 'px';
+        ring.style.height = Math.round(r.height + pad * 2) + 'px';
+        ring.hidden = false;
+      } else {
+        ring.hidden = true;
+      }
+    } else if (ring) {
+      ring.hidden = true;
+    }
+    // Card near the target, clamped to the viewport.
+    if (cardEl && target) {
+      let r = null;
+      try { r = target.getBoundingClientRect(); } catch (_) { r = null; }
+      if (r) {
+        const cardW = Math.min(300, Math.max(220, window.innerWidth - 24));
+        const cardH = cardEl.offsetHeight || 150;
+        let left = Math.min(Math.max(12, r.left + r.width / 2 - cardW / 2), window.innerWidth - cardW - 12);
+        let top = r.bottom + 12;
+        if (top + cardH > window.innerHeight - 12) top = Math.max(12, r.top - cardH - 12);
+        cardEl.style.left = Math.round(left) + 'px';
+        cardEl.style.top = Math.round(top) + 'px';
+        cardEl.style.width = cardW + 'px';
+      }
+    }
+  }
+
+  function tourRender() {
+    if (!tourCard) return;
+    const cardEl = tourCard.querySelector('.comet-tour-card');
+    if (!cardEl) return;
+    const step = Math.max(0, Math.min(tourStep, TOUR_COPY.length - 1));
+    const copy = TOUR_COPY[step];
+    const titleEl = cardEl.querySelector('.comet-tour-title');
+    const bodyEl = cardEl.querySelector('.comet-tour-body');
+    const stepEl = cardEl.querySelector('.comet-tour-step');
+    const nextBtn = cardEl.querySelector('.comet-tour-next');
+    if (titleEl) titleEl.textContent = copy.title;
+    if (bodyEl) bodyEl.textContent = copy.body;
+    if (stepEl) stepEl.textContent = 'Step ' + (step + 1) + ' of ' + TOUR_COPY.length;
+    if (nextBtn) nextBtn.textContent = step === TOUR_COPY.length - 1 ? 'Done' : 'Next';
+    tourPosition();
+  }
+
+  function tourComplete(reason) {
+    if (!tourCard) return;
+    diagLog(reason === 'skip' ? 'tour:skip' : 'tour:done', 'step=' + (tourStep + 1) + '/' + TOUR_COPY.length);
+    tourTeardown();
+    // One-time local flag: survives refresh, reinjection, extension reload,
+    // and browser restart. Best-effort: a storage failure must not crash.
+    try {
+      chrome.storage.local.set({ [ONBOARDED_KEY]: true }).catch(() => {});
+    } catch (_) { /* storage unavailable */ }
+    onboardedFlag = true;
+  }
+
+  function tourTeardown() {
+    if (tourKeyHandler) {
+      window.removeEventListener('keydown', tourKeyHandler, true);
+      tourKeyHandler = null;
+    }
+    if (tourRepositionHandler) {
+      window.removeEventListener('scroll', tourRepositionHandler, true);
+      window.removeEventListener('resize', tourRepositionHandler);
+      tourRepositionHandler = null;
+    }
+    tourRestorePreparedUI();
+    if (tourFocusBefore && typeof tourFocusBefore.focus === 'function') {
+      try { tourFocusBefore.focus(); } catch (_) { /* ok */ }
+    }
+    tourFocusBefore = null;
+    if (tourCard && tourCard.parentNode) {
+      try { tourCard.parentNode.removeChild(tourCard); } catch (_) { /* ok */ }
+    }
+    tourCard = null;
+    tourStep = -1;
+  }
+
+  function tourAdvance() {
+    if (!tourCard) return;
+    if (tourStep >= TOUR_COPY.length - 1) {
+      tourComplete('done');
+      return;
+    }
+    tourStep += 1;
+    tourPrepareStep(tourStep);
+    tourRender();
+    diagLog('tour:step', 'step=' + (tourStep + 1) + '/' + TOUR_COPY.length);
+    const cardEl = tourCard.querySelector('.comet-tour-card');
+    if (cardEl && typeof cardEl.focus === 'function') cardEl.focus();
+  }
+
+  function showTour(fromReset) {
+    if (tourCard) return;                     // one card per page context
+    if (!fromReset && tourSuppressed) return; // one-time flag already set
+    if (!fromReset && tourShownCount > 0) return; // already shown this context
+    if (!host || !host.parentNode) return;    // tool must be active
+    if (!shadow) return;
+    tourShownCount += 1;
+    tourCard = document.createElement('div');
+    tourCard.className = 'comet-tour';
+    tourCard.setAttribute('role', 'region');
+    tourCard.setAttribute('aria-label', 'Browserlink quick intro');
+    const ring = document.createElement('div');
+    ring.className = 'comet-tour-ring';
+    ring.setAttribute('aria-hidden', 'true');
+    ring.hidden = true;
+    const cardEl = document.createElement('div');
+    cardEl.className = 'comet-tour-card';
+    cardEl.setAttribute('role', 'dialog');
+    cardEl.setAttribute('aria-label', 'Browserlink quick intro');
+    cardEl.tabIndex = -1;
+    cardEl.innerHTML =
+      '<div class="comet-tour-step"></div>' +
+      '<div class="comet-tour-title"></div>' +
+      '<div class="comet-tour-body"></div>' +
+      '<div class="comet-tour-actions">' +
+      '  <button type="button" class="comet-btn comet-tour-skip" tabindex="0">Skip</button>' +
+      '  <button type="button" class="comet-btn comet-tour-next" tabindex="0">Next</button>' +
+      '</div>' +
+      '<div class="comet-tour-trust">No account · local hub · nothing leaves this machine</div>';
+    tourCard.appendChild(ring);
+    tourCard.appendChild(cardEl);
+    shadow.appendChild(tourCard);
+
+    const skipBtn = cardEl.querySelector('.comet-tour-skip');
+    const nextBtn = cardEl.querySelector('.comet-tour-next');
+    if (skipBtn) skipBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      tourComplete('skip');
+    });
+    if (nextBtn) nextBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      tourAdvance();
+    });
+
+    // Keyboard: Enter/Space advance when focus is inside the card, Escape
+    // dismisses from anywhere. Capture phase, but only for tour-owned keys.
+    tourKeyHandler = (e) => {
+      if (!tourCard || !tourCard.parentNode) return;
+      const fromCard = e.composedPath && e.composedPath().indexOf(tourCard) !== -1;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        tourComplete('skip');
+        return;
+      }
+      if ((e.key === 'Enter' || e.key === ' ') && fromCard) {
+        e.preventDefault();
+        e.stopPropagation();
+        tourAdvance();
+        return;
+      }
+      if ((e.key === 'ArrowRight' || e.key === 'ArrowDown') && fromCard) {
+        e.preventDefault();
+        e.stopPropagation();
+        tourAdvance();
+        return;
+      }
+      if (e.key === 'ArrowLeft' && fromCard) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (tourStep > 0) {
+          tourStep -= 1;
+          tourRender();
+          diagLog('tour:step', 'step=' + (tourStep + 1) + '/' + TOUR_COPY.length);
+        }
+      }
+    };
+    window.addEventListener('keydown', tourKeyHandler, true);
+
+    tourRepositionHandler = () => tourPosition();
+    window.addEventListener('scroll', tourRepositionHandler, true);
+    window.addEventListener('resize', tourRepositionHandler);
+
+    tourFocusBefore = document.activeElement;
+    tourStep = 0;
+    tourPrepareStep(0);
+    tourRender();
+    diagLog('tour:show', 'step=1/' + TOUR_COPY.length + (fromReset ? ' reset' : ''));
+    try { cardEl.focus(); } catch (_) { /* ok */ }
+  }
+
+  // Called after the tool becomes active (init or reinject): show the tour
+  // on first activation unless the one-time local flag is set.
+  function maybeShowTour() {
+    if (tourSuppressed || tourShownCount > 0) return;
+    try {
+      chrome.storage.local.get(ONBOARDED_KEY).then((got) => {
+        const done = !!(got && got[ONBOARDED_KEY]);
+        onboardedFlag = done;
+        if (done) {
+          tourSuppressed = true;
+          return;
+        }
+        showTour(false);
+      }).catch(() => { showTour(false); });
+    } catch (_) { showTour(false); }
+  }
 
   /* ---------------- diagnostics (window.__browserlinkDiag) ----------------
    * Agnostic live diagnostics: a ring buffer of events, a lazy JSON snapshot,
@@ -461,9 +767,44 @@
       },
       canvasCtx: !!(canvas && ctx),
       messagesBound: messagesBound,
+      // Onboarding (F6): tour + session always-on state for one-instance
+      // and persistence diagnostics. tourShownCount is per page context.
+      // target/ring/card/controls expose live geometry so behavioral
+      // verification can assert each mark points at its real control.
+      onboarding: {
+        flag: onboardedFlag,
+        step: tourStep,
+        shown: tourShownCount,
+        active: !!(tourCard && tourCard.parentNode),
+        alwaysOn: onboardingAlwaysOn,
+        title: (tourStep >= 0 && TOUR_COPY[tourStep]) ? TOUR_COPY[tourStep].title : null,
+        openedNoteCard: tourOpenedNoteCard,
+        target: tourDiagRect(tourTargetForStep(tourStep)),
+        ring: tourDiagRect(tourCard ? tourCard.querySelector('.comet-tour-ring') : null),
+        card: tourDiagRect(tourCard ? tourCard.querySelector('.comet-tour-card') : null),
+        controls: tourCard ? {
+          next: tourDiagRect(tourCard.querySelector('.comet-tour-next')),
+          skip: tourDiagRect(tourCard.querySelector('.comet-tour-skip')),
+        } : null,
+      },
       health: diagHealth(false),
       log: diagRing.slice(),
     };
+  }
+
+  // Safe rect snapshot for the onboarding diagnostics block (null when the
+  // element is missing or hidden). Hidden elements report null so a tour
+  // mark over an invisible control is never claimed as visible.
+  function tourDiagRect(el) {
+    if (!el) return null;
+    try {
+      const r = el.getBoundingClientRect();
+      if (!r || (r.width === 0 && r.height === 0)) return null;
+      return {
+        x: Math.round(r.left), y: Math.round(r.top),
+        w: Math.round(r.width), h: Math.round(r.height),
+      };
+    } catch (_) { return null; }
   }
 
   // Console print: JSON snapshot plus a compact log tail.
@@ -6906,6 +7247,8 @@
   function teardownHost() {
     stopInspectorRingTween();
     removeFreeze(); // Freeze State Capture: always remove the injected style
+    // Onboarding (F6): drop the tour card and its listeners with the host.
+    tourTeardown();
     // Deep pick (F1): drop frame listeners, cross-origin shields, and the
     // element-mode frame scan so nothing of ours survives the teardown.
     stopFrameScan();
@@ -7129,6 +7472,13 @@
       try {
         chrome.storage.local.set({ toolEnabled: true }); // master switch reflects active tool
       } catch (_) { /* storage unavailable */ }
+      // F6: refresh the session always-on flag and show the tour on this
+      // (manual) activation unless the one-time local flag is set.
+      try {
+        const got = await chrome.storage.session.get(ALWAYS_ON_KEY);
+        onboardingAlwaysOn = !!(got && got[ALWAYS_ON_KEY]);
+      } catch (_) { onboardingAlwaysOn = false; }
+      maybeShowTour();
       pingTabId();
     } catch (err) {
       try { if (host && host.parentNode) host.parentNode.removeChild(host); } catch (_) { /* ok */ }
@@ -7204,6 +7554,16 @@
     }
     if (msg.type === 'browserlinkExit') {
       fullExit();
+      return false;
+    }
+    if (msg.type === 'browserlinkShowTour') {
+      // Popup "Replay intro": the local flag was removed; show the tour on
+      // this tab even if it already ran once in this page context.
+      if (host && host.parentNode) {
+        showTour(true);
+      } else {
+        reinject().then(() => showTour(true)).catch(() => { /* ok */ });
+      }
       return false;
     }
     return false;
@@ -7768,6 +8128,22 @@
         diagLog('init:skip', 'disabled by master switch');
         return;
       }
+      // Session always-on (F6): a freshly loaded page with no per-tab state
+      // stays dormant unless the popup "Always on for this browser session"
+      // toggle is on. Per-tab state (explicit exit, or manual activation via
+      // reinject) always wins; dormant pages keep the message listener bound
+      // so the popup can still activate them manually.
+      let alwaysOn = false;
+      try {
+        const got = await chrome.storage.session.get(ALWAYS_ON_KEY);
+        alwaysOn = !!(got && got[ALWAYS_ON_KEY]);
+      } catch (_) { alwaysOn = false; }
+      onboardingAlwaysOn = alwaysOn;
+      const perTabChoice = !!(st && typeof st.enabled === 'boolean');
+      if (!perTabChoice && !alwaysOn) {
+        diagLog('init:skip', 'dormant: always-on off, manual activation required');
+        return;
+      }
       buildUI();
       bindEvents();
       await injectShadowStyles();
@@ -7777,6 +8153,10 @@
       // mouseover and on demand by resolveAtPoint).
       refreshFrameRegistry();
       diagAttach();
+      // Onboarding (F6): first activation shows the three-step tour unless
+      // the one-time local flag is set. Fire-and-forget: a storage failure
+      // must never block the toolbar.
+      maybeShowTour();
       const health = diagHealth(true);
       diagLog('init:done',
         'ready=' + (health.ok ? 'yes' : 'no')
@@ -7875,6 +8255,22 @@
       isUsableAnchorTarget,
       get anchorPassCount() { return reanchorPassCount; },
       get lastAnchorPass() { return lastAnchorPass ? Object.assign({}, lastAnchorPass) : null; },
+      // Onboarding (F6): harness hooks for the tour and session always-on.
+      // showTour(true) is the explicit reset path the popup Replay intro
+      // uses; advanceTour/dismissTour mirror pointer and keyboard actions.
+      showTour: (fromReset) => showTour(!!fromReset),
+      advanceTour: () => tourAdvance(),
+      dismissTour: () => tourComplete('skip'),
+      setAlwaysOn: (v) => {
+        onboardingAlwaysOn = !!v;
+        return chrome.storage.session.set({ [ALWAYS_ON_KEY]: !!v }).catch(() => {});
+      },
+      get tourStep() { return tourStep; },
+      get tourShownCount() { return tourShownCount; },
+      get tourActive() { return !!(tourCard && tourCard.parentNode); },
+      get onboarded() { return onboardedFlag; },
+      get alwaysOn() { return onboardingAlwaysOn; },
+      get tourSuppressed() { return tourSuppressed; },
     };
   }
 

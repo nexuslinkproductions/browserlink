@@ -20,6 +20,23 @@
   what lets the popup start a download with a chosen filename and observe
   its completion or cancellation). Nothing is uploaded; downloads go to the
   user's own machine through the browser's normal download dialog.
+- Onboarding (2.6) adds **no permissions**: the three-step coach tour and
+  the session always-on toggle use only the existing `storage` area. Local
+  keys at a behavioral level: `chrome.storage.local` holds `toolEnabled`
+  (master switch), `endpoint`, `contextLabel`, per-URL `draft:` records,
+  and `browserlinkOnboarded` (one-time intro flag, set when the tour is
+  completed or skipped and removed only by the popup's Replay intro).
+  `chrome.storage.session` holds per-tab view state (`browserlink:<tabId>`)
+  and `browserlinkAlwaysOn` (the session-scoped always-on flag, cleared at
+  browser restart). The service worker calls
+  `storage.session.setAccessLevel('TRUSTED_AND_UNTRUSTED_CONTEXTS')` so the
+  content script can read and write that session state; no new permission
+  is involved and the data is session-scoped, non-secret UI state.
+- Always-on activation is **session-scoped and off by default**: a newly
+  loaded page with no per-tab state stays inactive unless the popup toggle
+  is on, per-tab exit still wins, and pages where Chrome blocks content
+  scripts (chrome://, the web store, ...) never receive injection attempts
+  or permission prompts; the popup shows an honest unavailable state there.
 - Page DOM is never mutated beyond a closed ShadowRoot overlay; screenshots
   are captured via `chrome.tabs.captureVisibleTab` and cropped locally to
   the annotated element rect.

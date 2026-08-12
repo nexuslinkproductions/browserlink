@@ -32,6 +32,16 @@
  *     Markdown + PNG when present), saved via the browser download dialog.
  *   - "Backup all annotations": downloads <endpoint>/annotations/backup.zip,
  *     one consistent snapshot of the whole corpus (valid even when empty).
+ *   - Onboarding (F6): "Always on for this browser session" is a
+ *     session-scoped toggle (chrome.storage.session "browserlinkAlwaysOn",
+ *     cleared at browser restart). Off (default): the tool activates per
+ *     page (master switch). On: newly loaded eligible pages activate
+ *     automatically for the rest of the session; browser-internal pages
+ *     never activate, and the popup shows an honest unavailable state
+ *     there. "Replay intro" clears the one-time tour flag
+ *     (chrome.storage.local "browserlinkOnboarded") and asks the active
+ *     tab to show the three-step coach tour again (pick an element, add an
+ *     instruction, send).
  *   - Every button reports the outcome honestly: format and file name on
  *     success, absent screenshot, empty corpus, hub offline, or a
  *     cancelled/failed download on failure. Copy AI Brief is unchanged.
@@ -41,6 +51,28 @@
 const $ = (id) => document.getElementById(id);
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787';
 const HUB_STATUS_TIMEOUT_MS = 2000;
+const ONBOARDED_KEY = 'browserlinkOnboarded'; // chrome.storage.local
+const ALWAYS_ON_KEY = 'browserlinkAlwaysOn';  // chrome.storage.session
+
+/* Schemes/hosts where Chrome blocks extension content scripts: the tool can
+ * never run there, so the popup states it honestly instead of trying. */
+function isRestrictedTabUrl(rawUrl) {
+  const u = String(rawUrl || '').trim();
+  if (!u) return true;
+  if (/^(chrome|chrome-extension|edge|about|devtools|view-source|moz-extension|opera):/i.test(u)) {
+    return true;
+  }
+  try {
+    const url = new URL(u);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:' && url.protocol !== 'file:') {
+      return true;
+    }
+    if (url.hostname === 'chrome.google.com' && /^\/webstore\//.test(url.pathname)) {
+      return true;
+    }
+  } catch (_) { return true; }
+  return false;
+}
 
 /* Normalize a hub endpoint: trim, strip trailing slashes, and map
  * 'localhost' to '127.0.0.1' so IPv6 (::1) resolution cannot break the
@@ -338,6 +370,84 @@ function onToolToggle() {
       }
     } catch (_) { /* no receiver */ }
   }, 250);
+}
+
+/* ---- Onboarding (F6): session always-on, restricted-page state, tour ---- */
+
+/* Session-scoped always-on toggle: reflected from chrome.storage.session. */
+async function loadAlwaysOn() {
+  let on = false;
+  try {
+    const got = await chrome.storage.session.get(ALWAYS_ON_KEY);
+    on = !!(got && got[ALWAYS_ON_KEY]);
+  } catch (_) { /* storage unavailable */ }
+  $('alwaysOnToggle').checked = on;
+}
+
+function onAlwaysOnToggle() {
+  const on = $('alwaysOnToggle').checked;
+  try {
+    chrome.storage.session.set({ [ALWAYS_ON_KEY]: on }).catch(() => {});
+  } catch (_) { /* storage unavailable */ }
+  // Honest hint: the toggle applies to newly loaded eligible pages.
+  const hint = $('alwaysOnHint');
+  if (hint) {
+    hint.textContent = on
+      ? 'On: newly loaded eligible pages activate automatically for the rest of this session. Existing tabs keep their current state.'
+      : 'Off: the tool activates per page. On: newly loaded eligible pages activate automatically for this session.';
+  }
+}
+
+/* Restricted/unsupported active tab: show an honest unavailable state and
+ * disable the activation toggles instead of attempting injection. */
+async function loadPageState() {
+  const el = $('pageState');
+  let restricted = false;
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = tabs && tabs[0];
+    restricted = !tab || typeof tab.id !== 'number' || isRestrictedTabUrl(tab.url);
+  } catch (_) { restricted = true; }
+  if (!el) return;
+  if (restricted) {
+    el.textContent = 'Browserlink is not available on this page (Chrome blocks extensions on browser-internal pages).';
+    el.classList.add('err');
+    el.hidden = false;
+    $('toolToggle').disabled = true;
+    // The session always-on toggle stays usable here: it configures newly
+    // loaded eligible pages for the rest of the session and is not a
+    // per-page activation.
+  } else {
+    el.hidden = true;
+    el.classList.remove('err');
+    $('toolToggle').disabled = false;
+    $('alwaysOnToggle').disabled = false;
+  }
+}
+
+/* Replay intro: clear the one-time tour flag and show the three-step tour
+ * on the active tab (the service worker injects the content script first
+ * when the page has none). */
+async function replayIntro() {
+  const out = $('introResult');
+  out.textContent = 'resetting…';
+  out.className = 'result';
+  try {
+    await chrome.storage.local.remove(ONBOARDED_KEY);
+  } catch (_) { /* storage unavailable */ }
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'browserlinkShowTour' });
+    if (resp && resp.ok) {
+      out.textContent = 'Intro ready on this page ✓';
+      out.className = 'result ok';
+    } else {
+      out.textContent = 'No eligible page to show the intro on.';
+      out.className = 'result err';
+    }
+  } catch (_) {
+    out.textContent = 'No eligible page to show the intro on.';
+    out.className = 'result err';
+  }
 }
 
 /* send test annotation */
@@ -681,6 +791,8 @@ async function downloadBackup() {
 
 /* wiring */
 $('toolToggle').addEventListener('change', onToolToggle);
+$('alwaysOnToggle').addEventListener('change', onAlwaysOnToggle);
+$('replayIntro').addEventListener('click', replayIntro);
 $('saveEndpoint').addEventListener('click', saveEndpoint);
 $('refreshStatus').addEventListener('click', checkHub);
 $('refreshSessions').addEventListener('click', () => {
@@ -699,3 +811,5 @@ checkHub();
 loadEndpoint();
 loadLabel();
 loadToolEnabled();
+loadAlwaysOn();
+loadPageState();

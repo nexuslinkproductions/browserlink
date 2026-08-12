@@ -44,6 +44,25 @@ highlight, click to select, type instructions in the chat card) → **Send**.
 The annotation lands in the hub inbox (`~/.browserlink/annotations/`) and is
 delivered to your connected harness.
 
+### First run
+
+- **Three-step intro** - the first time the tool activates you see three
+  coach marks in order: pick an element, add an instruction, then send.
+  Each mark points at the real control; advance with Next/Enter, dismiss
+  with Skip/Escape. Completing or skipping stores a one-time local flag, so
+  the intro never replays after a refresh, extension reload, or browser
+  restart. The popup's **Replay intro** button resets it explicitly.
+- **Activation is per page by default** - a newly loaded page stays
+  inactive until you turn the tool on for it. The popup's **Always on for
+  this browser session** toggle switches to automatic activation on newly
+  loaded eligible pages for the rest of the session only (cleared at
+  browser restart, off by default, per-page exit still respected, and never
+  applied to browser-internal pages).
+- **Honest availability** - on pages where Chrome blocks extensions
+  (chrome://, the web store, and similar), the popup states that the tool
+  is unavailable instead of retrying or prompting. No account, no cloud:
+  everything stays on your machine.
+
 ## Invoke from any chat
 
 From any MCP-capable harness chat you can point the extension at *this*

@@ -34,3 +34,16 @@ delivers it to the session selected in the popup (or the fallback chat).
 `GET http://127.0.0.1:8787/annotations/latest/export.md` returns the newest
 annotation as Markdown (see [REST API](rest.md)); `curl` it into any editor,
 or use the popup button to copy it to the clipboard.
+
+## Onboarding and session activation
+
+The extension's **Always on for this browser session** toggle (popup) and
+the one-time three-step intro tour change **activation only**: they decide
+whether a newly loaded eligible page gets the annotation toolbar. They never
+change delivery routing, hub availability, the `/target` session contract,
+or which hub endpoint is used. When always-on is off (the default), a new
+page stays inactive until the tool is activated for it (popup master switch
+or a `browserlink_connect` activate). When it is on, newly loaded eligible
+pages activate automatically for the rest of the session; pages where
+Chrome blocks content scripts never activate. Delivery still happens
+through the hub exactly as described above.

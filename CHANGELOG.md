@@ -8,6 +8,27 @@ All notable changes to browserlink are documented here. Format follows
 
 ### Added
 
+- **Onboarding pack (three-step intro + session always-on)** - the first
+  time the tool activates, three coach marks appear in order - pick an
+  element, add an instruction, then send - each targeting the actual
+  control it names. Marks advance or dismiss by pointer (Next/Skip) or
+  keyboard (Enter, arrow keys, Escape), respect `prefers-reduced-motion`,
+  and keep keyboard focus inside the card. Completing or skipping stores a
+  one-time local flag (`browserlinkOnboarded`), so refresh, reinjection,
+  extension reload, and browser restart never replay the tour; the popup's
+  **Replay intro** button resets it explicitly. The popup gains **Always on
+  for this browser session**: off by default, newly loaded pages stay
+  inactive until activated per page; when on, newly loaded eligible pages
+  activate automatically for the rest of the session (session-scoped
+  `browserlinkAlwaysOn` flag, cleared at browser restart, per-tab exit
+  still respected). Restricted pages (chrome://, web store, ...) show an
+  honest unavailable state in the popup with no repeated injection
+  attempts, and the popup states its no-account, local-hub, existing
+  permission-scope copy. No new permissions were added; the service worker
+  exposes session storage to the content script via
+  `storage.session.setAccessLevel` so the session flag and per-tab view
+  state work as documented.
+
 - **Local save and backup** - the popup gains three browser-native download
   actions (no upload, no account; the destination is chosen in the browser's
   normal download dialog via `chrome.downloads`):

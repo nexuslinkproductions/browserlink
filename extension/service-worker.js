@@ -64,15 +64,34 @@ function ensurePollAlarm() {
   } catch (_) { /* alarms unavailable */ }
 }
 
+/* F6 onboarding: the content script reads and writes chrome.storage.session
+ * (per-tab view state plus the "browserlinkAlwaysOn" session flag), so the
+ * session area must be reachable from content scripts. This is an access
+ * level on the EXISTING storage area (no new permission) and is cleared
+ * when the browser session ends. Best-effort and idempotent. */
+function allowContentSessionStorage() {
+  try {
+    if (chrome.storage && chrome.storage.session
+      && typeof chrome.storage.session.setAccessLevel === 'function') {
+      chrome.storage.session
+        .setAccessLevel({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' })
+        .catch(() => { /* older Chrome or already granted */ });
+    }
+  } catch (_) { /* storage unavailable */ }
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   ensurePollAlarm();
+  allowContentSessionStorage();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   ensurePollAlarm();
+  allowContentSessionStorage();
 });
 
 ensurePollAlarm();
+allowContentSessionStorage();
 
 async function pollTargetAndMaybeActivate() {
   let endpoint;
@@ -318,10 +337,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg.type === 'browserlinkToggle' || msg.type === 'browserlinkExit') {
-    // Forward activation/deactivation from the popup to the active tab.
-    // If the content script is absent (fresh page, or after an extension
-    // reload) inject it on demand so the popup works without a refresh.
+  if (msg.type === 'browserlinkToggle' || msg.type === 'browserlinkExit'
+    || msg.type === 'browserlinkShowTour') {
+    // Forward activation/deactivation (and the F6 "Replay intro" tour
+    // request) from the popup to the active tab. If the content script is
+    // absent (fresh page, or after an extension reload) inject it on demand
+    // so the popup works without a refresh; a dormant content script
+    // handles browserlinkShowTour by reinjecting and showing the tour.
     chrome.tabs.query({ active: true, currentWindow: true })
       .then((tabs) => {
         const tab = tabs && tabs[0];
