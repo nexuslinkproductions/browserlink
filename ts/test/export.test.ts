@@ -50,6 +50,21 @@ function fixtureAnnotation(): JsonObject {
       activeElementSelector: null,
       openDetailsSelectors: ["details.shipping"],
     },
+    env: {
+      capturedAt: "2026-08-12T12:00:00.000Z",
+      url: "https://example.test/shop/cart",
+      viewport: { w: 1440, h: 900 },
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0 Safari/537.36",
+      language: "en-US",
+      devicePixelRatio: 2,
+      timezoneOffsetMinutes: -420,
+    },
+    textQuote: {
+      quote: "Button contrast looks off",
+      prefix: "The checkout",
+      suffix: "on the cart page",
+    },
     screenshotFile: "20260812-120000-000.png",
   };
 }
@@ -92,6 +107,20 @@ describe("formatAnnotationMarkdown", () => {
     assert.match(md, /- Animations frozen: true/);
     assert.match(md, /- Hovered selector: button\.checkout/);
     assert.match(md, /- Open details selectors: details\.shipping/);
+    // Schema v1.9: Agent context renders the env snapshot one-to-one.
+    assert.match(md, /## Agent Context/);
+    assert.match(md, /- Captured at: 2026-08-12T12:00:00\.000Z/);
+    assert.match(md, /- User agent: Mozilla\/5\.0/);
+    assert.match(md, /- Language: en-US/);
+    assert.match(md, /- Device pixel ratio: 2/);
+    assert.match(md, /- Timezone offset \(minutes\): -420/);
+    // Schema v1.9: Reproduction context with selector, text quote, screenshot.
+    assert.match(md, /## Reproduction Context/);
+    assert.match(md, /- Selector: `html body div#app button\.checkout`/);
+    assert.match(md, /- Text quote: Button contrast looks off/);
+    assert.match(md, /- Quote prefix: The checkout/);
+    assert.match(md, /- Quote suffix: on the cart page/);
+    assert.match(md, /- Screenshot file: `20260812-120000-000\.png`/);
     // Strokes summary.
     assert.match(md, /## Strokes/);
     assert.match(md, /- Count: 2/);
@@ -125,6 +154,52 @@ describe("formatAnnotationMarkdown", () => {
     annotation.note = "legacy note text";
     const md = formatAnnotationMarkdown(annotation, "a.json");
     assert.match(md, /- legacy note text/);
+  });
+
+  test("agent context and reproduction context render explicit omitted states when env is absent", () => {
+    const annotation = fixtureAnnotation();
+    delete annotation.env;
+    delete annotation.textQuote;
+    delete annotation.screenshotFile;
+    const md = formatAnnotationMarkdown(annotation, "a.json");
+    assert.match(md, /## Agent Context/);
+    assert.match(md, /- Captured at: \(omitted\)/);
+    assert.match(md, /- URL: \(omitted\)/);
+    assert.match(md, /- Viewport: \(omitted\)/);
+    assert.match(md, /- User agent: \(omitted\)/);
+    assert.match(md, /- Language: \(omitted\)/);
+    assert.match(md, /- Device pixel ratio: \(omitted\)/);
+    assert.match(md, /- Timezone offset \(minutes\): \(omitted\)/);
+    assert.match(md, /## Reproduction Context/);
+    assert.match(md, /- Selector: `html body div#app button\.checkout`/);
+    assert.match(md, /- Text quote: \(omitted\)/);
+    assert.match(md, /- Screenshot file: \(omitted\)/);
+  });
+
+  test("partial env values render omitted, never fabricated", () => {
+    const annotation = fixtureAnnotation();
+    annotation.env = {
+      capturedAt: "2026-08-12T12:00:00.000Z",
+      url: "https://example.test/shop/cart",
+      viewport: { w: 1440, h: 900 },
+      userAgent: "Mozilla/5.0",
+      language: "en-US",
+    };
+    const md = formatAnnotationMarkdown(annotation, "a.json");
+    assert.match(md, /- Device pixel ratio: \(omitted\)/);
+    assert.match(md, /- Timezone offset \(minutes\): \(omitted\)/);
+    assert.ok(!md.includes("- Device pixel ratio: 2"));
+    assert.ok(!md.includes("- Timezone offset (minutes): -420"));
+  });
+
+  test("thread fields are not rendered by the formatter (F8 owns threads)", () => {
+    const annotation = fixtureAnnotation();
+    annotation.threadId = "thr-1";
+    annotation.parentId = "item-2";
+    const md = formatAnnotationMarkdown(annotation, "a.json");
+    assert.ok(!md.includes("thr-1"));
+    assert.ok(!md.includes("item-2"));
+    assert.ok(md.startsWith("# AI Brief"));
   });
 
   test("no U+2014 em-dash characters in the output", () => {

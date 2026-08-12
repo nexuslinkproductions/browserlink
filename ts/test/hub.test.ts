@@ -24,6 +24,8 @@ import {
 } from "../src/adapters/hermes.ts";
 import { register as registerWebhook } from "../src/adapters/webhook.ts";
 import { MAX_MESSAGE_TEXT_LENGTH } from "../src/schema.ts";
+// F7 parity probe: MCP annotations_list must agree with the REST search.
+import { annotationsList as mcpAnnotationsList } from "../src/mcp.ts";
 
 const TINY_PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -140,12 +142,12 @@ describe("HTTP routes", () => {
       try {
         let res = await request(hub.base, "GET", "/health");
         assert.equal(res.status, 200);
-        assert.deepEqual(res.json, { ok: true, version: "2.6.0" });
+        assert.deepEqual(res.json, { ok: true, version: "2.7.0" });
 
         res = await request(hub.base, "GET", "/status");
         assert.equal(res.status, 200);
         assert.equal(res.json.ok, true);
-        assert.equal(res.json.version, "2.6.0");
+        assert.equal(res.json.version, "2.7.0");
         assert.equal(res.json.dataDir, dir);
         assert.equal(res.json.target, null);
         assert.ok(Array.isArray(res.json.adapters));
@@ -821,13 +823,16 @@ describe("webhook adapter", () => {
     try {
       await withTempDataDir(async (dir) => {
         process.env.BROWSERLINK_WEBHOOK_URL = "http://webhook.test/hook";
+        // F8: the delivered body is the bounded thread event, which carries
+        // the element instruction. A stored instruction beyond the 1MB cap
+        // (the hub does not size-check instruction) must still be skipped.
         await registerWebhook({
           id: "ann-big-1",
           source: "test",
           url: "https://example.test/",
           viewport: { w: 100, h: 100 },
           strokes: [],
-          note: "x".repeat(1_100_000),
+          elements: [{ index: 1, tag: "p", instruction: "x".repeat(1_100_000) }],
         });
         assert.equal(called, false, "oversized body never sent");
         const logLines = (
@@ -849,7 +854,70 @@ describe("webhook adapter", () => {
     }
   });
 
-  test("sends under the cap", async () => {
+  test("sends the bounded thread event under the cap", async () => {
+    const prevUrl = process.env.BROWSERLINK_WEBHOOK_URL;
+    const prevHub = process.env.BROWSERLINK_HUB_URL;
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; body: string } | null = null;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      captured = { url: String(url), body: String(init?.body ?? "") };
+      return new Response("ok", { status: 200 });
+    }) as typeof fetch;
+    try {
+      process.env.BROWSERLINK_WEBHOOK_URL = "http://webhook.test/hook";
+      process.env.BROWSERLINK_HUB_URL = "http://127.0.0.1:8799/";
+      await registerWebhook(
+        {
+          id: "ann-ok-1",
+          source: "test",
+          url: "https://example.test/page",
+          title: "Cart page",
+          viewport: { w: 100, h: 100 },
+          strokes: [],
+          threadId: "thr-abc",
+          parentId: "ann-root-1",
+          elements: [
+            {
+              index: 1,
+              tag: "button",
+              cssPath: "main button.buy",
+              intent: "fix",
+              severity: "blocking",
+              instruction: "Move it above the fold",
+            },
+          ],
+        },
+        "/tmp/bl-f8-v27/annotations/ann-ok-1.json",
+      );
+      assert.ok(captured, "fetch was called");
+      assert.equal(captured!.url, "http://webhook.test/hook");
+      const sent = JSON.parse(captured!.body) as Record<string, unknown>;
+      assert.equal(sent.event, "annotation.thread.v1");
+      assert.equal(sent.annotationId, "ann-ok-1");
+      assert.equal(sent.threadId, "thr-abc");
+      assert.equal(sent.parentId, "ann-root-1");
+      assert.equal(sent.url, "https://example.test/page");
+      assert.equal(sent.title, "Cart page");
+      assert.equal(sent.selector, "main button.buy");
+      assert.equal(sent.tag, "button");
+      assert.equal(sent.intent, "fix");
+      assert.equal(sent.severity, "blocking");
+      assert.equal(sent.instruction, "Move it above the fold");
+      assert.equal(sent.replyText, "Move it above the fold");
+      assert.equal(
+        sent.shareUrl,
+        "http://127.0.0.1:8799/annotations/ann-ok-1.json/share",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (prevUrl === undefined) delete process.env.BROWSERLINK_WEBHOOK_URL;
+      else process.env.BROWSERLINK_WEBHOOK_URL = prevUrl;
+      if (prevHub === undefined) delete process.env.BROWSERLINK_HUB_URL;
+      else process.env.BROWSERLINK_HUB_URL = prevHub;
+    }
+  });
+
+  test("legacy annotation without thread fields still delivers a bounded event", async () => {
     const prevUrl = process.env.BROWSERLINK_WEBHOOK_URL;
     const originalFetch = globalThis.fetch;
     let captured: { url: string; body: string } | null = null;
@@ -860,18 +928,22 @@ describe("webhook adapter", () => {
     try {
       process.env.BROWSERLINK_WEBHOOK_URL = "http://webhook.test/hook";
       await registerWebhook({
-        id: "ann-ok-1",
+        id: "ann-legacy-1",
         source: "test",
         url: "https://example.test/",
         viewport: { w: 100, h: 100 },
         strokes: [],
-        note: "small payload",
+        elements: [{ index: 1, tag: "p", instruction: "legacy note" }],
       });
-      assert.ok(captured, "fetch was called");
-      assert.equal(captured!.url, "http://webhook.test/hook");
+      assert.ok(captured, "fetch was called for a legacy annotation");
       const sent = JSON.parse(captured!.body) as Record<string, unknown>;
-      assert.equal(sent.id, "ann-ok-1");
-      assert.equal(sent.note, "small payload");
+      assert.equal(sent.event, "annotation.thread.v1");
+      assert.equal(sent.annotationId, "ann-legacy-1");
+      assert.equal(sent.threadId, null);
+      assert.equal(sent.parentId, null);
+      assert.equal(sent.replyText, null);
+      assert.equal(sent.instruction, "legacy note");
+      assert.ok(String(sent.shareUrl).endsWith("/annotations/ann-legacy-1.json/share"));
     } finally {
       globalThis.fetch = originalFetch;
       if (prevUrl === undefined) delete process.env.BROWSERLINK_WEBHOOK_URL;
@@ -1410,6 +1482,259 @@ describe("share page route", () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * F7: GET /annotations search and filters (local full-text recall).
+ * Section kept separate from other suites so concurrent feature edits never
+ * touch these probes. Every test name carries 'search', 'filter', or
+ * 'annotations_list' for the mechanism gate's --test-name-pattern.
+ * ------------------------------------------------------------------------- */
+describe("F7 search and filter route", () => {
+  const seedRecords = [
+    {
+      source: "test",
+      url: "https://fixture.test/alpha",
+      title: "Alpha page",
+      viewport: { w: 100, h: 100 },
+      label: "Needle one",
+      notes: ["productivity hack for review"],
+      note: "legacy joined",
+      strokes: [],
+      elements: [
+        {
+          index: 1,
+          tag: "button",
+          text: "Shop now",
+          instruction: "Make this blue and round",
+        },
+      ],
+    },
+    {
+      source: "test",
+      url: "https://fixture.test/beta",
+      title: "Beta page",
+      viewport: { w: 100, h: 100 },
+      label: "Needle two",
+      notes: ["unrelated note"],
+      strokes: [],
+      elements: [],
+    },
+    {
+      source: "test",
+      url: "https://other.test/gamma",
+      title: "Gamma page",
+      viewport: { w: 100, h: 100 },
+      label: "Unicode record",
+      notes: ["caf\u00e9 creme"], // composed e-acute (NFC)
+      strokes: [],
+      elements: [{ index: 1, tag: "p", text: "body", instruction: "keep" }],
+    },
+  ];
+
+  async function seedAll(hubBase: string): Promise<string[]> {
+    const names: string[] = [];
+    for (const record of seedRecords) {
+      const res = await request(hubBase, "POST", "/annotations", record);
+      assert.equal(res.status, 200);
+      names.push(res.json.file as string);
+      await new Promise((r) => setTimeout(r, 15)); // distinct mtimes
+    }
+    return names;
+  }
+
+  test("search matches across label url title notes and element fields, newest first", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const names = await seedAll(hub.base);
+        // Label hit, case-insensitive.
+        let res = await request(hub.base, "GET", "/annotations?q=NEEDLE");
+        assert.equal(res.status, 200);
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[1], names[0]],
+          "label matches, newest first",
+        );
+        assert.equal(res.json.skippedCorrupt, 0);
+        // Element instruction hit.
+        res = await request(hub.base, "GET", "/annotations?q=blue");
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[0]],
+          "element instruction matches",
+        );
+        // Note hit.
+        res = await request(hub.base, "GET", "/annotations?q=productivity");
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[0]],
+          "note matches",
+        );
+        // URL hit.
+        res = await request(hub.base, "GET", "/annotations?q=gamma");
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[2]],
+          "url matches",
+        );
+        // Title hit.
+        res = await request(hub.base, "GET", "/annotations?q=Alpha");
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[0]],
+          "title matches",
+        );
+        // Legacy joined note hit.
+        res = await request(hub.base, "GET", "/annotations?q=legacy%20joined");
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[0]],
+          "legacy note matches",
+        );
+        // NFC normalization: decomposed query matches the composed stored note.
+        res = await request(hub.base, "GET", "/annotations?q=cafe\u0301");
+        assert.equal(res.status, 200);
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[2]],
+          "decomposed query hits composed note (NFC)",
+        );
+        // No match: empty files, zero diagnostics.
+        res = await request(hub.base, "GET", "/annotations?q=nomatch");
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.json.files, []);
+        assert.equal(res.json.skippedCorrupt, 0);
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("search filters compose with url and since using AND semantics", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        await seedAll(hub.base);
+        // url filter alone.
+        let res = await request(hub.base, "GET", "/annotations?url=fixture");
+        assert.equal(res.status, 200);
+        assert.equal(res.json.files.length, 2, "both fixture records match url");
+        assert.equal(res.json.skippedCorrupt, 0);
+        // q AND url.
+        res = await request(hub.base, "GET", "/annotations?q=needle&url=fixture");
+        assert.equal(res.status, 200);
+        assert.equal(res.json.files.length, 2, "needle records are on fixture");
+        // q AND url excluding: needle records are on fixture, not other.
+        res = await request(hub.base, "GET", "/annotations?q=needle&url=other");
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.json.files, []);
+        // since in the past admits everything stored now.
+        res = await request(
+          hub.base,
+          "GET",
+          "/annotations?q=needle&url=fixture&since=2026-01-01T00:00:00.000Z",
+        );
+        assert.equal(res.status, 200);
+        assert.equal(res.json.files.length, 2);
+        // since in the future admits nothing.
+        res = await request(hub.base, "GET", "/annotations?since=2099-01-01T00:00:00.000Z");
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.json.files, []);
+        assert.equal(res.json.skippedCorrupt, 0);
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("empty q search preserves the plain newest-first list behavior", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        await seedAll(hub.base);
+        const plain = await request(hub.base, "GET", "/annotations");
+        assert.equal(plain.status, 200);
+        assert.ok(!("skippedCorrupt" in plain.json), "plain list has no diagnostics");
+        const empty = await request(hub.base, "GET", "/annotations?q=");
+        assert.equal(empty.status, 200);
+        assert.deepEqual(empty.json, plain.json, "empty q is byte-identical to the plain list");
+        assert.ok(!("skippedCorrupt" in empty.json));
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("invalid since returns 400 on the search route", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const res = await request(hub.base, "GET", "/annotations?since=not-a-date");
+        assert.equal(res.status, 400);
+        assert.deepEqual(res.json, { error: "invalid since timestamp" });
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("corrupt records are skipped with an explicit diagnostics count in search", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const posted = await request(hub.base, "POST", "/annotations", seedRecords[0]);
+        assert.equal(posted.status, 200);
+        const annDir = path.join(dir, "annotations");
+        await writeFile(path.join(annDir, "20260101-000000-900.json"), "{ not json");
+        const res = await request(hub.base, "GET", "/annotations?q=needle");
+        assert.equal(res.status, 200);
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [posted.json.file],
+          "only the complete matching record is returned",
+        );
+        assert.equal(res.json.skippedCorrupt, 1, "corrupt record counted, never fatal");
+        // The plain list still shows the corrupt file (no record reads).
+        const plain = await request(hub.base, "GET", "/annotations");
+        assert.equal(plain.json.files.length, 2);
+        assert.ok(!("skippedCorrupt" in plain.json));
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("REST search and MCP annotations_list fixtures match in the same order", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        await seedAll(hub.base);
+        const cases: Array<{ q?: string; url?: string }> = [
+          { q: "needle" },
+          { q: "needle", url: "fixture" },
+          { url: "fixture" },
+          { q: "cafe\u0301" },
+          { q: "pop" },
+        ];
+        for (const filters of cases) {
+          const params: string[] = [];
+          if (filters.q) params.push(`q=${encodeURIComponent(filters.q)}`);
+          if (filters.url) params.push(`url=${encodeURIComponent(filters.url)}`);
+          const query = params.join("&");
+          const res = await request(hub.base, "GET", `/annotations?${query}`);
+          assert.equal(res.status, 200);
+          const restNames = res.json.files.map((f: { name: string }) => f.name);
+          const mcpNames = (
+            await mcpAnnotationsList(20, { q: filters.q, url: filters.url })
+          ).map((f) => f.name);
+          assert.deepEqual(mcpNames, restNames, `REST/MCP parity for ${query}`);
+        }
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+});
+
+/* ---------------------------------------------------------------------------
  * F3: GET /annotations/latest/bundle, /annotations/<name>/bundle, and
  * /annotations/backup.zip (local save and backup).
  * Section kept separate from schema/hub suites so concurrent feature edits
@@ -1842,5 +2167,350 @@ describe("F3 bundle and backup routes", () => {
         await hub.close();
       }
     });
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * F8: element threads - thread identity validation on store, the whole-thread
+ * replay route, and the webhook thread event handoff. Section kept separate
+ * so concurrent feature edits to other parts of this file never touch these
+ * probes.
+ * ------------------------------------------------------------------------- */
+describe("F8 element threads", () => {
+  const threadPayload = (overrides: Record<string, unknown> = {}) => ({
+    source: "test",
+    url: "https://thread.test/page",
+    title: "Thread page",
+    viewport: { w: 100, h: 100 },
+    strokes: [],
+    elements: [
+      {
+        index: 1,
+        tag: "button",
+        cssPath: "main button.buy",
+        intent: "fix",
+        severity: "blocking",
+        instruction: "Move it above the fold",
+      },
+    ],
+    ...overrides,
+  });
+
+  test("root annotation stores its threadId and the reply stores parentId", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const root = await request(hub.base, "POST", "/annotations", {
+          ...threadPayload(),
+          threadId: "thr-f8-1",
+        });
+        assert.equal(root.status, 200);
+        const rootName = root.json.file as string;
+
+        await new Promise((r) => setTimeout(r, 15)); // distinct names
+        const reply = await request(hub.base, "POST", "/annotations", {
+          ...threadPayload(),
+          threadId: "thr-f8-1",
+          parentId: rootName, // with ".json", as the hub reports it
+        });
+        assert.equal(reply.status, 200);
+        const replyName = reply.json.file as string;
+
+        const storedRoot = JSON.parse(
+          await readFile(path.join(dir, "annotations", rootName), "utf8"),
+        ) as Record<string, unknown>;
+        assert.equal(storedRoot.threadId, "thr-f8-1");
+        assert.equal("parentId" in storedRoot, false, "root carries no parentId");
+
+        const storedReply = JSON.parse(
+          await readFile(path.join(dir, "annotations", replyName), "utf8"),
+        ) as Record<string, unknown>;
+        assert.equal(storedReply.threadId, "thr-f8-1");
+        assert.equal(storedReply.parentId, rootName, "stored JSON preserves the link");
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("parentId also accepts the bare stem without .json", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const root = await request(hub.base, "POST", "/annotations", {
+          ...threadPayload(),
+          threadId: "thr-f8-2",
+        });
+        const stem = String(root.json.file).replace(/\.json$/, "");
+        await new Promise((r) => setTimeout(r, 15));
+        const reply = await request(hub.base, "POST", "/annotations", {
+          ...threadPayload(),
+          threadId: "thr-f8-2",
+          parentId: stem,
+        });
+        assert.equal(reply.status, 200);
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("parentId without threadId is rejected", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const res = await request(hub.base, "POST", "/annotations", {
+          ...threadPayload(),
+          parentId: "whatever",
+        });
+        assert.equal(res.status, 400);
+        assert.equal(res.json.error, "parentId requires threadId");
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("missing parent is rejected", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const res = await request(hub.base, "POST", "/annotations", {
+          ...threadPayload(),
+          threadId: "thr-f8-3",
+          parentId: "no-such-annotation",
+        });
+        assert.equal(res.status, 400);
+        assert.equal(res.json.error, "parent annotation not found");
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("cross-thread parent is rejected", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const a = await request(hub.base, "POST", "/annotations", {
+          ...threadPayload(),
+          threadId: "thr-f8-a",
+        });
+        const aName = a.json.file as string;
+        await new Promise((r) => setTimeout(r, 15));
+        const res = await request(hub.base, "POST", "/annotations", {
+          ...threadPayload(),
+          threadId: "thr-f8-b",
+          parentId: aName,
+        });
+        assert.equal(res.status, 400);
+        assert.equal(res.json.error, "cross-thread parent");
+        assert.equal(
+          fs.readdirSync(path.join(dir, "annotations")).filter((f) => f.endsWith(".json")).length,
+          1,
+          "rejected reply never stored",
+        );
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("cycle in the parent chain is rejected", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        // Hand-write a self-consistent cycle a -> c -> b -> a directly on
+        // disk (the hub would never store these, but a corrupt or hand-made
+        // corpus must still fail closed when a reply references it).
+        const annDir = path.join(dir, "annotations");
+        await mkdir(annDir, { recursive: true });
+        const write = (name: string, record: Record<string, unknown>) =>
+          writeFile(path.join(annDir, name), JSON.stringify(record));
+        await write("ann-a.json", { source: "test", url: "x", viewport: { w: 1, h: 1 }, strokes: [], threadId: "thr-cycle", parentId: "ann-c" });
+        await write("ann-b.json", { source: "test", url: "x", viewport: { w: 1, h: 1 }, strokes: [], threadId: "thr-cycle", parentId: "ann-a" });
+        await write("ann-c.json", { source: "test", url: "x", viewport: { w: 1, h: 1 }, strokes: [], threadId: "thr-cycle", parentId: "ann-b" });
+
+        const res = await request(hub.base, "POST", "/annotations", {
+          ...threadPayload(),
+          threadId: "thr-cycle",
+          parentId: "ann-a",
+        });
+        assert.equal(res.status, 400);
+        assert.equal(res.json.error, "thread cycle detected");
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("thread route lists root and replies in chronological order", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const root = await request(hub.base, "POST", "/annotations", {
+          ...threadPayload(),
+          threadId: "thr-f8-list",
+          label: "root label",
+        });
+        const rootName = root.json.file as string;
+        await new Promise((r) => setTimeout(r, 15));
+        const reply = await request(hub.base, "POST", "/annotations", {
+          ...threadPayload({ label: "reply label" }),
+          threadId: "thr-f8-list",
+          parentId: rootName,
+        });
+        const replyName = reply.json.file as string;
+
+        const res = await request(hub.base, "GET", `/annotations/${rootName}/thread`);
+        assert.equal(res.status, 200);
+        assert.equal(res.json.threadId, "thr-f8-list");
+        assert.equal(res.json.count, 2);
+        assert.deepEqual(
+          res.json.items.map((i: { name: string }) => i.name),
+          [rootName, replyName],
+          "root first, reply second",
+        );
+        assert.equal(res.json.items[0].label, "root label");
+        assert.equal(res.json.items[1].parentId, rootName);
+
+        const viaReply = await request(hub.base, "GET", `/annotations/${replyName}/thread`);
+        assert.equal(viaReply.status, 200);
+        assert.equal(viaReply.json.count, 2, "same thread from the reply endpoint");
+
+        const latest = await request(hub.base, "GET", "/annotations/latest/thread");
+        assert.equal(latest.status, 200);
+        assert.equal(latest.json.threadId, "thr-f8-list");
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("legacy annotation without thread fields answers 404 no thread", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const posted = await request(hub.base, "POST", "/annotations", threadPayload());
+        assert.equal(posted.status, 200);
+        const name = posted.json.file as string;
+        const res = await request(hub.base, "GET", `/annotations/${name}/thread`);
+        assert.equal(res.status, 404);
+        assert.equal(res.json.error, "no thread");
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("thread route safety: missing file 404, unsafe name 400, empty corpus 404", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const missing = await request(hub.base, "GET", "/annotations/nope.json/thread");
+        assert.equal(missing.status, 404);
+        const unsafe = await request(hub.base, "GET", "/annotations/a/b/thread");
+        assert.equal(unsafe.status, 400);
+        assert.equal(unsafe.json.error, "invalid annotation name");
+        const empty = await request(hub.base, "GET", "/annotations/latest/thread");
+        assert.equal(empty.status, 404);
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("webhook handoff fires through the hub POST with the thread event", async () => {
+    const prevUrl = process.env.BROWSERLINK_WEBHOOK_URL;
+    const prevHub = process.env.BROWSERLINK_HUB_URL;
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; body: string } | null = null;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const target = String(url);
+      if (target === "http://webhook.test/hook") {
+        captured = { url: target, body: String(init?.body ?? "") };
+        return new Response("ok", { status: 200 });
+      }
+      return originalFetch(url, init); // hub requests pass through untouched
+    }) as typeof fetch;
+    try {
+      await withTempDataDir(async (dir) => {
+        process.env.BROWSERLINK_WEBHOOK_URL = "http://webhook.test/hook";
+        process.env.BROWSERLINK_HUB_URL = "http://127.0.0.1:8799";
+        const hub = await startHub();
+        try {
+          const root = await request(hub.base, "POST", "/annotations", {
+            ...threadPayload(),
+            threadId: "thr-f8-hook",
+          });
+          assert.equal(root.status, 200);
+          await new Promise((r) => setTimeout(r, 50)); // adapter dispatch
+          assert.ok(captured, "hub POST dispatched the webhook");
+          const sent = JSON.parse(captured!.body) as Record<string, unknown>;
+          assert.equal(sent.event, "annotation.thread.v1");
+          assert.equal(sent.threadId, "thr-f8-hook");
+          assert.equal(sent.parentId, null, "root event has no parentId");
+          assert.equal(sent.selector, "main button.buy");
+          assert.equal(sent.intent, "fix");
+          assert.equal(sent.severity, "blocking");
+          assert.equal(sent.instruction, "Move it above the fold");
+          assert.equal(sent.replyText, null);
+          assert.ok(
+            String(sent.shareUrl).endsWith(`/annotations/${root.json.file}/share`),
+          );
+        } finally {
+          await hub.close();
+        }
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (prevUrl === undefined) delete process.env.BROWSERLINK_WEBHOOK_URL;
+      else process.env.BROWSERLINK_WEBHOOK_URL = prevUrl;
+      if (prevHub === undefined) delete process.env.BROWSERLINK_HUB_URL;
+      else process.env.BROWSERLINK_HUB_URL = prevHub;
+    }
+  });
+
+  test("webhook HTTP failure never blocks storage", async () => {
+    const prevUrl = process.env.BROWSERLINK_WEBHOOK_URL;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const target = String(url);
+      if (target === "http://webhook.test/hook") {
+        return new Response("nope", { status: 500 });
+      }
+      return originalFetch(url, init); // hub requests pass through untouched
+    }) as typeof fetch;
+    try {
+      await withTempDataDir(async (dir) => {
+        process.env.BROWSERLINK_WEBHOOK_URL = "http://webhook.test/hook";
+        const hub = await startHub();
+        try {
+          const res = await request(hub.base, "POST", "/annotations", {
+            ...threadPayload(),
+            threadId: "thr-f8-fail",
+          });
+          assert.equal(res.status, 200, "annotation stored despite webhook failure");
+          const name = res.json.file as string;
+          const stored = JSON.parse(
+            await readFile(path.join(dir, "annotations", name), "utf8"),
+          ) as Record<string, unknown>;
+          assert.equal(stored.threadId, "thr-f8-fail");
+          await new Promise((r) => setTimeout(r, 50)); // let the adapter log land
+          const logText = await readFile(
+            path.join(dir, "browserlink-error.log"),
+            "utf8",
+          ).catch(() => "");
+          assert.match(logText, /"adapter":"webhook"/);
+          assert.match(logText, /HTTP 500/);
+        } finally {
+          await hub.close();
+        }
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (prevUrl === undefined) delete process.env.BROWSERLINK_WEBHOOK_URL;
+      else process.env.BROWSERLINK_WEBHOOK_URL = prevUrl;
+    }
   });
 });

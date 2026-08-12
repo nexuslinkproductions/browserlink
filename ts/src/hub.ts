@@ -183,6 +183,120 @@ function stringOf(value: unknown): string {
 }
 
 /* ---------------------------------------------------------------------------
+ * F7: local full-text search.
+ *
+ * GET /annotations?q=<term>&url=<substring>&since=<ISO timestamp> filters the
+ * corpus before the newest-first listing. Search text is the NFC-normalized,
+ * case-folded concatenation of label, URL, title, notes, the legacy joined
+ * note, and per-element text and instruction. A JSON record that cannot be
+ * parsed as an object is skipped, never fatal, and counted in skippedCorrupt
+ * so callers can diagnose a partial corpus.
+ * ------------------------------------------------------------------------- */
+function normalizeSearchText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value.normalize("NFC").toLowerCase();
+}
+
+/** The full searchable text of one annotation (same fields as the docs). */
+function annotationSearchText(annotation: JsonObject): string {
+  const parts: string[] = [];
+  for (const key of ["label", "url", "title"]) {
+    const value = annotation[key];
+    if (typeof value === "string") parts.push(value);
+  }
+  if (Array.isArray(annotation.notes)) {
+    for (const note of annotation.notes) {
+      if (typeof note === "string") parts.push(note);
+    }
+  }
+  const legacy = annotation.note;
+  if (typeof legacy === "string") parts.push(legacy);
+  if (Array.isArray(annotation.elements)) {
+    for (const element of annotation.elements) {
+      if (element === null || typeof element !== "object" || Array.isArray(element)) {
+        continue;
+      }
+      const record = element as JsonObject;
+      for (const key of ["text", "instruction"]) {
+        const value = record[key];
+        if (typeof value === "string") parts.push(value);
+      }
+    }
+  }
+  return parts.join("\n").normalize("NFC").toLowerCase();
+}
+
+/** Read one stored annotation as an object, or null when unreadable. */
+function tryReadAnnotation(filePath: string): JsonObject | null {
+  try {
+    const value = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    return value as JsonObject;
+  } catch {
+    return null;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * F8: element threads - thread identity validation on store.
+ *
+ * Schema v1.9 threadId/parentId are optional top-level strings. When a
+ * payload carries parentId it must reference an EXISTING stored annotation
+ * in the SAME thread: the parent file must exist, its threadId must equal
+ * the payload's threadId (cross-thread parents are rejected), and walking
+ * the parent chain must never revisit an id (cycles are rejected). Both
+ * "X" and "X.json" are accepted as parent references. A parentId without a
+ * threadId is rejected. Root annotations (threadId only, no parentId) and
+ * legacy annotations (neither field) are always valid. The bounded chain
+ * walk is defense in depth: because every stored annotation was validated
+ * on store (parent exists at store time), the corpus cannot contain a cycle
+ * by induction; the walk proves it regardless.
+ * ------------------------------------------------------------------------- */
+
+const MAX_THREAD_CHAIN = 500;
+
+/** Read a stored annotation by its file name (NAME_RE-validated). */
+function storedAnnotationByName(name: string): JsonObject | null {
+  if (!NAME_RE.test(name)) return null;
+  return tryReadAnnotation(path.join(annotationsDir(), name));
+}
+
+/** Thread-link validation error for a payload, or null when the link is valid. */
+function threadLinkError(body: JsonObject): string | null {
+  const threadId = body.threadId;
+  const parentId = body.parentId;
+  if (parentId === undefined || parentId === null) return null;
+  if (typeof threadId !== "string" || threadId.length === 0) {
+    return "parentId requires threadId";
+  }
+  if (typeof parentId !== "string" || parentId.length === 0) {
+    return "parentId requires threadId";
+  }
+  // Accept both "X" and "X.json" as the parent reference.
+  const stem = parentId.endsWith(".json") ? parentId.slice(0, -5) : parentId;
+  if (!NAME_RE.test(stem)) return "parent annotation not found";
+  const parent = storedAnnotationByName(`${stem}.json`);
+  if (parent === null) return "parent annotation not found";
+  if (parent.threadId !== threadId) return "cross-thread parent";
+  // Bounded walk up the parent chain; revisiting an id is a cycle.
+  let current = stem;
+  const seen = new Set<string>([stem]);
+  for (let i = 0; i < MAX_THREAD_CHAIN; i++) {
+    const record = storedAnnotationByName(`${current}.json`);
+    const next = record && typeof record.parentId === "string" ? record.parentId : null;
+    if (!next) return null; // reached the root: chain is acyclic
+    const nextStem = next.endsWith(".json") ? next.slice(0, -5) : next;
+    if (!NAME_RE.test(nextStem) || seen.has(nextStem)) {
+      return "thread cycle detected";
+    }
+    seen.add(nextStem);
+    current = nextStem;
+  }
+  return "thread cycle detected";
+}
+
+
+/* ---------------------------------------------------------------------------
  * Deterministic ZIP writer (store method, no compression).
  *
  * Depends only on the standard library (CRC-32 table built inline), so bundle
@@ -939,6 +1053,45 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
   }
 
 
+  // F8: one annotation's whole thread - every stored annotation sharing its
+  // threadId, in chronological order (root first, then replies). The named
+  // annotation must exist and carry a threadId; legacy annotations without
+  // thread fields answer 404 "no thread". Items are the stored JSON records
+  // with the stored file name attached, sorted by name ascending (stored
+  // names are millisecond timestamps, so name order IS chronological order).
+  function serveThread(res: http.ServerResponse, name: string): void {
+    try {
+      const filePath = path.join(annotationsDir(), name);
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+        sendJson(res, 404, { error: "not found" });
+        return;
+      }
+      const annotation = JSON.parse(
+        fs.readFileSync(filePath, "utf8"),
+      ) as JsonObject;
+      const threadId = annotation.threadId;
+      if (typeof threadId !== "string" || threadId.length === 0) {
+        sendJson(res, 404, { error: "no thread" });
+        return;
+      }
+      const items: JsonObject[] = [];
+      for (const other of listAnnotationNames()) {
+        const record = tryReadAnnotation(
+          path.join(annotationsDir(), other),
+        );
+        if (record !== null && record.threadId === threadId) {
+          items.push({ name: other, ...record });
+        }
+      }
+      items.sort((a, b) =>
+        String(a.name) < String(b.name) ? -1 : String(a.name) > String(b.name) ? 1 : 0,
+      );
+      sendJson(res, 200, { threadId, count: items.length, items });
+    } catch {
+      sendJson(res, 404, { error: "not found" });
+    }
+  }
+
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? "GET";
     const pathname = requestPathname(req.url);
@@ -977,7 +1130,24 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
       }
       if (pathname === "/annotations") {
         const directory = annotationsDir();
+        const parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+        const q = normalizeSearchText((parsedUrl.searchParams.get("q") ?? "").trim());
+        const urlFilter = normalizeSearchText(
+          (parsedUrl.searchParams.get("url") ?? "").trim(),
+        );
+        const sinceRaw = parsedUrl.searchParams.get("since") ?? "";
+        let sinceMs: number | null = null;
+        if (sinceRaw !== "") {
+          const parsed = Date.parse(sinceRaw);
+          if (Number.isNaN(parsed)) {
+            sendJson(res, 400, { error: "invalid since timestamp" });
+            return;
+          }
+          sinceMs = parsed;
+        }
+        const filtering = q !== "" || urlFilter !== "" || sinceMs !== null;
         const files: Array<{ name: string; size: number; mtime: number }> = [];
+        let skippedCorrupt = 0;
         try {
           if (fs.existsSync(directory) && fs.statSync(directory).isDirectory()) {
             for (const name of fs.readdirSync(directory)) {
@@ -985,9 +1155,25 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
               const filePath = path.join(directory, name);
               try {
                 const st = fs.statSync(filePath);
-                if (st.isFile()) {
-                  files.push({ name, size: st.size, mtime: st.mtimeMs / 1000 });
+                if (!st.isFile()) continue;
+                if (sinceMs !== null && st.mtimeMs < sinceMs) continue;
+                if (filtering) {
+                  const annotation = tryReadAnnotation(filePath);
+                  if (annotation === null) {
+                    skippedCorrupt += 1;
+                    continue;
+                  }
+                  if (
+                    urlFilter !== "" &&
+                    !normalizeSearchText(annotation.url).includes(urlFilter)
+                  ) {
+                    continue;
+                  }
+                  if (q !== "" && !annotationSearchText(annotation).includes(q)) {
+                    continue;
+                  }
                 }
+                files.push({ name, size: st.size, mtime: st.mtimeMs / 1000 });
               } catch {
                 continue;
               }
@@ -997,7 +1183,11 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
           // empty list
         }
         files.sort((a, b) => b.mtime - a.mtime);
-        sendJson(res, 200, { files });
+        if (filtering) {
+          sendJson(res, 200, { files, skippedCorrupt });
+        } else {
+          sendJson(res, 200, { files });
+        }
         return;
       }
       // Convenience alias: export the newest stored annotation (same
@@ -1129,6 +1319,29 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
         serveBackup(res);
         return;
       }
+      // F8: whole-thread replay. Convenience alias for the newest annotation.
+      if (pathname === "/annotations/latest/thread") {
+        const newest = listAnnotationNames()[0] ?? null;
+        if (newest === null) {
+          sendJson(res, 404, { error: "not found" });
+          return;
+        }
+        serveThread(res, newest);
+        return;
+      }
+      if (pathname.startsWith("/annotations/") && pathname.endsWith("/thread")) {
+        const name = pathname.slice(
+          "/annotations/".length,
+          -"/thread".length,
+        );
+        // Unsafe names (any "/", "\", or "..") answer 400; missing files 404.
+        if (!isSafeName(name)) {
+          sendJson(res, 400, { error: "invalid annotation name" });
+          return;
+        }
+        serveThread(res, name);
+        return;
+      }
       if (pathname.startsWith("/annotations/")) {
         const name = pathname.slice("/annotations/".length);
         if (!isSafeName(name)) {
@@ -1248,6 +1461,15 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
         if (error !== null) {
           status = 400;
           sendJson(res, status, { error });
+          return;
+        }
+        // F8: thread identity links must be valid before the annotation is
+        // stored (missing parent, cross-thread parent, and cycles are
+        // rejected with HTTP 400; the parent must already exist on disk).
+        const threadError = threadLinkError(body);
+        if (threadError !== null) {
+          status = 400;
+          sendJson(res, status, { error: threadError });
           return;
         }
         const pathOut = storeAnnotation(body);

@@ -1,10 +1,10 @@
-/** Shared annotation schema (v1.8), single source of truth for hub + MCP. */
+/** Shared annotation schema (v1.9), single source of truth for hub + MCP. */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-export const VERSION = "2.6.0";
+export const VERSION = "2.7.0";
 
 export const SCREENSHOT_PREFIX = "data:image/png;base64,";
 export const MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024;
@@ -88,6 +88,61 @@ export type AnchorMetadata = {
   fallback?: AnchorFallbackSignal[];
 };
 
+// Schema v1.9 (F4): optional top-level environment snapshot captured once at
+// send start. env records the browser and viewport state exactly as observed
+// (ISO-8601 capturedAt, page URL, viewport size, user agent, language,
+// device pixel ratio, and timezone offset in minutes). All fields are
+// required whenever env is present and strictly validated: unknown keys,
+// invalid timestamps, invalid bounds, and oversized strings are rejected
+// with HTTP 400, while v1.8 payloads without env stay valid (backward
+// compatible with every earlier schema).
+export const ENV_KEYS = [
+  "capturedAt",
+  "url",
+  "viewport",
+  "userAgent",
+  "language",
+  "devicePixelRatio",
+  "timezoneOffsetMinutes",
+] as const;
+export const MAX_ENV_URL = 2048;
+export const MAX_ENV_UA = 512;
+export const MAX_ENV_LANG = 64;
+export const MAX_TIMEZONE_OFFSET_MINUTES = 840; // UTC-14 through UTC+14
+export type EnvironmentSnapshot = {
+  capturedAt: string;
+  url: string;
+  viewport: { w: number; h: number };
+  userAgent: string;
+  language: string;
+  devicePixelRatio: number;
+  timezoneOffsetMinutes: number;
+};
+
+// Schema v1.9 (F4): optional textQuote descriptor (reserved for F9 text
+// selection). quote is the normalized selected page text; prefix and suffix
+// carry the bounded surrounding context used for unique-contextual restore.
+// Strictly validated: unknown keys, missing or oversized quote, and
+// oversized context strings are rejected with HTTP 400. Accepted at the top
+// level (quote-linked notes) and per element (Ask AI / Highlight markers),
+// with the same shape and limits at both levels.
+export const TEXT_QUOTE_KEYS = ["quote", "prefix", "suffix"] as const;
+export const MAX_QUOTE_TEXT = 5000;
+export const MAX_QUOTE_CONTEXT = 500;
+export type TextQuote = {
+  quote: string;
+  prefix?: string;
+  suffix?: string;
+};
+
+// Schema v1.9 (F4): optional thread identity (reserved for F8 element
+// threads). threadId identifies the thread a committed element instruction
+// belongs to; parentId references an existing item in the same thread. Both
+// are optional non-empty strings within documented caps; absence stays valid
+// (legacy annotations and root threads).
+export const MAX_THREAD_ID = 100;
+export const MAX_PARENT_ID = 100;
+
 // Schema v1.6: optional top-level capture state (Freeze State Capture).
 // Only these four fields are accepted; unknown keys are rejected with
 // HTTP 400. animationsFrozen is required whenever captureState is present.
@@ -129,6 +184,13 @@ export interface AnnotationPayload {
   screenshot?: string;
   screenshotFile?: string;
   captureState?: CaptureState;
+  // Schema v1.9 (F4): optional environment snapshot, text quote, and thread
+  // identity. All are strictly validated and optional for backward
+  // compatibility; see the validation rules below.
+  env?: EnvironmentSnapshot;
+  textQuote?: TextQuote;
+  threadId?: string;
+  parentId?: string;
   [key: string]: JsonValue | undefined;
 }
 
@@ -281,6 +343,42 @@ export function logSuccess(entry: Omit<SuccessLogEntry, "ts">): void {
 
 function isNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+/**
+ * Validate a schema v1.9 textQuote object at the given error path (top level
+ * "textQuote" or per-element "elements[N].textQuote"). Strict: only the
+ * three known keys, quote required non-empty within MAX_QUOTE_TEXT, and
+ * prefix/suffix optional strings within MAX_QUOTE_CONTEXT. Returns an error
+ * string or null when valid.
+ */
+function validateTextQuote(value: unknown, path: string): string | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return `${path} must be an object`;
+  }
+  const q = value as Record<string, unknown>;
+  for (const key of Object.keys(q)) {
+    if (!(TEXT_QUOTE_KEYS as readonly string[]).includes(key)) {
+      return `${path} has unknown key '${key}'`;
+    }
+  }
+  const quote = q.quote;
+  if (
+    typeof quote !== "string" ||
+    quote.length === 0 ||
+    quote.length > MAX_QUOTE_TEXT
+  ) {
+    return `${path}.quote must be a non-empty string of at most ${MAX_QUOTE_TEXT} characters`;
+  }
+  for (const key of ["prefix", "suffix"] as const) {
+    const context = q[key];
+    if (context !== undefined) {
+      if (typeof context !== "string" || context.length > MAX_QUOTE_CONTEXT) {
+        return `${path}.${key} must be a string of at most ${MAX_QUOTE_CONTEXT} characters`;
+      }
+    }
+  }
+  return null;
 }
 
 /** Validate annotation payload. Returns error string or null when valid. */
@@ -535,6 +633,19 @@ export function validatePayload(payload: unknown): string | null {
           }
         }
       }
+      // Schema v1.9 (F4): optional per-element textQuote (reserved for F9
+      // text selection). Same shape and limits as the top-level textQuote;
+      // unknown keys, missing or oversized quote, and oversized context
+      // strings are rejected with HTTP 400. Legacy elements without
+      // textQuote stay valid (backward compatible).
+      const elQuote = el.textQuote;
+      if (elQuote !== undefined) {
+        const err = validateTextQuote(
+          elQuote,
+          `elements[${elementIndex}].textQuote`,
+        );
+        if (err !== null) return err;
+      }
     }
   }
 
@@ -629,6 +740,125 @@ export function validatePayload(payload: unknown): string | null {
           return `captureState.openDetailsSelectors[${i}] must be a string`;
         }
       }
+    }
+  }
+
+  // Schema v1.9 (F4): optional top-level env snapshot. Strictly validated:
+  // when env is present it must be an object with exactly the seven known
+  // keys, every field required and typed exactly; capturedAt must be an
+  // ISO-8601 timestamp, viewport positive integers, devicePixelRatio a
+  // positive finite number, timezoneOffsetMinutes an integer within
+  // UTC-14..UTC+14, and strings non-empty within documented caps. Unknown
+  // keys, invalid timestamps, invalid bounds, and oversized strings are
+  // rejected with HTTP 400. v1.8 payloads without env stay valid.
+  const ISO_TIMESTAMP_RE =
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/;
+  if ("env" in obj) {
+    const env = obj.env;
+    if (env === null || typeof env !== "object" || Array.isArray(env)) {
+      return "env must be an object";
+    }
+    const eo = env as Record<string, unknown>;
+    for (const key of Object.keys(eo)) {
+      if (!(ENV_KEYS as readonly string[]).includes(key)) {
+        return `env has unknown key '${key}'`;
+      }
+    }
+    const capturedAt = eo.capturedAt;
+    if (
+      typeof capturedAt !== "string" ||
+      !ISO_TIMESTAMP_RE.test(capturedAt) ||
+      Number.isNaN(Date.parse(capturedAt))
+    ) {
+      return "env.capturedAt must be an ISO-8601 timestamp";
+    }
+    const envUrl = eo.url;
+    if (
+      typeof envUrl !== "string" ||
+      envUrl.length === 0 ||
+      envUrl.length > MAX_ENV_URL
+    ) {
+      return `env.url must be a non-empty string of at most ${MAX_ENV_URL} characters`;
+    }
+    const envViewport = eo.viewport;
+    if (
+      envViewport === null ||
+      typeof envViewport !== "object" ||
+      Array.isArray(envViewport)
+    ) {
+      return "env.viewport must be an object";
+    }
+    const evp = envViewport as Record<string, unknown>;
+    for (const key of ["w", "h"] as const) {
+      const value = evp[key];
+      if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+        return `env.viewport.${key} must be a positive integer`;
+      }
+    }
+    const userAgent = eo.userAgent;
+    if (
+      typeof userAgent !== "string" ||
+      userAgent.length === 0 ||
+      userAgent.length > MAX_ENV_UA
+    ) {
+      return `env.userAgent must be a non-empty string of at most ${MAX_ENV_UA} characters`;
+    }
+    const language = eo.language;
+    if (
+      typeof language !== "string" ||
+      language.length === 0 ||
+      language.length > MAX_ENV_LANG
+    ) {
+      return `env.language must be a non-empty string of at most ${MAX_ENV_LANG} characters`;
+    }
+    const dpr = eo.devicePixelRatio;
+    if (!isNumber(dpr) || dpr <= 0) {
+      return "env.devicePixelRatio must be a positive number";
+    }
+    const tz = eo.timezoneOffsetMinutes;
+    if (
+      typeof tz !== "number" ||
+      !Number.isInteger(tz) ||
+      tz < -MAX_TIMEZONE_OFFSET_MINUTES ||
+      tz > MAX_TIMEZONE_OFFSET_MINUTES
+    ) {
+      return `env.timezoneOffsetMinutes must be an integer from -${MAX_TIMEZONE_OFFSET_MINUTES} to ${MAX_TIMEZONE_OFFSET_MINUTES}`;
+    }
+  }
+
+  // Schema v1.9 (F4): optional top-level textQuote (reserved for F9 text
+  // selection). Same shape and limits as the per-element textQuote; unknown
+  // keys, missing or oversized quote, and oversized context strings are
+  // rejected with HTTP 400. Absence stays valid (backward compatible).
+  const topQuote = obj.textQuote;
+  if (topQuote !== undefined) {
+    const err = validateTextQuote(topQuote, "textQuote");
+    if (err !== null) return err;
+  }
+
+  // Schema v1.9 (F4): optional thread identity, reserved for F8 element
+  // threads. threadId identifies the thread a committed element instruction
+  // belongs to; parentId references an existing item in the same thread.
+  // Both are optional non-empty strings within documented caps; wrong
+  // types, empty strings, and oversized strings are rejected with HTTP 400.
+  if ("threadId" in obj) {
+    const threadId = obj.threadId;
+    if (
+      typeof threadId !== "string" ||
+      threadId.length === 0 ||
+      threadId.length > MAX_THREAD_ID
+    ) {
+      return `threadId must be a non-empty string of at most ${MAX_THREAD_ID} characters`;
+    }
+  }
+  if ("parentId" in obj) {
+    const parentId = obj.parentId;
+    if (
+      typeof parentId !== "string" ||
+      parentId.length === 0 ||
+      parentId.length > MAX_PARENT_ID
+    ) {
+      return `parentId must be a non-empty string of at most ${MAX_PARENT_ID} characters`;
     }
   }
 

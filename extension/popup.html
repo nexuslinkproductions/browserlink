@@ -151,6 +151,66 @@
     color: #9aa0a6;
   }
   .gap { margin-top: 14px; }
+  .search-list {
+    margin-top: 4px;
+    display: grid;
+    gap: 8px;
+  }
+  .search-item {
+    padding: 8px 9px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .search-item .page {
+    margin: 0 0 3px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #e8eaed;
+    overflow-wrap: anywhere;
+  }
+  .search-item .excerpt {
+    margin: 0 0 4px;
+    font-size: 11px;
+    color: #bdc1c6;
+    overflow-wrap: anywhere;
+  }
+  .search-item .meta {
+    margin: 0;
+    font-size: 10px;
+    color: #9aa0a6;
+    overflow-wrap: anywhere;
+  }
+  .search-item .meta.shot { color: #35c759; }
+  .search-note { margin-top: 6px; font-size: 11px; color: #9aa0a6; }
+  .route-list {
+    margin-top: 4px;
+    display: grid;
+    gap: 6px;
+  }
+  .route-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .route-item .pat {
+    flex: 1;
+    font-size: 11px;
+    color: #e8eaed;
+    overflow-wrap: anywhere;
+  }
+  .route-item button {
+    flex: 0 0 auto;
+    width: auto;
+    padding: 3px 8px;
+    font-size: 11px;
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .route-item button:hover { background: rgba(255, 255, 255, 0.16); }
 </style>
 </head>
 <body>
@@ -225,6 +285,32 @@
 
   <button id="downloadBackup" type="button" title="Download one snapshot of every stored annotation">Backup all annotations</button>
   <div id="backupResult" class="result"></div>
+
+  <div class="gap"></div>
+  <label for="searchInput">Search annotations</label>
+  <input id="searchInput" type="text" placeholder="Search notes, text, instructions..."
+         autocomplete="off" spellcheck="false" aria-describedby="searchStatus">
+  <div id="searchStatus" class="hint"></div>
+  <div id="searchResults" class="search-list" hidden></div>
+
+  <div class="gap"></div>
+  <label for="routeInput">Route opt-outs (SPA routes stay dormant)</label>
+  <input id="routeInput" type="text"
+         placeholder="https://example.com or https://example.com/blocked"
+         autocomplete="off" spellcheck="false" aria-describedby="routeStatus">
+  <div class="row">
+    <button id="routeAdd" type="button" class="mini"
+            title="Add an exact-origin or origin + path-prefix opt-out">Add</button>
+    <button id="routeRefresh" type="button" class="mini"
+            title="Re-check the current tab against the opt-outs">Check tab</button>
+  </div>
+  <div id="routeStatus" class="hint"></div>
+  <div id="routeList" class="route-list"></div>
+  <div id="routeState" class="hint"></div>
+  <p class="note">Opt-outs are exact origins, optionally with a path prefix.
+    Wildcards, query strings, and fragments are never stored. An opted-out
+    route stays dormant on load and exits the tool once when you navigate
+    into it; leaving the route restores normal activation.</p>
 
   <div class="gap"></div>
   <p class="note">No account, no cloud: annotations, drafts, and downloads

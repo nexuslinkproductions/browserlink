@@ -37,7 +37,9 @@
 :host([data-capturing='full']) .comet-hl,
 :host([data-capturing='full']) .comet-hover-box,
 :host([data-capturing='full']) canvas,
-:host([data-capturing='full']) .comet-frame-shield {
+:host([data-capturing='full']) .comet-frame-shield,
+:host([data-capturing='partial']) .comet-sel-actions,
+:host([data-capturing='full']) .comet-sel-actions {
   visibility: hidden !important;
 }
 
@@ -529,6 +531,62 @@
 }
 .comet-note-count[hidden] {
   display: none;
+}
+
+/* ---------------- text-selection quick actions (F9) ----------------
+ * ONE compact surface opened by a valid page text selection (Note / Ask AI
+ * / Highlight). Fixed, pointer-events opt in on the pointer-events:none
+ * host, painted above the canvas (later sibling at the same z-index).
+ * Motion: the class joins the shared Apple-grade motion group below and the
+ * reduced-motion transition:none list, so hover/press and reduced motion
+ * behave exactly like the rest of the overlay. */
+.comet-sel-actions {
+  position: fixed;
+  z-index: 2147483646;
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(28, 31, 39, 0.97);
+  color: #e8eaed;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+  font: 12px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.comet-sel-actions[hidden] {
+  display: none;
+}
+
+.comet-sel-act {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #e8eaed;
+  font: inherit;
+  padding: 6px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.comet-sel-act:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.comet-sel-act:focus-visible {
+  outline: 2px solid #4a9eff;
+  outline-offset: 1px;
+}
+
+.comet-sel-act:first-child {
+  border-color: rgba(74, 158, 255, 0.5);
+  background: rgba(74, 158, 255, 0.22);
+}
+
+.comet-sel-act:first-child:hover {
+  background: rgba(74, 158, 255, 0.32);
 }
 
 /* ---- toolbar power / collapse ---- */
@@ -2420,7 +2478,9 @@
 .comet-mode-btn,
 .comet-insp-cat-header,
 .comet-insp-fmt-btn,
-.comet-meta-chip {
+.comet-meta-chip,
+.comet-sel-actions,
+.comet-sel-act {
   transition: transform var(--bl-dur-fast) var(--bl-ease-spring),
               opacity var(--bl-dur-fast) var(--bl-ease-out),
               box-shadow var(--bl-dur) var(--bl-ease-soft),
@@ -2437,7 +2497,8 @@
 .comet-insp-copy:hover,
 .comet-insp-reveal:hover,
 .comet-mode-btn:hover,
-.comet-meta-chip:hover {
+.comet-meta-chip:hover,
+.comet-sel-act:hover {
   transform: scale(1.04);
 }
 .comet-btn:active,
@@ -2454,6 +2515,7 @@
 .comet-insp-cat-header:active,
 .comet-insp-fmt-btn:active,
 .comet-mode-btn:active,
+.comet-sel-act:active,
 .comet-send.send-press {
   transform: scale(0.97);
 }
@@ -2682,7 +2744,9 @@
   .comet-hl,
   .comet-hover-box,
   .comet-hl-chip,
-  .comet-meta-chip {
+  .comet-meta-chip,
+  .comet-sel-actions,
+  .comet-sel-act {
     transition: none !important;
   }
   #hermes-annotate-host.is-entering,
@@ -2698,6 +2762,7 @@
   .comet-insp-copy:hover,
   .comet-insp-reveal:hover,
   .comet-mode-btn:hover,
+  .comet-sel-act:hover,
   .comet-btn:active,
   .comet-swatch:active,
   .comet-width:active,
@@ -2712,6 +2777,7 @@
   .comet-insp-cat-header:active,
   .comet-insp-fmt-btn:active,
   .comet-mode-btn:active,
+  .comet-sel-act:active,
   .comet-send.send-press {
     transform: none !important;
     filter: none !important;

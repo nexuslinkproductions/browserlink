@@ -151,6 +151,19 @@
   // Edge inset for a docked toolbar/chip (clamped 10-25px per design spec).
   const DOCK_GAP_PX = Math.min(25, Math.max(10, 14));
 
+  /* ---------------- text-selection quick actions (F9) ----------------
+   * Quote limits mirror the schema v1.9 textQuote contract
+   * (schema.ts MAX_QUOTE_TEXT / MAX_QUOTE_CONTEXT) so the extension never
+   * ships a payload the hub would reject. Context sampling is bounded and
+   * independent of the schema cap: at most SEL_CONTEXT_SAMPLE characters
+   * per side are captured, then capQuote applies the schema caps again.
+   * The restore scan is bounded so hostile or huge pages cannot stall the
+   * content script. */
+  const SEL_MAX_QUOTE = 5000;       // schema MAX_QUOTE_TEXT
+  const SEL_MAX_CONTEXT = 500;      // schema MAX_QUOTE_CONTEXT
+  const SEL_CONTEXT_SAMPLE = 120;   // raw context chars captured per side
+  const SEL_MAX_SCAN_NODES = 4000;  // restore walk cap (text nodes)
+
   /* ---------------- state ---------------- */
   const state = {
     annotateOn: true,    // draw mode is the default selection on start
@@ -211,6 +224,7 @@
   let hoverBoxRaf = 0;       // rAF throttle for scroll/resize box recompute
   let chatCard = null;
   let inspMetaEl = null; // intent/severity chip row inside the element inspector
+  let inspThreadEl = null; // F8: thread history panel inside the element inspector
   let chatHead = null;
   let chatInput = null;
   let chipEl = null;         // 48px collapsed chip
@@ -248,6 +262,22 @@
   let selectionPulseRaf = 0;
   let selectionPulseStarted = 0;
   let lastSelectionCount = -1;
+
+  /* ---------------- text-selection quick actions (F9) state ----------------
+   * selSurface is the ONE compact action surface (Note / Ask AI / Highlight)
+   * built in buildUI and toggled; selSurfaceQuote is the last validated
+   * quote snapshot the surface was shown for. A mousedown on the surface
+   * collapses the page selection BEFORE the click handler runs, so the
+   * quote is snapshotted into selPendingQuote at mousedown and consumed by
+   * the click handler. selListenersBound mirrors the bindEvents/fullExit
+   * lifecycle for diagnostics (exactly one listener set per page). */
+  let selSurface = null;
+  let selSurfaceQuote = null;   // last validated quote snapshot (capture time)
+  let selPendingQuote = null;   // mousedown snapshot consumed by the click
+  let selTopQuote = null;       // top-level textQuote for the quote-linked note
+  let selActionCount = 0;       // actions taken since injection (diag)
+  let selListenersBound = false;
+  let selSurfaceRaf = 0;        // rAF throttle for the refresh check
 
   /* ---------------- Freeze State Capture (schema v1.6) ----------------
    * One extension-owned style element pauses CSS animations and zeroes
@@ -301,6 +331,136 @@
    */
   const ONBOARDED_KEY = 'browserlinkOnboarded'; // chrome.storage.local
   const ALWAYS_ON_KEY = 'browserlinkAlwaysOn';  // chrome.storage.session
+
+  /* ---------------- Route opt-outs (F10): per-route programmatic control ----------------
+   * A local list of exact-origin plus pathname-prefix opt-outs, stored in
+   * chrome.storage.local under "routeOptOuts" and managed by the popup.
+   * A route that matches an entry stays dormant on load and performs
+   * fullExit once when an active host navigates into it (pushState,
+   * replaceState, popstate, hashchange); leaving the route permits the
+   * existing manual or session always-on activation model. Matching is
+   * pure (no DOM, no storage): canonical origin equality plus a
+   * pathname-prefix boundary check, so the mechanism gate can extract and
+   * drive these functions verbatim. Entries never carry wildcards, query
+   * strings, or fragments.
+   */
+  const ROUTE_OPTOUTS_KEY = 'routeOptOuts'; // chrome.storage.local
+  let lastRouteMatched = null;  // null unknown; true/false after an evaluation
+  let routeOptOutsCount = 0;    // list size seen at the last evaluation
+  let routeCheckPending = false;
+
+  // Canonicalize an opt-out entry: 'scheme://host[:port][/path]' with the
+  // default port removed, host lowercased (localhost mapped to 127.0.0.1),
+  // and trailing slashes stripped. Wildcards, query strings, and fragments
+  // are rejected (return null), as are non-http(s) schemes and unparseable
+  // input. The canonical form is what the popup stores and shows.
+  function normalizeRoutePattern(raw) {
+    const s = String(raw == null ? '' : raw).trim();
+    if (!s) return null;
+    if (s.indexOf('*') !== -1) return null;
+    if (s.indexOf('?') !== -1 || s.indexOf('#') !== -1) return null;
+    let url = null;
+    try { url = new URL(s); } catch (_) { return null; }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    let host = url.hostname.toLowerCase();
+    if (host === 'localhost') host = '127.0.0.1';
+    const port = url.port;
+    const defaultPort =
+      (url.protocol === 'http:' && port === '80') ||
+      (url.protocol === 'https:' && port === '443');
+    const hostPort = defaultPort ? host : (port ? host + ':' + port : host);
+    let path = url.pathname || '';
+    while (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+    if (path === '/') path = '';
+    return url.protocol + '//' + hostPort + path;
+  }
+
+  // Split a canonical entry into {origin, prefix}. prefix '' matches every
+  // path on the origin; a non-empty prefix is a pathname prefix.
+  function routeEntryParts(canonical) {
+    const idx = canonical.indexOf('://');
+    if (idx < 0) return { origin: canonical, prefix: '' };
+    const rest = canonical.slice(idx + 3);
+    const slash = rest.indexOf('/');
+    if (slash < 0) return { origin: canonical, prefix: '' };
+    return { origin: canonical.slice(0, idx + 3) + rest.slice(0, slash), prefix: rest.slice(slash) };
+  }
+
+  // Does the href sit on an opted-out route? Entries are exact-origin
+  // (every path matches) or origin + pathname prefix with a boundary check
+  // (/blocked matches /blocked and /blocked/xyz but not /blocking).
+  function routeMatchesHref(optOuts, href) {
+    if (!Array.isArray(optOuts) || optOuts.length === 0) return false;
+    let current = null;
+    try { current = new URL(href); } catch (_) { return false; }
+    let host = current.hostname.toLowerCase();
+    if (host === 'localhost') host = '127.0.0.1';
+    const port = current.port;
+    const defaultPort =
+      (current.protocol === 'http:' && port === '80') ||
+      (current.protocol === 'https:' && port === '443');
+    const hostPort = defaultPort ? host : (port ? host + ':' + port : host);
+    const origin = current.protocol + '//' + hostPort;
+    const pathname = current.pathname || '/';
+    for (const entry of optOuts) {
+      const canonical = normalizeRoutePattern(entry);
+      if (!canonical) continue; // corrupt entry: skipped, never fatal
+      const parts = routeEntryParts(canonical);
+      if (parts.origin !== origin) continue;
+      if (parts.prefix === '') return true;
+      if (pathname === parts.prefix || pathname.startsWith(parts.prefix + '/')) return true;
+    }
+    return false;
+  }
+
+  // Read the stored opt-out list defensively: any failure yields [].
+  function storedRouteOptOuts() {
+    return new Promise((resolve) => {
+      try {
+        chrome.storage.local.get(ROUTE_OPTOUTS_KEY).then((got) => {
+          const list = got && got[ROUTE_OPTOUTS_KEY];
+          resolve(Array.isArray(list) ? list : []);
+        }).catch(() => resolve([]));
+      } catch (_) { resolve([]); }
+    });
+  }
+
+  // Pure route transition decision for history events, so the mechanism
+  // gate can drive enter/leave fixtures: 'exit' when the route became
+  // matched while the host is active (fullExit once), 'dormant' when the
+  // route is matched and no host exists, 'allowed' when the route is no
+  // longer matched and the host is gone (manual or session always-on
+  // activation is permitted again), 'stay' otherwise.
+  function routeTransitionAction(wasMatched, isMatched, isActive) {
+    if (isMatched && isActive) return 'exit';
+    if (isMatched && !isActive) return 'dormant';
+    if (!isMatched && !isActive && wasMatched) return 'allowed';
+    return 'stay';
+  }
+
+  // Evaluate the current route against the stored opt-outs on every history
+  // event. Fire-and-forget; the route guard never breaks the page.
+  async function checkRouteForHistory() {
+    if (routeCheckPending) return;
+    routeCheckPending = true;
+    try {
+      const optOuts = await storedRouteOptOuts();
+      routeOptOutsCount = optOuts.length;
+      const matched = routeMatchesHref(optOuts, location.href);
+      const isActive = !!(host && host.parentNode);
+      const action = routeTransitionAction(!!lastRouteMatched, matched, isActive);
+      lastRouteMatched = matched;
+      if (action === 'exit') {
+        diagLog('route:exit', 'url=' + location.href + ' optOuts=' + optOuts.length);
+        fullExit({ routeOptOut: true });
+      } else if (action === 'dormant') {
+        diagLog('route:dormant', 'url=' + location.href + ' optOuts=' + optOuts.length);
+      } else if (action === 'allowed') {
+        diagLog('route:allowed', 'url=' + location.href + ' optOuts=' + optOuts.length);
+      }
+    } catch (_) { /* route guard never breaks the page */ }
+    routeCheckPending = false;
+  }
   const TOUR_COPY = [
     {
       title: 'Pick an element',
@@ -765,6 +925,33 @@
           };
         }),
       },
+      // Element threads (F8): thread identity + ordered reply history of
+      // committed element instructions. sent marks items that already
+      // shipped in a stored annotation (the next reply's parentId target).
+      thread: {
+        id: thread.id,
+        count: thread.items.length,
+        items: thread.items.map((it) => ({
+          id: it.id,
+          parentId: it.parentId,
+          textLen: it.text ? it.text.length : 0,
+          index: it.index,
+          sent: it.sent,
+        })),
+      },
+      // Text-selection quick actions (F9): surface visibility, the top-level
+      // quote-linked note quote, action count, exactly-one-listener proof,
+      // and the number of committed quote markers. quoteLen is the live
+      // quote snapshot length (0 when none); markers counts elements that
+      // carry the internal quoteMarker flag.
+      selection: {
+        surface: !!(selSurface && !selSurface.hidden),
+        topQuote: !!selTopQuote,
+        quoteLen: (selSurfaceQuote && selSurfaceQuote.quote) ? selSurfaceQuote.quote.length : 0,
+        actions: selActionCount,
+        listeners: selListenersBound ? 1 : 0,
+        markers: state.elements.filter((en) => en.descriptor && en.descriptor.quoteMarker).length,
+      },
       canvasCtx: !!(canvas && ctx),
       messagesBound: messagesBound,
       // Onboarding (F6): tour + session always-on state for one-instance
@@ -788,6 +975,12 @@
         } : null,
       },
       health: diagHealth(false),
+      // Route opt-outs (F10): last evaluated route match state. matched is
+      // null until the first evaluation (init or a history event) ran.
+      route: {
+        matched: lastRouteMatched === null ? null : !!lastRouteMatched,
+        optOuts: routeOptOutsCount,
+      },
       log: diagRing.slice(),
     };
   }
@@ -1060,8 +1253,43 @@
             out.anchor = anchorOut;
           }
         }
+        // F9: quote markers persist their textQuote (schema v1.9, capped),
+        // the marker flag, and the last restore resolution so the draft
+        // stays introspectable; restore recomputes the live resolution from
+        // the DOM regardless. Legacy drafts without these fields restore
+        // unchanged (draft format stays backward compatible at v1).
+        if (d.quoteMarker === true) out.quoteMarker = true;
+        if (d.textQuote && typeof d.textQuote === 'object' && !Array.isArray(d.textQuote)) {
+          out.textQuote = capQuote(d.textQuote.quote, d.textQuote.prefix, d.textQuote.suffix);
+        }
+        if (d.quote && typeof d.quote === 'object' && !Array.isArray(d.quote)) {
+          const qr = d.quote;
+          if (qr.version === 1
+            && (qr.resolution === 'exact' || qr.resolution === 'fallback'
+              || qr.resolution === 'ambiguous' || qr.resolution === 'unresolved')) {
+            const quoteOut = { version: 1, resolution: qr.resolution };
+            if (typeof qr.confidence === 'number' && Number.isFinite(qr.confidence)) {
+              quoteOut.confidence = Math.max(0, Math.min(1, qr.confidence));
+            }
+            out.quote = quoteOut;
+          }
+        }
         return out;
       }),
+      // F8: thread identity + ordered item history survive the draft. The
+      // block is absent for empty threads (pre-F8 drafts restore without
+      // it), so draft format stays backward compatible at v1.
+      thread: thread.items.length ? {
+        id: thread.id,
+        seq: thread.seq,
+        items: thread.items.map((it) => ({
+          id: it.id,
+          parentId: it.parentId,
+          text: String(it.text || '').slice(0, MAX_INSTR),
+          index: it.index,
+          sent: it.sent,
+        })),
+      } : null,
     };
   }
 
@@ -1180,11 +1408,39 @@
       let el = null;
       let res = null;
       try {
-        // Anchor resilience (F2): full deterministic chain, exact replay
-        // first; legacy flat descriptors (and descriptors without cssPath)
-        // resolve through the same fallback signals.
-        res = reanchorElement(desc);
-        if (res.el) el = res.el;
+        // F9: quote markers restore by TEXT, not by cssPath - the
+        // deterministic exact-then-contextual chain over the live DOM.
+        if (desc.quoteMarker === true
+          && desc.textQuote && typeof desc.textQuote === 'object'
+          && !Array.isArray(desc.textQuote)) {
+          const qr = restoreQuoteMatch(
+            desc.textQuote.quote, desc.textQuote.prefix, desc.textQuote.suffix,
+            pageQuoteSegments(document));
+          if (qr.segment && qr.segment.node) {
+            el = qr.segment.node.parentElement || qr.segment.node;
+            res = {
+              el,
+              resolution: qr.resolution === 'exact' ? 'exact' : 'fallback',
+              confidence: qr.resolution === 'exact' ? 1 : 0.85,
+              fallback: qr.resolution === 'fallback' ? ['text'] : [],
+              reason: qr.resolution,
+            };
+          } else {
+            res = {
+              el: null,
+              resolution: 'unresolved',
+              confidence: 0,
+              fallback: [],
+              reason: qr.resolution,
+            };
+          }
+        } else {
+          // Anchor resilience (F2): full deterministic chain, exact replay
+          // first; legacy flat descriptors (and descriptors without cssPath)
+          // resolve through the same fallback signals.
+          res = reanchorElement(desc);
+          if (res.el) el = res.el;
+        }
       } catch (_) { el = null; res = null; }
       const d2 = {
         index: (typeof desc.index === 'number' && Number.isFinite(desc.index)) ? desc.index : maxIndex + 1,
@@ -1218,6 +1474,12 @@
           : [];
         if (hosts.length) d2.shadow = { depth: hosts.length, hosts };
       }
+      // F9: restore the quote marker fields (marker flag + capped textQuote;
+      // the live resolution is recomputed below and stamped on d2.quote).
+      if (desc.quoteMarker === true) d2.quoteMarker = true;
+      if (desc.textQuote && typeof desc.textQuote === 'object' && !Array.isArray(desc.textQuote)) {
+        d2.textQuote = capQuote(desc.textQuote.quote, desc.textQuote.prefix, desc.textQuote.suffix);
+      }
       const outlineEl = createOutline(d2.index);
       state.elements.push({ descriptor: d2, el, outlineEl });
       // Anchor resilience (F2): stamp the truthful resolution state, mark
@@ -1225,7 +1487,17 @@
       // unresolved entry; its instruction is never attached and never
       // dropped - it renders as a ghost at the prior rect.
       if (!res) res = { el: null, resolution: 'unresolved', confidence: 0, fallback: [], reason: 'none' };
-      stampAnchor(d2, res);
+      // F9: quote markers carry their own resolution stamp (the F2 anchor
+      // field stays absent for them - text restore has no cssPath signal).
+      if (d2.quoteMarker) {
+        d2.quote = {
+          version: 1,
+          resolution: res.resolution,
+          confidence: Math.round(res.confidence * 1000) / 1000,
+        };
+      } else {
+        stampAnchor(d2, res);
+      }
       markOutlineAnchor(outlineEl, res.resolution);
       if (res.resolution === 'exact') restored += 1;
       else if (res.resolution === 'fallback') { restored += 1; moved += 1; }
@@ -1236,6 +1508,46 @@
       if (d2.index > maxIndex) maxIndex = d2.index;
     }
     if (maxIndex >= state.nextIndex) state.nextIndex = maxIndex + 1;
+    // F8: restore the thread identity + ordered item history. The block is
+    // optional (pre-F8 drafts have none) and sanitized: ids and text are
+    // capped, the list is capped at MAX_THREAD_ITEMS, and an invalid chain
+    // (missing parents, cycles, cross-thread references) falls back to a
+    // fresh thread so the restored elements still ship. seq continues after
+    // the highest restored item id so new replies never collide.
+    let restoredThread = false;
+    if (d.thread && typeof d.thread === 'object') {
+      const t = d.thread;
+      const tid = (typeof t.id === 'string' && t.id && t.id.length <= MAX_THREAD_ID_LEN)
+        ? t.id : null;
+      const rawItems = Array.isArray(t.items) ? t.items.slice(0, MAX_THREAD_ITEMS) : [];
+      const items = [];
+      for (const raw of rawItems) {
+        if (!raw || typeof raw !== 'object') continue;
+        const id = (typeof raw.id === 'string' && raw.id)
+          ? String(raw.id).slice(0, MAX_THREAD_ID_LEN) : null;
+        if (!id) continue;
+        items.push({
+          id,
+          parentId: raw.parentId == null
+            ? null
+            : (typeof raw.parentId === 'string' ? String(raw.parentId).slice(0, MAX_THREAD_ID_LEN) : null),
+          text: String(raw.text || '').slice(0, MAX_INSTR),
+          index: (Number.isInteger(raw.index) && raw.index >= 0) ? raw.index : null,
+          sent: (typeof raw.sent === 'string' && raw.sent)
+            ? String(raw.sent).slice(0, MAX_THREAD_ID_LEN) : null,
+        });
+      }
+      const tv = threadValidateItems(items, []);
+      if (tid && items.length && tv.ok) {
+        thread = { id: tid, items, seq: 0 };
+        for (const it of items) {
+          const m = /^p(\d+)$/.exec(it.id);
+          if (m) thread.seq = Math.max(thread.seq, Number(m[1]));
+        }
+        restoredThread = true;
+      }
+    }
+    if (!restoredThread) threadReset();
     if (state.strokes.length) redraw();
     if (state.elements.length) {
       updateCount();
@@ -1269,6 +1581,220 @@
       + ' elements=' + restored + ' moved=' + moved + ' ambiguous=' + ambiguous
       + ' unresolved=' + unresolved);
   }
+
+  /* ---------------- Element threads (F8) ----------------
+   * One thread per page context: the ordered, append-only reply history of
+   * committed element instructions. The FIRST committed instruction mints a
+   * stable threadId and becomes the root item (parentId null); every later
+   * commit is a reply whose parentId points at the previous item, so the
+   * chain can never branch or cycle from normal use. The whole current
+   * batch ships in one annotation carrying top-level threadId (schema
+   * v1.9); when the batch continues a thread that was ALREADY sent, the
+   * annotation also carries parentId = the stored annotation id of the
+   * nearest sent ancestor, learned from the hub after each confirmed send
+   * (GET /annotations, newest first). The hub validates the link on store
+   * (parent exists, same thread, acyclic) and its thread route replays the
+   * whole thread in order. The inspector renders the thread history
+   * chronologically with append-only replies; edits update an item in
+   * place. Legacy drafts without a thread block restore without threads.
+   */
+  const MAX_THREAD_ITEMS = 20;    // thread history cap (note-queue parity)
+  const MAX_THREAD_ID_LEN = 100;  // schema v1.9 cap (schema.ts MAX_THREAD_ID)
+  // items[i] = { id: 'p<seq>', parentId, text, index, sent }
+  // sent = stored annotation id that shipped this item, or null (unsent).
+  let thread = { id: null, items: [], seq: 0 };
+
+  function threadReset() {
+    thread = { id: null, items: [], seq: 0 };
+  }
+
+  // Stable thread id for this page context (timestamp base36 + random).
+  function threadMintId() {
+    return 'thr-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+  }
+
+  // Record a committed element instruction as one thread item. The first
+  // commit mints the thread; later NEW commits append replies (parentId =
+  // previous item). Edits update the item text in place so the chain stays
+  // append-only. History is capped at MAX_THREAD_ITEMS by dropping the
+  // OLDEST items and re-rooting the new front, so the surviving chain never
+  // dangles.
+  function threadCommit(entryIndex, text, isEdit) {
+    if (isEdit && thread.items[entryIndex]) {
+      thread.items[entryIndex].text = text;
+      return thread.items[entryIndex];
+    }
+    if (!thread.id) thread.id = threadMintId();
+    const id = 'p' + (++thread.seq);
+    const parentId = thread.items.length ? thread.items[thread.items.length - 1].id : null;
+    const item = { id, parentId, text, index: entryIndex, sent: null };
+    thread.items.push(item);
+    if (thread.items.length > MAX_THREAD_ITEMS) {
+      thread.items.splice(0, thread.items.length - MAX_THREAD_ITEMS);
+      thread.items[0].parentId = null; // new front becomes the root
+    }
+    return item;
+  }
+
+  // Pure validation of a thread's item chain, exercised by the mechanism
+  // gate: roots (parentId null) are valid; a reply must reference an
+  // existing item in the SAME thread (missing parents rejected); an item
+  // whose parentId belongs to another thread list is a cross-thread parent
+  // (rejected); walking parent chains must never revisit an id (cycles
+  // rejected). Returns {ok:true} or {ok:false, error}.
+  function threadValidateItems(items, otherThreads) {
+    if (!Array.isArray(items)) return { ok: false, error: 'items must be a list' };
+    const seen = new Set();
+    for (const it of items) {
+      if (!it || typeof it !== 'object') return { ok: false, error: 'item must be an object' };
+      const id = typeof it.id === 'string' && it.id ? it.id : '';
+      if (!id) return { ok: false, error: 'item id missing' };
+      if (seen.has(id)) return { ok: false, error: 'duplicate item id ' + id };
+      seen.add(id);
+      const parentId = it.parentId == null ? null : (typeof it.parentId === 'string' ? it.parentId : '');
+      if (parentId === null) continue; // root
+      if (!parentId) return { ok: false, error: 'item ' + id + ' has an invalid parentId' };
+      if (Array.isArray(otherThreads)) {
+        for (const other of otherThreads) {
+          if (other && Array.isArray(other) && other.some((o) => o && o.id === parentId)) {
+            return { ok: false, error: 'cross-thread parent ' + parentId };
+          }
+        }
+      }
+      const parent = items.find((o) => o.id === parentId);
+      if (!parent) return { ok: false, error: 'missing parent ' + parentId };
+      // Cycle walk: the chain must terminate at a root without revisiting.
+      let cur = it;
+      const chain = new Set([id]);
+      let guard = 0;
+      while (cur && cur.parentId) {
+        if (++guard > MAX_THREAD_ITEMS + 1) return { ok: false, error: 'thread cycle detected' };
+        const next = items.find((o) => o.id === cur.parentId);
+        if (!next) return { ok: false, error: 'missing parent ' + cur.parentId };
+        if (chain.has(next.id)) return { ok: false, error: 'thread cycle detected' };
+        chain.add(next.id);
+        cur = next;
+      }
+    }
+    return { ok: true };
+  }
+
+  // The annotation-level parentId for the NEXT send: the stored annotation
+  // id of the nearest SENT ancestor in the thread (walked from the head
+  // backwards), or null when nothing in this thread has shipped yet (the
+  // annotation is then the thread root).
+  function threadPayloadParentId() {
+    if (!thread.id || !thread.items.length) return null;
+    for (let i = thread.items.length - 1; i >= 0; i--) {
+      if (thread.items[i].sent) return thread.items[i].sent;
+    }
+    return null;
+  }
+
+  // After a confirmed send, learn the stored annotation id from the hub
+  // (GET /annotations, newest first; the annotation we just posted is the
+  // newest, guarded by a 15s mtime sanity bound) and stamp it on every
+  // item that shipped, so the next send carries a valid parentId. Never
+  // throws: a hub that is offline or slow just leaves items unsent and the
+  // next send stays a root in the same thread.
+  async function threadLearnSentId() {
+    if (!thread.id || !thread.items.length) return;
+    let endpoint = 'http://127.0.0.1:8787';
+    try {
+      const got = await chrome.storage.local.get('endpoint');
+      if (got && typeof got.endpoint === 'string' && got.endpoint) endpoint = got.endpoint;
+    } catch (_) { /* storage unavailable: default endpoint */ }
+    try {
+      const res = await fetch(endpoint.replace(/\/+$/, '') + '/annotations');
+      if (!res.ok) return;
+      const body = await res.json();
+      const files = body && Array.isArray(body.files) ? body.files : [];
+      if (!files.length || !files[0] || typeof files[0].name !== 'string') return;
+      const name = files[0].name;
+      const mtime = Number(files[0].mtime) || 0;
+      if (Date.now() / 1000 - mtime > 15) return; // not the annotation we just sent
+      let stamped = false;
+      for (const it of thread.items) {
+        if (!it.sent) { it.sent = name; stamped = true; }
+      }
+      if (stamped) {
+        diagLog('thread:sent', 'thread=' + thread.id + ' annotation=' + name);
+        refreshThreadPanel();
+      }
+    } catch (_) { /* hub offline: keep prior state, next send stays a root */ }
+  }
+
+  // Render the inspector thread panel: the ordered reply history of the
+  // current page-context thread. The panel is hidden until the first item
+  // exists; the current element's item is highlighted, sent items carry a
+  // "sent" badge, and replies are append-only via the preserved instruction
+  // field (committing the next element instruction appends the next reply).
+  function refreshThreadPanel() {
+    if (!inspPanel || !inspThreadEl) return;
+    const listEl = inspThreadEl.querySelector('.comet-thread-list');
+    if (!listEl) return;
+    if (!thread.id || !thread.items.length) {
+      inspThreadEl.hidden = true;
+      return;
+    }
+    inspThreadEl.hidden = false;
+    const idEl = inspThreadEl.querySelector('.comet-thread-id');
+    if (idEl) idEl.textContent = String(thread.id);
+    const countEl = inspThreadEl.querySelector('.comet-thread-count');
+    if (countEl) countEl.textContent = thread.items.length === 1
+      ? '1 item' : thread.items.length + ' items';
+    listEl.innerHTML = '';
+    for (let i = 0; i < thread.items.length; i++) {
+      const it = thread.items[i];
+      const row = document.createElement('div');
+      row.className = 'comet-thread-item';
+      if (it.index === state.activeIndex) row.classList.add('is-current');
+      const role = document.createElement('span');
+      role.className = 'comet-thread-role';
+      role.textContent = (i === 0 || !it.parentId) ? 'Root' : 'Reply';
+      const chip = document.createElement('span');
+      chip.className = 'comet-thread-elem';
+      chip.textContent = 'E' + String(it.index != null ? it.index : i + 1);
+      const text = document.createElement('span');
+      text.className = 'comet-thread-text';
+      text.textContent = String(it.text || '').slice(0, MAX_INSTR);
+      text.title = String(it.text || '');
+      const sent = document.createElement('span');
+      sent.className = 'comet-thread-sent';
+      sent.textContent = 'sent';
+      sent.style.display = it.sent ? '' : 'none';
+      row.appendChild(role);
+      row.appendChild(chip);
+      row.appendChild(text);
+      row.appendChild(sent);
+      listEl.appendChild(row);
+    }
+  }
+
+  // Supplemental styles for the thread panel, appended in BOTH style paths
+  // (overlay.css or the fallback), keeping the thread UI self-contained in
+  // content.js so later waves never depend on overlay.css for it. The panel
+  // is static content (no transitions), so reduced-motion needs no override.
+  const THREAD_PANEL_CSS =
+    '.comet-thread{border-top:1px solid rgba(255,255,255,.14);padding-top:6px;' +
+    'display:flex;flex-direction:column;gap:6px;}' +
+    '.comet-thread[hidden]{display:none;}' +
+    '.comet-thread-head{display:flex;align-items:center;gap:6px;font-size:11px;color:#9aa0a6;}' +
+    '.comet-thread-title{font-weight:600;text-transform:uppercase;letter-spacing:.05em;}' +
+    '.comet-thread-id{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+    'font:10px/1.3 ui-monospace,Menlo,Consolas,monospace;}' +
+    '.comet-thread-count{flex:0 0 auto;}' +
+    '.comet-thread-list{display:flex;flex-direction:column;gap:4px;max-height:120px;overflow-y:auto;}' +
+    '.comet-thread-item{display:flex;align-items:baseline;gap:6px;padding:3px 6px;border-radius:5px;' +
+    'background:rgba(255,255,255,.04);border:1px solid transparent;}' +
+    '.comet-thread-item.is-current{border-color:rgba(74,158,255,.55);background:rgba(74,158,255,.08);}' +
+    '.comet-thread-role{flex:0 0 auto;font-size:10px;font-weight:600;color:#6ab0ff;' +
+    'text-transform:uppercase;letter-spacing:.04em;}' +
+    '.comet-thread-elem{flex:0 0 auto;font-size:10px;color:#9aa0a6;}' +
+    '.comet-thread-text{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+    'white-space:nowrap;font-size:11px;color:#e8eaed;}' +
+    '.comet-thread-sent{flex:0 0 auto;font-size:9px;color:#35c759;}' +
+    '.comet-thread-hint{font-size:10px;color:#9aa0a6;font-style:italic;}';
 
   /* ---------------- toolbar position / collapse / edge dock ---------------- */
   const TOOLBAR_DOCK_SIDES = ['left', 'right', 'bottom'];
@@ -3197,6 +3723,10 @@
 
   function onHistoryChange() {
     scheduleReanchor('history');
+    // Route opt-outs (F10): pushState/replaceState/popstate/hashchange all
+    // re-evaluate the route so an opted-out route performs fullExit once and
+    // leaving it permits the existing activation model again.
+    checkRouteForHistory();
   }
 
   /* ---------------- deep pick: same-origin frame registry ---------------- */
@@ -3807,6 +4337,8 @@
     if (hintProp) scheduleRedraw();
     // Keep Size & Position readout glued to the live element rect.
     updateInspectorMetrics();
+    // F9: the quick-action surface follows the selection on scroll/resize.
+    positionSelSurface();
     // Floating inspector follows its element on scroll; docked panels are
     // viewport-anchored and skip this.
     if (inspPanel && !inspPanel.hidden && !state.dock) positionInspector();
@@ -4061,6 +4593,20 @@
     const wasActive = state.activeIndex === index || inspector.descriptor === removed.descriptor;
     if (pending && pending.el === removed.el) pending = null;
     state.elements.splice(index, 1);
+    // F8: keep the thread history aligned with the element list. The item
+    // for the removed element is dropped and the item that follows is
+    // re-parented to the new previous item, so the chain never dangles.
+    const itemAt = thread.items.findIndex((it) => it.index === index);
+    if (itemAt !== -1) {
+      thread.items.splice(itemAt, 1);
+      if (thread.items[itemAt]) {
+        thread.items[itemAt].parentId = itemAt > 0 ? thread.items[itemAt - 1].id : null;
+      }
+    }
+    for (const it of thread.items) {
+      if (typeof it.index === 'number' && it.index > index) it.index -= 1;
+    }
+    refreshThreadPanel();
     removeOutlineWithFade(removed.outlineEl);
     if (!state.elements.length) {
       state.activeIndex = -1;
@@ -4201,6 +4747,9 @@
 
   function addChat() {
     if (!pending) return;
+    // F8: capture the edit flag before pending is cleared; the committed
+    // instruction is one thread item (edit = update in place, new = reply).
+    const wasEdit = !!pending.isEdit;
     // The instruction field is the inspector textarea in element mode (the
     // chat card is annotate-note only); fall back to the card input.
     const src = (inspInput && inspPanel && !inspPanel.hidden) ? inspInput : chatInput;
@@ -4225,6 +4774,9 @@
     if (INTENTS.indexOf(metaDesc.intent) === -1) delete metaDesc.intent;
     if (SEVERITIES.indexOf(metaDesc.severity) === -1) delete metaDesc.severity;
     pending = null;
+    // F8: the committed instruction becomes (or updates) one thread item.
+    threadCommit(committedIndex, instr, wasEdit);
+    refreshThreadPanel();
     if (chatInput) chatInput.value = '';
     if (inspInput) inspInput.value = state.elements[committedIndex].descriptor.instruction || '';
     if (inspInput) inspInput.focus(); // inspector stays open for the next element
@@ -4419,11 +4971,38 @@
     // Only Escape and the Enter shortcuts (chat card / inspector instruction
     // field) are global actions.
     if (fromUi && e.key !== 'Escape' && !chatEnter && !inspEnter) {
+      // F9: arrow keys move focus between the surface buttons when one of
+      // them has focus (Tab already works natively; the guard below stops
+      // propagation, not default actions). Home/End are not handled: Tab
+      // covers the full cycle.
+      if (selSurface && !selSurface.hidden
+        && (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+        const btns = Array.prototype.slice.call(selSurface.querySelectorAll('.comet-sel-act'));
+        const idx = e.target && btns.indexOf(e.target);
+        if (idx !== -1 && btns.length > 1) {
+          const dir = (e.key === 'ArrowRight' || e.key === 'ArrowDown') ? 1 : -1;
+          const next = btns[(idx + dir + btns.length) % btns.length];
+          e.preventDefault();
+          if (next) next.focus();
+          return;
+        }
+      }
       // Block host-page shortcuts (capture-phase window listeners run before
       // the shadow-root bubble guard at bindEvents). stopImmediatePropagation
       // without preventDefault: the field still receives the character, the
       // page never sees the key.
       e.stopImmediatePropagation();
+      return;
+    }
+
+    // F9: Escape dismisses the text-selection quick-action surface first,
+    // before any mode-specific handling, and never leaks to the page while
+    // the surface is up (stopImmediatePropagation + preventDefault). A
+    // second Escape then runs the normal chat/inspector cancel paths.
+    if (selSurface && !selSurface.hidden && e.key === 'Escape') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      hideSelSurface();
       return;
     }
 
@@ -4455,6 +5034,407 @@
       e.preventDefault();
       cancelChat();
     }
+  }
+
+  /* ---------------- text-selection quick actions (F9) ----------------
+   * Browser-native page text selection opens ONE compact quick-action
+   * surface with Note / Ask AI / Highlight. Capture reads the live page
+   * selection into a schema v1.9 textQuote descriptor (normalized quote
+   * plus bounded prefix/suffix context, caps mirrored from the hub).
+   * Restore is deterministic: exact normalized quote match first, then a
+   * UNIQUE contextual fallback using the stored prefix/suffix; ambiguous
+   * or missing matches stay unresolved (ghost marker at the prior rect),
+   * never a guessed element. Excluded selections (password/input fields,
+   * the extension's own closed shadow UI) produce no surface. The pure
+   * functions here are the mechanism gate fixtures: they execute the
+   * shipped bytes verbatim. */
+
+  // Normalize page text for quote matching: collapse every whitespace run
+  // (including newlines and non-breaking spaces) to one space and trim.
+  function normalizeQuoteText(s) {
+    return String(s == null ? '' : s)
+      .replace(/\u00a0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  // Apply the schema v1.9 textQuote caps. quote must end up non-empty and
+  // within SEL_MAX_QUOTE; prefix/suffix within SEL_MAX_CONTEXT. The result
+  // always carries the three keys so consumers can rely on the shape.
+  function capQuote(quote, prefix, suffix) {
+    return {
+      quote: normalizeQuoteText(quote).slice(0, SEL_MAX_QUOTE),
+      prefix: normalizeQuoteText(prefix).slice(0, SEL_MAX_CONTEXT),
+      suffix: normalizeQuoteText(suffix).slice(0, SEL_MAX_CONTEXT),
+    };
+  }
+
+  // Bounded raw context around a selection inside ONE text node. start/end
+  // are offsets into `text`; at most SEL_CONTEXT_SAMPLE characters per side
+  // are sampled (the schema cap is applied later by capQuote).
+  function quoteContextOf(text, start, end) {
+    const full = String(text == null ? '' : text);
+    const s = Math.max(0, Math.min(full.length, start));
+    const e = Math.max(s, Math.min(full.length, end));
+    return {
+      prefix: full.slice(Math.max(0, s - SEL_CONTEXT_SAMPLE), s),
+      suffix: full.slice(e, Math.min(full.length, e + SEL_CONTEXT_SAMPLE)),
+    };
+  }
+
+  // Exclusion contract: a selection anchored inside a password/input field,
+  // text area, select, or the extension's own UI (closed shadow root) never
+  // produces a quick-action surface. Rich-editable page text stays eligible.
+  function selectionExcludedEl(el) {
+    if (!el || el.nodeType !== 1) return true;
+    const tag = String(el.tagName || '').toUpperCase();
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (shadow) {
+      try {
+        const root = el.getRootNode ? el.getRootNode() : null;
+        if (root === shadow) return true; // selection inside the extension UI
+      } catch (_) { /* ok */ }
+    }
+    return false;
+  }
+
+  // Build the schema v1.9 textQuote descriptor from the live page selection.
+  // Null when there is no usable selection: collapsed, whitespace-only, or
+  // anchored inside an excluded element.
+  function quoteFromSelection() {
+    let sel = null;
+    try { sel = window.getSelection(); } catch (_) { sel = null; }
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+    const range = sel.getRangeAt(0);
+    if (!range || range.collapsed) return null;
+    const anchorEl = (sel.anchorNode && sel.anchorNode.nodeType === 1)
+      ? sel.anchorNode
+      : (sel.anchorNode && sel.anchorNode.parentElement ? sel.anchorNode.parentElement : null);
+    if (selectionExcludedEl(anchorEl)) return null;
+    let quote = '';
+    let prefix = '';
+    let suffix = '';
+    try {
+      quote = range.toString();
+      if (range.startContainer && range.startContainer.nodeType === 3
+        && range.endContainer === range.startContainer) {
+        // Single text node: context comes from the node's own data.
+        const ctx = quoteContextOf(range.startContainer.data, range.startOffset, range.endOffset);
+        prefix = ctx.prefix;
+        suffix = ctx.suffix;
+      } else {
+        // Multi-node selection: bounded context from the enclosing text.
+        let anc = range.commonAncestorContainer;
+        if (anc && anc.nodeType === 3) anc = anc.parentElement;
+        if (anc && anc.nodeType === 1) {
+          const q = normalizeQuoteText(quote);
+          const txt = String(anc.textContent || '');
+          const rel = q ? txt.indexOf(q) : -1;
+          if (rel !== -1) {
+            const ctx = quoteContextOf(txt, rel, rel + q.length);
+            prefix = ctx.prefix;
+            suffix = ctx.suffix;
+          }
+        }
+      }
+    } catch (_) {
+      try { quote = sel.toString(); } catch (_2) { quote = ''; }
+    }
+    const capped = capQuote(quote, prefix, suffix);
+    if (!capped.quote) return null;
+    return capped;
+  }
+
+  // All non-empty text segments of the page (bounded walk). A segment is one
+  // text node with its normalized form; the walk stops at SEL_MAX_SCAN_NODES
+  // so hostile or huge pages cannot stall restore.
+  function pageQuoteSegments(rootDoc) {
+    const out = [];
+    if (!rootDoc) return out;
+    const showText = (typeof NodeFilter !== 'undefined' && NodeFilter.SHOW_TEXT)
+      ? NodeFilter.SHOW_TEXT : 4;
+    let walker = null;
+    try {
+      walker = rootDoc.createTreeWalker
+        ? rootDoc.createTreeWalker(rootDoc.body || rootDoc.documentElement || rootDoc, showText)
+        : null;
+    } catch (_) { walker = null; }
+    if (!walker) return out;
+    let node = walker.nextNode();
+    let n = 0;
+    while (node && n < SEL_MAX_SCAN_NODES) {
+      const raw = node.data || '';
+      const norm = normalizeQuoteText(raw);
+      if (norm) out.push({ node, raw, norm });
+      n += 1;
+      node = walker.nextNode();
+    }
+    return out;
+  }
+
+  // Deterministic quote restore over segments ({node, raw, norm}):
+  //   pass 1 - exact normalized containment (one winner -> exact);
+  //   pass 2 - unique contextual fallback with the stored prefix/suffix
+  //            (one winner -> fallback);
+  //   else    - ambiguous (several candidates, context cannot disambiguate)
+  //            or unresolved (no candidate). Ambiguous and unresolved are
+  //            never guessed.
+  function restoreQuoteMatch(quote, prefix, suffix, segments) {
+    const q = normalizeQuoteText(quote);
+    if (!q || !Array.isArray(segments)) {
+      return { resolution: 'unresolved', segment: null, confidence: 0 };
+    }
+    const exact = [];
+    for (const seg of segments) {
+      if (!seg || typeof seg.norm !== 'string') continue;
+      if (seg.norm.indexOf(q) !== -1) exact.push(seg);
+    }
+    if (exact.length === 1) {
+      return { resolution: 'exact', segment: exact[0], confidence: 1 };
+    }
+    if (exact.length === 0) {
+      return { resolution: 'unresolved', segment: null, confidence: 0 };
+    }
+    const p = normalizeQuoteText(prefix);
+    const s = normalizeQuoteText(suffix);
+    const contextual = [];
+    for (const seg of exact) {
+      const at = seg.norm.indexOf(q);
+      if (at === -1) continue;
+      const before = seg.norm.slice(0, at);
+      const after = seg.norm.slice(at + q.length);
+      const pOk = !p || before.endsWith(p) || before.indexOf(p) !== -1;
+      const sOk = !s || after.startsWith(s) || after.indexOf(s) !== -1;
+      if (pOk && sOk) contextual.push(seg);
+    }
+    if (contextual.length === 1) {
+      return { resolution: 'fallback', segment: contextual[0], confidence: 0.85 };
+    }
+    return { resolution: 'ambiguous', segment: null, confidence: 0 };
+  }
+
+  // The live element the selection belongs to (common ancestor of the
+  // range). Null when the selection is gone or anchored in excluded UI; the
+  // Ask AI / Highlight flows then fall back to an unresolved descriptor.
+  function quoteAnchorElement() {
+    try {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+      const range = sel.getRangeAt(0);
+      let anc = range.commonAncestorContainer;
+      if (anc && anc.nodeType === 3) anc = anc.parentElement;
+      if (anc && anc.nodeType === 1 && !selectionExcludedEl(anc)) return anc;
+      return null;
+    } catch (_) { return null; }
+  }
+
+  // Element descriptor for the quote flows (Ask AI / Highlight). Carries
+  // the schema v1.9 per-element textQuote; the quoteMarker flag and any
+  // quote-resolution bookkeeping are extension-internal and stripped in
+  // descriptorForPayload so the shipped payload stays schema-clean.
+  function quoteDescriptor(q) {
+    const el = quoteAnchorElement();
+    let css = '';
+    let rect = null;
+    if (el) {
+      try { css = cssPath(el); } catch (_) { css = ''; }
+      try { rect = normalizedRectOf(el); } catch (_) { rect = null; }
+    }
+    let href = '';
+    let ariaLabel = '';
+    if (el) {
+      try { href = String(el.getAttribute ? (el.getAttribute('href') || '') : ''); } catch (_) { href = ''; }
+      try { ariaLabel = String(el.getAttribute ? (el.getAttribute('aria-label') || '') : ''); } catch (_) { ariaLabel = ''; }
+    }
+    return {
+      index: state.nextIndex++,
+      tag: el ? String(el.tagName || '').toLowerCase() : 'text',
+      id: el ? String(el.id || '') : '',
+      className: el ? String(el.className || '') : '',
+      text: q.quote.slice(0, MAX_TEXT),
+      href,
+      ariaLabel,
+      cssPath: css,
+      rect,
+      instruction: '',
+      textQuote: q,
+      quoteMarker: true,
+    };
+  }
+
+  // Note: the selected text enters the note queue (queue-first, same as the
+  // annotate note card) and the top-level textQuote descriptor rides with
+  // the batch (schema v1.9 reserves it for quote-linked notes).
+  function selActionNote(q) {
+    const text = q.quote.slice(0, MAX_TEXT);
+    if (!text) return;
+    selTopQuote = q;
+    state.annotNote = text;
+    state.annotNotes.push(text);
+    if (state.annotNotes.length > 20) state.annotNotes.splice(0, state.annotNotes.length - 20);
+    updateNoteCount();
+    persistDraft(); // F3: queued notes survive refresh
+  }
+
+  // Ask AI: opens the EXISTING instruction flow (inspector) with a quote
+  // descriptor staged for Add. Never auto-sends: the user writes the
+  // instruction and presses Add (or cancels).
+  function selActionAsk(q) {
+    const desc = quoteDescriptor(q);
+    openChat(desc, quoteAnchorElement(), false, -1);
+    if (inspInput) inspInput.focus();
+  }
+
+  // Highlight: immediate visual quote marker - a committed element entry
+  // carrying the per-element textQuote, with the standard numbered outline.
+  // Additive like shift-click; the batch ships it like any element.
+  function selActionHighlight(q) {
+    const desc = quoteDescriptor(q);
+    const outlineEl = createOutline(desc.index);
+    state.elements.push({ descriptor: desc, el: quoteAnchorElement(), outlineEl });
+    state.activeIndex = state.elements.length - 1;
+    updateCount();
+    updateSelectionPulse();
+    positionSelections();
+    persistDraft(); // F3: committed markers survive refresh
+  }
+
+  // The canonical quote-state clear (Clear All / confirmed Send / teardown).
+  // Returns the reset state object so the mechanism is testable without
+  // DOM access; the surface DOM hide is a separate call.
+  function clearSelQuoteState() {
+    selTopQuote = null;
+    selPendingQuote = null;
+    return { topQuote: null, pendingQuote: null };
+  }
+
+  function collapseSelection() {
+    try {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed) sel.removeAllRanges();
+    } catch (_) { /* ok */ }
+  }
+
+  function hideSelSurface() {
+    if (!selSurface) return;
+    selSurface.hidden = true;
+  }
+
+  function showSelSurface(q) {
+    if (!selSurface) return;
+    selSurfaceQuote = q;
+    selSurface.hidden = false;
+    positionSelSurface();
+    if (gsapReady && !isReducedMotion()) {
+      gsapEnter(selSurface, { duration: 0.18, from: { opacity: 0, y: 6, scale: 0.96 } });
+    }
+  }
+
+  // Position the surface below the selection rect, clamped to the viewport;
+  // flips above the selection when there is no room below.
+  function positionSelSurface() {
+    if (!selSurface || selSurface.hidden) return;
+    let rect = null;
+    try {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.rangeCount) {
+        rect = sel.getRangeAt(0).getBoundingClientRect();
+      }
+    } catch (_) { rect = null; }
+    const w = selSurface.offsetWidth || 230;
+    const h = selSurface.offsetHeight || 34;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    let x;
+    let y;
+    if (rect && rect.width > 0) {
+      x = Math.round(Math.min(vw - w - 8, Math.max(8, rect.left + rect.width / 2 - w / 2)));
+      y = rect.bottom + 8;
+      if (y + h > vh - 8 && rect.top - h - 8 > 0) y = rect.top - h - 8;
+      y = Math.round(Math.min(vh - h - 8, Math.max(8, y)));
+    } else {
+      x = Math.round(vw - w - 12);
+      y = Math.round(vh - h - 12);
+    }
+    selSurface.style.left = x + 'px';
+    selSurface.style.top = y + 'px';
+  }
+
+  // One rAF-throttled refresh: show the surface when a valid selection
+  // exists, hide it otherwise. Also the entry point exposed to the harness.
+  function refreshSelSurface() {
+    if (selSurfaceRaf) { cancelAnimationFrame(selSurfaceRaf); selSurfaceRaf = 0; }
+    const q = quoteFromSelection();
+    if (!q) {
+      hideSelSurface();
+      selSurfaceQuote = null;
+      return;
+    }
+    showSelSurface(q);
+  }
+
+  function scheduleSelSurfaceCheck() {
+    if (selSurfaceRaf) cancelAnimationFrame(selSurfaceRaf);
+    selSurfaceRaf = requestAnimationFrame(() => {
+      selSurfaceRaf = 0;
+      refreshSelSurface();
+    });
+  }
+
+  function onSelMouseUp(e) {
+    if (!host || !host.parentNode) return;
+    // Interaction inside our own UI never re-triggers the surface. A press
+    // on the surface itself is consumed by its mousedown snapshot + click
+    // handler (the mouseup/click arrive after the page selection has been
+    // collapsed, so the surface must stay up for the click to act).
+    if (e && e.composedPath && e.composedPath().indexOf(host) !== -1) {
+      if (!(selSurface && e.composedPath().indexOf(selSurface) !== -1)) hideSelSurface();
+      return;
+    }
+    scheduleSelSurfaceCheck();
+  }
+
+  function onSelKeyUp(e) {
+    // Keyboard selection (Shift+arrows) also opens the surface.
+    if (e.key === 'Shift' || e.key.indexOf('Arrow') === 0) scheduleSelSurfaceCheck();
+  }
+
+  function onSelChange() {
+    if (!selSurface || selSurface.hidden) return;
+    // A press on the surface itself collapses the page selection before the
+    // click handler runs; the mousedown snapshot already captured the quote,
+    // so do not dismiss here (do not rely on focus: Safari buttons do not
+    // take focus on click).
+    if (selPendingQuote) return;
+    const q = quoteFromSelection();
+    if (!q || (selSurfaceQuote && q.quote !== selSurfaceQuote.quote)) {
+      hideSelSurface();
+      selSurfaceQuote = null;
+    } else {
+      positionSelSurface();
+    }
+  }
+
+  function onSelActionClick(e) {
+    const btn = e.target && e.target.closest ? e.target.closest('[data-sel-act]') : null;
+    if (!btn || !selSurface) return;
+    e.preventDefault();
+    e.stopPropagation();
+    // Consume the mousedown snapshot first (the press collapsed the page
+    // selection), then the surface's own snapshot; the live selection is a
+    // last resort for keyboard activation. The surface may already be
+    // hidden by the time the click lands - it was visible at press time.
+    const q = selPendingQuote || selSurfaceQuote || quoteFromSelection();
+    selPendingQuote = null;
+    if (!q) { hideSelSurface(); return; }
+    if (btn.dataset.selAct === 'note') selActionNote(q);
+    else if (btn.dataset.selAct === 'ask') selActionAsk(q);
+    else if (btn.dataset.selAct === 'highlight') selActionHighlight(q);
+    selActionCount += 1;
+    hideSelSurface();
+    collapseSelection();
+    diagLog('sel:' + btn.dataset.selAct,
+      'quote=' + q.quote.length + ' prefix=' + q.prefix.length + ' suffix=' + q.suffix.length);
   }
 
   /* ---------------- element inspector (v1.2) ---------------- */
@@ -6151,6 +7131,7 @@
     const on = !!pending;
     inspAddEl.disabled = !on;
     inspAddEl.classList.toggle('is-disabled', !on);
+    refreshThreadPanel(); // F8: thread history follows the active element
   }
 
   // Subtle radial glow that follows the cursor inside the panel bounds.
@@ -6536,6 +7517,9 @@
       }
     }
     updateSelectionPulse();
+    // F9: a mode switch dismisses any open quick-action surface (the quote
+    // capture is momentary; the picker/draw flows own the next interaction).
+    hideSelSurface();
   }
 
   function setAnnotate(on, opts) {
@@ -6617,6 +7601,8 @@
     updateSelectionPulse();
     redraw();
     clearDraft(); // F3: Clear All removes the persisted URL draft
+    threadReset(); // F8: Clear All starts a fresh thread
+    clearSelQuoteState(); // F9: Clear All drops the top-level quote too
   }
 
   /* ---------------- Freeze State Capture (schema v1.6) ---------------- */
@@ -6738,6 +7724,27 @@
     };
   }
 
+  // Schema v1.9 (F4): browser environment snapshot captured ONCE at send
+  // start (send() reads environmentPayload() a single time while building
+  // the payload). Every value is real observed state: ISO-8601 capturedAt,
+  // the page URL, the CSS-pixel viewport, user agent, language, device
+  // pixel ratio, and the current timezone offset in minutes. The snapshot
+  // is never re-read after send begins and never fabricated.
+  function environmentPayload() {
+    const now = new Date();
+    let capturedAt = now.toISOString();
+    if (typeof capturedAt !== 'string' || !capturedAt) capturedAt = '';
+    return {
+      capturedAt: capturedAt,
+      url: String(location.href || ''),
+      viewport: { w: window.innerWidth, h: window.innerHeight },
+      userAgent: String(navigator.userAgent || ''),
+      language: String(navigator.language || ''),
+      devicePixelRatio: typeof window.devicePixelRatio === 'number' ? window.devicePixelRatio : 1,
+      timezoneOffsetMinutes: now.getTimezoneOffset(),
+    };
+  }
+
   // Return the visible union in CSS pixels. The service worker applies dpr
   // when it crops the captured bitmap, so this function never scales x/y/w/h.
   function computeCaptureRect(entries) {
@@ -6843,6 +7850,17 @@
     } else {
       delete d.anchor;
     }
+    // F9: quote markers ship their schema v1.9 textQuote (canonical, capped)
+    // but NEVER their extension-internal bookkeeping (quoteMarker flag,
+    // quote-resolution stamp) - the hub would store them, and they carry no
+    // contract. Stripped here so the payload stays schema-clean.
+    if (d.textQuote && typeof d.textQuote === 'object' && !Array.isArray(d.textQuote)) {
+      d.textQuote = capQuote(d.textQuote.quote, d.textQuote.prefix, d.textQuote.suffix);
+    } else {
+      delete d.textQuote;
+    }
+    delete d.quoteMarker;
+    delete d.quote;
     return d;
   }
 
@@ -6989,6 +8007,23 @@
     sendBusy = true;
     if (button) playMotion(button, 'send-press', 100);
     startSendPulse(button);
+    // Schema v1.9 (F4): capture the browser environment ONCE at send start
+    // so the stored annotation carries agent-ready context (capturedAt,
+    // url, viewport, userAgent, language, devicePixelRatio, timezone
+    // offset). Every new send includes env; legacy sends now carry it too.
+    const envSnapshot = environmentPayload();
+    // F8: an invalid thread chain is rejected BEFORE send (a reply must
+    // point at an existing item in the same thread; cycles and cross-thread
+    // parents never reach the hub). The hub re-validates on store.
+    const threadValidation = threadValidateItems(thread.items, []);
+    if (!threadValidation.ok) {
+      setStatus('Thread invalid: ' + threadValidation.error, 'err');
+      diagLog('send:blocked', 'thread=' + threadValidation.error);
+      sendFeedback(button, false);
+      endSendPulse(false);
+      sendBusy = false;
+      return;
+    }
     let label = '';
     try {
       const got = await chrome.storage.local.get('contextLabel');
@@ -7000,6 +8035,8 @@
       title: document.title || '',
       viewport: { w: window.innerWidth, h: window.innerHeight },
       label: label.slice(0, MAX_TEXT),
+      // Schema v1.9 (F4): env snapshot captured once at send start.
+      env: envSnapshot,
       // Committed annotation notes from the chat card note mode (annotate
       // tool). 'note' stays for backward compatibility (queue joined, capped);
       // 'notes' ships the full queue (each entry capped).
@@ -7010,7 +8047,22 @@
       strokes: state.strokes.map((s) => ({ color: s.color, width: s.width, points: s.points })),
       // v1.4: every selected descriptor carries its own instruction + edits.
       elements: state.elements.map(descriptorForPayload),
+      // F9: the quote-linked note's textQuote descriptor ships at the top
+      // level (schema v1.9); quote markers carry their own per-element
+      // textQuote via descriptorForPayload. Omitted when no quote action
+      // was taken, so legacy sends stay byte-compatible.
     };
+    if (selTopQuote) payload.textQuote = selTopQuote;
+    // F8: thread identity on the annotation. The batch belongs to the
+    // page-context thread (top-level threadId, schema v1.9); when it
+    // continues a thread that already shipped, parentId references the
+    // stored annotation id of the nearest sent ancestor so the hub thread
+    // route can replay root + replies in order.
+    if (thread.id && thread.items.length) {
+      payload.threadId = thread.id;
+      const parentId = threadPayloadParentId();
+      if (parentId) payload.parentId = parentId;
+    }
     const captureRect = computeCaptureRect(state.elements);
     if (captureRect) payload.captureRect = captureRect;
     diagLastCaptureRect = captureRect;
@@ -7109,6 +8161,12 @@
       updateSelectionPulse();
       redraw();
       clearDraft(); // F3: draft clears ONLY after a confirmed successful POST
+      // F9: the quote-linked note ships with the batch, then resets so the
+      // next batch starts without a stale top-level textQuote.
+      clearSelQuoteState();
+      // F8: stamp the stored annotation id on every shipped thread item so
+      // the next send carries a valid parentId (fire-and-forget).
+      threadLearnSentId();
       // Nothing left to send: let the button collapse away after 2.5s.
       sendHideTimer = setTimeout(hideSendButton, 2500);
     } else {
@@ -7317,6 +8375,7 @@
     inspSelectionCountEl = null;
     inspSelectionList = null;
     inspResetAllBtn = null;
+    inspThreadEl = null;
     inspInput = null;
     modeToggle = null;
     modePill = null;
@@ -7327,6 +8386,15 @@
     sendHideTimer = 0;
     if (sendHideDoneTimer) clearTimeout(sendHideDoneTimer);
     sendHideDoneTimer = 0;
+    // F9: quote state dies with the host (the surface DOM is gone; the
+    // top-level quote and the action counter reset for the next inject).
+    if (selSurfaceRaf) { cancelAnimationFrame(selSurfaceRaf); selSurfaceRaf = 0; }
+    selSurface = null;
+    selSurfaceQuote = null;
+    selPendingQuote = null;
+    selTopQuote = null;
+    selActionCount = 0;
+    selListenersBound = false;
     sendBusy = false;
     if (collapseTimer) clearTimeout(collapseTimer);
     collapseTimer = 0;
@@ -7361,7 +8429,12 @@
   }
 
   // Full exit: animate the host out, then remove it and all listeners.
-  function fullExit() {
+  // opts.routeOptOut (F10): the exit was forced by an opted-out route, so
+  // deactivation must NOT persist - the user did not ask to disable the
+  // tool, and leaving the route permits the existing manual or session
+  // always-on activation model again.
+  function fullExit(opts) {
+    const routeOptOut = !!(opts && opts.routeOptOut);
     if (exitTimer) return;
     // Freeze State Capture: unfreeze immediately so the page keeps running
     // during the exit animation (teardownHost also calls removeFreeze, so
@@ -7416,6 +8489,12 @@
     window.removeEventListener('mousedown', onPageMouseDown, true);
     window.removeEventListener('click', onPageClick, true);
     window.removeEventListener('keydown', onKeyDown, true);
+    // F9: remove the selection quick-action listeners (surface element dies
+    // with the host; its own listeners go with it).
+    window.removeEventListener('mouseup', onSelMouseUp);
+    window.removeEventListener('keyup', onSelKeyUp);
+    document.removeEventListener('selectionchange', onSelChange);
+    selListenersBound = false;
     window.removeEventListener('pointerup', endDrag);
     window.removeEventListener('mouseup', endDrag);
     document.removeEventListener('scroll', repositionAll, true);
@@ -7424,10 +8503,12 @@
     window.removeEventListener('pagehide', onPageHide); // exiting never writes a draft
     window.removeEventListener('popstate', onHistoryChange);
     window.removeEventListener('hashchange', onHistoryChange);
-    saveTabState({ enabled: false }); // deactivation persists per tab
-    try {
-      chrome.storage.local.set({ toolEnabled: false }); // master switch stays off across refreshes
-    } catch (_) { /* storage unavailable */ }
+    if (!routeOptOut) {
+      saveTabState({ enabled: false }); // deactivation persists per tab
+      try {
+        chrome.storage.local.set({ toolEnabled: false }); // master switch stays off across refreshes
+      } catch (_) { /* storage unavailable */ }
+    }
 
     // Premium smooth-out: reverse of the toolbar entrance. The whole host
     // (toolbar + chip + card) scales 0.98 -> 0.92 toward the toolbar's
@@ -7476,6 +8557,18 @@
       teardownHost();
     }
     if (host && host.parentNode) return; // already active
+    // Route opt-outs (F10): an opted-out route refuses activation, including
+    // programmatic enable. A storage failure must not lock the tool out.
+    try {
+      const optOuts = await storedRouteOptOuts();
+      routeOptOutsCount = optOuts.length;
+      if (routeMatchesHref(optOuts, location.href)) {
+        lastRouteMatched = true;
+        diagLog('route:block', 'reinject refused: url=' + location.href + ' optOuts=' + optOuts.length);
+        return;
+      }
+      lastRouteMatched = false;
+    } catch (_) { /* proceed: route guard must not lock the tool out */ }
     try {
       updateMotionPreference();
       buildUI();
@@ -7568,6 +8661,19 @@
         sendResponse({ ok: true, enabled: !!(host && host.parentNode) });
       } catch (_) { /* ok */ }
       return false;
+    }
+    if (msg.type === 'browserlinkGetRoute') {
+      // Service worker asks whether THIS page sits on an opted-out route
+      // (used when the tab URL is unavailable to the background). Dormant
+      // pages answer too: the listener survives exit.
+      storedRouteOptOuts().then((optOuts) => {
+        try {
+          sendResponse({ ok: true, routeMatched: routeMatchesHref(optOuts, location.href) });
+        } catch (_) { /* ok */ }
+      }).catch(() => {
+        try { sendResponse({ ok: true, routeMatched: false }); } catch (_) { /* ok */ }
+      });
+      return true; // async sendResponse
     }
     if (msg.type === 'browserlinkToggle') {
       if (msg.enabled === true) reinject();
@@ -7746,6 +8852,19 @@
       '<div class="comet-selection-head"><span class="comet-selection-count">0 selected</span></div>' +
       '<div class="comet-selection-list"></div>' +
       '<div class="comet-insp-rows"></div>' +
+      // F8: element thread panel - the ordered reply history of committed
+      // element instructions (root first, replies after). Append-only:
+      // committing the next element instruction adds the next reply. The
+      // instruction field below is preserved as the first instruction field.
+      '<div class="comet-thread" hidden>' +
+      '  <div class="comet-thread-head">' +
+      '    <span class="comet-thread-title">Thread</span>' +
+      '    <span class="comet-thread-id"></span>' +
+      '    <span class="comet-thread-count"></span>' +
+      '  </div>' +
+      '  <div class="comet-thread-list"></div>' +
+      '  <div class="comet-thread-hint">Append-only: commit the next element instruction to reply.</div>' +
+      '</div>' +
       '<div class="comet-insp-foot">' +
       '  <div class="comet-insp-foot-meta">' +
       '    <span class="comet-insp-count">0 edits</span>' +
@@ -7786,6 +8905,29 @@
     sentToastEl.hidden = true;
     sentToastEl.textContent = 'Sent ✓';
 
+    // F9: ONE compact text-selection quick-action surface (Note / Ask AI /
+    // Highlight). Hidden by default; shown on a valid page selection and
+    // repositioned over the selection rect. pointer-events opt in on the
+    // host (the host itself is pointer-events:none).
+    selSurface = document.createElement('div');
+    selSurface.className = 'comet-sel-actions';
+    selSurface.setAttribute('role', 'toolbar');
+    selSurface.setAttribute('aria-label', 'Text selection actions');
+    selSurface.hidden = true;
+    selSurface.innerHTML =
+      '<button type="button" class="comet-sel-act" data-sel-act="note" title="Queue the selected text as a quote-linked note">Note</button>' +
+      '<button type="button" class="comet-sel-act" data-sel-act="ask" title="Ask AI about the selected text (opens the instruction flow)">Ask AI</button>' +
+      '<button type="button" class="comet-sel-act" data-sel-act="highlight" title="Store a visual quote marker for the selected text">Highlight</button>';
+    // Snapshot the quote at mousedown: the press collapses the page
+    // selection BEFORE the click handler runs, so the action must not read
+    // the live selection at click time.
+    selSurface.addEventListener('mousedown', (e) => {
+      if (selSurface && !selSurface.hidden) {
+        selPendingQuote = selSurfaceQuote || quoteFromSelection();
+      }
+      e.stopPropagation();
+    });
+
     shadow.appendChild(toolbar);
     shadow.appendChild(chipEl);
     shadow.appendChild(selLayer);
@@ -7794,6 +8936,7 @@
     shadow.appendChild(canvas);
     shadow.appendChild(chatCard);
     shadow.appendChild(inspPanel);
+    shadow.appendChild(selSurface);
     shadow.appendChild(sentToastEl);
 
     // Diagnostics overlay (Ctrl+Shift+D to toggle). Sits inside the shadow
@@ -7827,6 +8970,7 @@
     chatHead = chatCard.querySelector('.comet-chat-head');
     chatInput = chatCard.querySelector('.comet-chat-input');
     inspRows = inspPanel.querySelector('.comet-insp-rows');
+    inspThreadEl = inspPanel.querySelector('.comet-thread');
     inspCountEl = inspPanel.querySelector('.comet-insp-count');
     inspSelectionCountEl = inspPanel.querySelector('.comet-selection-count');
     inspSelectionList = inspPanel.querySelector('.comet-selection-list');
@@ -7980,6 +9124,9 @@
         '.comet-diag-body{flex:1;overflow:auto;max-height:calc(40vh - 30px);margin:0;padding:8px;' +
         'white-space:pre-wrap;word-break:break-word;color:#9aa0a6;}';
     }
+    // F8: thread panel styles appended in BOTH paths (overlay.css or the
+    // fallback), keeping the thread UI self-contained in content.js.
+    css += THREAD_PANEL_CSS;
     style.textContent = css;
     shadow.appendChild(style);
   }
@@ -8078,6 +9225,14 @@
       inspPanel.addEventListener('pointerleave', onInspPointerLeave);
     }
     if (inspDockEl) inspDockEl.addEventListener('click', onDockClick);
+    // F9: text-selection quick actions. Exactly ONE listener set per page
+    // context: surface clicks + the mouseup/keyup/selectionchange trio that
+    // drives surface show/hide. All are removed in fullExit.
+    if (selSurface) selSurface.addEventListener('click', onSelActionClick);
+    window.addEventListener('mouseup', onSelMouseUp);
+    window.addEventListener('keyup', onSelKeyUp);
+    document.addEventListener('selectionchange', onSelChange);
+    selListenersBound = true;
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mousedown', onPageMouseDown, true);
     window.addEventListener('click', onPageClick, true);
@@ -8148,6 +9303,21 @@
         // Deactivation persists: stay off until the popup re-enables.
         saveTabState({ enabled: false });
         diagLog('init:skip', 'disabled by master switch');
+        return;
+      }
+      // Route opt-outs (F10): an opted-out route stays dormant even when the
+      // master switch is on and the session always-on flag is set. Per-tab
+      // state is left untouched so leaving the route (or a later refresh on
+      // an allowed route) falls back to the existing activation model.
+      let routeOptedOut = false;
+      try {
+        const optOuts = await storedRouteOptOuts();
+        routeOptOutsCount = optOuts.length;
+        routeOptedOut = routeMatchesHref(optOuts, location.href);
+      } catch (_) { routeOptedOut = false; }
+      lastRouteMatched = routeOptedOut;
+      if (routeOptedOut) {
+        diagLog('init:skip', 'route opt-out: url=' + location.href + ' optOuts=' + routeOptOutsCount);
         return;
       }
       // Session always-on (F6): a freshly loaded page with no per-tab state
@@ -8293,6 +9463,52 @@
       get onboarded() { return onboardedFlag; },
       get alwaysOn() { return onboardingAlwaysOn; },
       get tourSuppressed() { return tourSuppressed; },
+      // Element threads (F8): harness hooks for the thread validator and
+      // identity chain (the mechanism gate drives these with root, reply,
+      // cycle, cross-thread, restore, unresolved, and cap fixtures).
+      threadReset,
+      threadCommit,
+      threadValidateItems,
+      threadPayloadParentId,
+      get threadId() { return thread.id; },
+      get threadItems() { return thread.items.map((it) => Object.assign({}, it)); },
+      get threadCount() { return thread.items.length; },
+      // Text-selection quick actions (F9): harness hooks. The mechanism
+      // gate drives normalizeQuoteText / capQuote / quoteContextOf /
+      // selectionExcludedEl / restoreQuoteMatch with exact, normalized,
+      // ambiguous, input-exclusion, cap, draft-restore, and clear fixtures;
+      // quoteFromSelection / pageQuoteSegments / refreshSelSurface /
+      // clearSelQuoteState are the DOM-coupled paths used behaviorally.
+      normalizeQuoteText,
+      capQuote,
+      quoteContextOf,
+      selectionExcludedEl,
+      quoteFromSelection,
+      restoreQuoteMatch,
+      pageQuoteSegments,
+      quoteAnchorElement,
+      refreshSelSurface,
+      hideSelSurface,
+      clearSelQuoteState,
+      get selSurfaceVisible() { return !!(selSurface && !selSurface.hidden); },
+      get selSurfaceQuote() { return selSurfaceQuote ? Object.assign({}, selSurfaceQuote) : null; },
+      get selTopQuote() { return selTopQuote ? Object.assign({}, selTopQuote) : null; },
+      get selActionCount() { return selActionCount; },
+      get selListenersBound() { return selListenersBound; },
+      get selMarkerCount() {
+        return state.elements.filter((en) => en.descriptor && en.descriptor.quoteMarker).length;
+      },
+      // Route opt-outs (F10): harness hooks for the mechanism gate's route
+      // normalization, match, and transition fixtures (the gate also
+      // extracts these functions verbatim from the shipped file).
+      normalizeRoutePattern,
+      routeEntryParts,
+      routeMatchesHref,
+      routeTransitionAction,
+      storedRouteOptOuts,
+      checkRouteForHistory,
+      get lastRouteMatched() { return lastRouteMatched; },
+      get routeOptOutsCount() { return routeOptOutsCount; },
     };
   }
 

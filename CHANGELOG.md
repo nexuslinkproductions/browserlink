@@ -4,6 +4,35 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [2.7.0] - 2026-08-12
+
+### Added
+
+- **Element threads and webhook handoff (F8)** - committed element
+  instructions now form an ordered, append-only reply thread instead of
+  single-turn records. The first instruction in a page context mints a
+  stable thread id (schema v1.9 `threadId`); every later committed
+  instruction is a reply whose `parentId` references the previous item, and
+  the element inspector visibly lists the whole thread chronologically
+  (root first, replies after) with the existing instruction field preserved
+  as the reply composer. The thread history survives refresh via the
+  existing draft store (capped at 20 items, instructions at 500
+  characters) and keeps its data on unresolved anchors. When a send
+  continues a thread that already shipped, the annotation carries
+  `parentId` = the stored id of the nearest sent ancestor, so a new
+  `GET /annotations/<name>/thread` route (plus `/annotations/latest/thread`)
+  replays the full thread in order. The hub validates every thread link on
+  store - a missing parent, a cross-thread parent, a `parentId` without
+  `threadId`, or a cycle in the parent chain is rejected with HTTP 400
+  before the annotation is persisted - while root and legacy annotations
+  store unchanged. Webhook delivery (`BROWSERLINK_WEBHOOK_URL`) now emits
+  one bounded `annotation.thread.v1` JSON event per annotation with the
+  annotation id, thread id, parent id, page URL, element selector, intent,
+  severity, instruction, reply text, and the local share URL, staying far
+  below the 1MB cap; legacy annotations deliver the same event with null
+  thread fields, and a webhook failure never blocks local storage or the
+  other adapters.
+
 ## [2.6.0] - 2026-08-12
 
 ### Added

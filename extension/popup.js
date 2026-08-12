@@ -45,6 +45,13 @@
  *   - Every button reports the outcome honestly: format and file name on
  *     success, absent screenshot, empty corpus, hub offline, or a
  *     cancelled/failed download on failure. Copy AI Brief is unchanged.
+ *   - Search (F7): a debounced full-text query against
+ *     <endpoint>/annotations?q=<term> recalls stored annotations by their
+ *     label, URL, title, notes, and element text or instruction. Each result
+ *     shows the page, a matching excerpt, and screenshot availability; the
+ *     status line distinguishes an empty corpus, no match, a malformed
+ *     response, and a hub that is offline, and reports how many corrupt
+ *     records the hub skipped.
  */
 'use strict';
 
@@ -789,6 +796,366 @@ async function downloadBackup() {
   }
 }
 
+/* ---- Search annotations (F7): debounced local full-text recall ---- */
+
+const SEARCH_DEBOUNCE_MS = 250;
+const SEARCH_RESULT_CAP = 8;
+let searchTimer = null;
+
+/* NFC-normalized lowercase text, mirroring the hub search normalization. */
+function searchFold(value) {
+  return String(value == null ? '' : value).normalize('NFC').toLowerCase();
+}
+
+/* The same searchable fields the hub indexes: label, URL, title, notes,
+ * the legacy joined note, and per-element text and instruction. */
+function annotationSearchBlob(ann) {
+  const parts = [];
+  if (ann && typeof ann === 'object') {
+    for (const key of ['label', 'url', 'title']) {
+      if (typeof ann[key] === 'string') parts.push(ann[key]);
+    }
+    if (Array.isArray(ann.notes)) {
+      for (const note of ann.notes) {
+        if (typeof note === 'string') parts.push(note);
+      }
+    }
+    if (typeof ann.note === 'string') parts.push(ann.note);
+    if (Array.isArray(ann.elements)) {
+      for (const el of ann.elements) {
+        if (!el || typeof el !== 'object') continue;
+        for (const key of ['text', 'instruction']) {
+          if (typeof el[key] === 'string') parts.push(el[key]);
+        }
+      }
+    }
+  }
+  return parts.join('\n');
+}
+
+/* A short window around the first q hit. Matching runs on the NFC-folded
+ * text so indices align with the normalized blob being sliced. */
+function makeExcerpt(blob, qLower) {
+  const normalized = blob.normalize('NFC');
+  const idx = normalized.toLowerCase().indexOf(qLower);
+  if (idx < 0) return '';
+  const from = Math.max(0, idx - 45);
+  const to = Math.min(normalized.length, idx + qLower.length + 70);
+  let excerpt = normalized.slice(from, to).replace(/\s+/g, ' ');
+  if (from > 0) excerpt = '… ' + excerpt;
+  if (to < normalized.length) excerpt = excerpt + ' …';
+  return excerpt;
+}
+
+async function runSearch() {
+  const input = $('searchInput');
+  const status = $('searchStatus');
+  const results = $('searchResults');
+  const q = (input.value || '').trim();
+  if (!q) {
+    status.textContent = '';
+    status.className = 'hint';
+    results.hidden = true;
+    results.textContent = '';
+    return;
+  }
+  status.textContent = 'searching…';
+  status.className = 'hint';
+  results.hidden = true;
+  let endpoint;
+  try {
+    endpoint = await resolveEndpoint();
+  } catch (_) {
+    status.textContent = 'Search unavailable: hub offline.';
+    status.className = 'hint err';
+    return;
+  }
+  try {
+    const res = await fetch(endpoint + '/annotations?q=' + encodeURIComponent(q));
+    if (!res.ok) {
+      status.textContent = 'Search failed: hub answered ' + res.status + '.';
+      status.className = 'hint err';
+      return;
+    }
+    let body = null;
+    try {
+      body = await res.json();
+    } catch (_) { body = null; }
+    if (!body || !Array.isArray(body.files)) {
+      status.textContent = 'Search failed: malformed response from hub.';
+      status.className = 'hint err';
+      return;
+    }
+    const files = body.files;
+    if (files.length === 0) {
+      // Distinguish an empty corpus from a no-match query.
+      let corpusCount = 0;
+      try {
+        const plain = await fetch(endpoint + '/annotations');
+        const plainBody = await plain.json();
+        if (plainBody && Array.isArray(plainBody.files)) corpusCount = plainBody.files.length;
+      } catch (_) { /* corpus probe is best-effort */ }
+      status.className = 'hint';
+      status.textContent = corpusCount === 0
+        ? 'No annotations stored yet.'
+        : 'No matches for "' + q + '".';
+      return;
+    }
+    const qLower = searchFold(q);
+    const items = [];
+    const cap = Math.min(files.length, SEARCH_RESULT_CAP);
+    for (let i = 0; i < cap; i++) {
+      const file = files[i];
+      if (!file || !file.name) continue;
+      let ann = null;
+      try {
+        const detail = await fetch(
+          endpoint + '/annotations/' + encodeURIComponent(String(file.name)),
+        );
+        if (detail.ok) ann = await detail.json();
+      } catch (_) { ann = null; }
+      if (!ann || typeof ann !== 'object') continue;
+      const blob = annotationSearchBlob(ann);
+      const page = String(ann.title || ann.url || file.name);
+      const excerpt = makeExcerpt(blob, qLower);
+      const hasShot = typeof ann.screenshotFile === 'string' && ann.screenshotFile.length > 0;
+      items.push({ name: String(file.name), page: page, excerpt: excerpt, hasShot: hasShot });
+    }
+    // Render with textContent only: stored annotations are untrusted.
+    results.textContent = '';
+    for (const item of items) {
+      const row = document.createElement('div');
+      row.className = 'search-item';
+      const page = document.createElement('p');
+      page.className = 'page';
+      page.textContent = item.page;
+      row.appendChild(page);
+      if (item.excerpt) {
+        const excerpt = document.createElement('p');
+        excerpt.className = 'excerpt';
+        excerpt.textContent = item.excerpt;
+        row.appendChild(excerpt);
+      }
+      const meta = document.createElement('p');
+      meta.className = item.hasShot ? 'meta shot' : 'meta';
+      meta.textContent = item.name + ' · ' + (item.hasShot ? 'screenshot' : 'no screenshot');
+      row.appendChild(meta);
+      results.appendChild(row);
+    }
+    status.className = 'hint';
+    status.textContent = files.length > cap
+      ? cap + ' of ' + files.length + ' matches shown.'
+      : files.length + ' match' + (files.length === 1 ? '' : 'es');
+    if (typeof body.skippedCorrupt === 'number' && body.skippedCorrupt > 0) {
+      status.textContent += ' · ' + body.skippedCorrupt + ' corrupt record' +
+        (body.skippedCorrupt === 1 ? '' : 's') + ' skipped';
+    }
+    results.hidden = false;
+  } catch (_) {
+    status.textContent = 'Search unavailable: hub offline.';
+    status.className = 'hint err';
+  }
+}
+
+function onSearchInput() {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(runSearch, SEARCH_DEBOUNCE_MS);
+}
+
+/* ---- Route opt-outs (F10): origin + pathname-prefix exclusion list ----
+ * The popup manages a local list of exact-origin plus pathname-prefix
+ * opt-outs in chrome.storage.local ("routeOptOuts"). Entries are
+ * canonicalized (default port removed, localhost mapped to 127.0.0.1,
+ * trailing slashes stripped); wildcards, query strings, fragments, and
+ * invalid URLs are rejected and never stored. The content script keeps
+ * opted-out routes dormant and exits an active host once when the SPA
+ * navigates into one; the service worker refuses programmatic enable on
+ * them. Matching functions are pure and identical to the content script's,
+ * so the mechanism gate can extract and drive them from either file. */
+const ROUTE_OPTOUTS_KEY = 'routeOptOuts'; // chrome.storage.local
+
+// Canonicalize an opt-out entry (see the content script for the exact
+// contract): 'scheme://host[:port][/path]', default port removed, host
+// lowercased, trailing slash stripped, query/fragment/wildcards rejected.
+function normalizeRoutePattern(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return null;
+  if (s.indexOf('*') !== -1) return null;
+  if (s.indexOf('?') !== -1 || s.indexOf('#') !== -1) return null;
+  let url = null;
+  try { url = new URL(s); } catch (_) { return null; }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  let host = url.hostname.toLowerCase();
+  if (host === 'localhost') host = '127.0.0.1';
+  const port = url.port;
+  const defaultPort =
+    (url.protocol === 'http:' && port === '80') ||
+    (url.protocol === 'https:' && port === '443');
+  const hostPort = defaultPort ? host : (port ? host + ':' + port : host);
+  let path = url.pathname || '';
+  while (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+  if (path === '/') path = '';
+  return url.protocol + '//' + hostPort + path;
+}
+
+// Split a canonical entry into {origin, prefix}. prefix '' matches every
+// path on the origin; a non-empty prefix is a pathname prefix.
+function routeEntryParts(canonical) {
+  const idx = canonical.indexOf('://');
+  if (idx < 0) return { origin: canonical, prefix: '' };
+  const rest = canonical.slice(idx + 3);
+  const slash = rest.indexOf('/');
+  if (slash < 0) return { origin: canonical, prefix: '' };
+  return { origin: canonical.slice(0, idx + 3) + rest.slice(0, slash), prefix: rest.slice(slash) };
+}
+
+// Does the href sit on an opted-out route? Exact-origin entries match every
+// path; origin + pathname-prefix entries match with a boundary check.
+function routeMatchesHref(optOuts, href) {
+  if (!Array.isArray(optOuts) || optOuts.length === 0) return false;
+  let current = null;
+  try { current = new URL(href); } catch (_) { return false; }
+  let host = current.hostname.toLowerCase();
+  if (host === 'localhost') host = '127.0.0.1';
+  const port = current.port;
+  const defaultPort =
+    (current.protocol === 'http:' && port === '80') ||
+    (current.protocol === 'https:' && port === '443');
+  const hostPort = defaultPort ? host : (port ? host + ':' + port : host);
+  const origin = current.protocol + '//' + hostPort;
+  const pathname = current.pathname || '/';
+  for (const entry of optOuts) {
+    const canonical = normalizeRoutePattern(entry);
+    if (!canonical) continue;
+    const parts = routeEntryParts(canonical);
+    if (parts.origin !== origin) continue;
+    if (parts.prefix === '') return true;
+    if (pathname === parts.prefix || pathname.startsWith(parts.prefix + '/')) return true;
+  }
+  return false;
+}
+
+function addRouteOptOut() {
+  const input = $('routeInput');
+  const status = $('routeStatus');
+  const raw = (input.value || '').trim();
+  if (!raw) {
+    status.textContent = 'Enter an origin, optionally with a path prefix.';
+    status.className = 'hint err';
+    return;
+  }
+  if (raw.indexOf('*') !== -1) {
+    status.textContent = 'Wildcards are not supported; use an exact origin plus an optional path prefix.';
+    status.className = 'hint err';
+    return;
+  }
+  if (raw.indexOf('?') !== -1 || raw.indexOf('#') !== -1) {
+    status.textContent = 'Query strings and fragments are not stored; use origin + path only.';
+    status.className = 'hint err';
+    return;
+  }
+  const canonical = normalizeRoutePattern(raw);
+  if (!canonical) {
+    status.textContent = 'Not a valid http(s) URL.';
+    status.className = 'hint err';
+    return;
+  }
+  chrome.storage.local.get(ROUTE_OPTOUTS_KEY).then((got) => {
+    const list = (got && Array.isArray(got[ROUTE_OPTOUTS_KEY]))
+      ? got[ROUTE_OPTOUTS_KEY].slice()
+      : [];
+    if (list.indexOf(canonical) !== -1) {
+      status.textContent = 'Already on the list.';
+      status.className = 'hint err';
+      return;
+    }
+    list.push(canonical);
+    return chrome.storage.local.set({ [ROUTE_OPTOUTS_KEY]: list }).then(() => {
+      input.value = '';
+      status.textContent = 'Added ' + canonical;
+      status.className = 'hint';
+      renderRouteOptOuts();
+      refreshRouteState();
+    });
+  }).catch(() => {
+    status.textContent = 'Could not save the opt-out.';
+    status.className = 'hint err';
+  });
+}
+
+function removeRouteOptOut(canonical) {
+  chrome.storage.local.get(ROUTE_OPTOUTS_KEY).then((got) => {
+    const list = (got && Array.isArray(got[ROUTE_OPTOUTS_KEY]))
+      ? got[ROUTE_OPTOUTS_KEY].slice()
+      : [];
+    const next = list.filter((entry) => entry !== canonical);
+    if (next.length === list.length) return;
+    return chrome.storage.local.set({ [ROUTE_OPTOUTS_KEY]: next }).then(() => {
+      renderRouteOptOuts();
+      refreshRouteState();
+    });
+  }).catch(() => { /* storage unavailable */ });
+}
+
+function renderRouteOptOuts() {
+  const listEl = $('routeList');
+  listEl.textContent = '';
+  chrome.storage.local.get(ROUTE_OPTOUTS_KEY).then((got) => {
+    const list = (got && Array.isArray(got[ROUTE_OPTOUTS_KEY]))
+      ? got[ROUTE_OPTOUTS_KEY]
+      : [];
+    if (list.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'note';
+      empty.textContent = 'No route opt-outs: the tool may activate on every eligible page.';
+      listEl.appendChild(empty);
+      return;
+    }
+    // textContent only: stored entries are treated as untrusted text.
+    for (const canonical of list) {
+      const row = document.createElement('div');
+      row.className = 'route-item';
+      const pat = document.createElement('span');
+      pat.className = 'pat';
+      pat.textContent = String(canonical);
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.textContent = 'Remove';
+      rm.title = 'Allow the tool on ' + String(canonical);
+      rm.addEventListener('click', () => removeRouteOptOut(String(canonical)));
+      row.appendChild(pat);
+      row.appendChild(rm);
+      listEl.appendChild(row);
+    }
+  }).catch(() => { /* storage unavailable */ });
+}
+
+/* Current-tab route state via the service worker. Harnesses use the same
+ * browserlinkRouteControl message with action enable/disable; restricted
+ * pages fail closed. */
+async function refreshRouteState() {
+  const el = $('routeState');
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'browserlinkRouteControl', action: 'state' });
+    if (resp && resp.ok) {
+      const reasonText = {
+        'restricted': 'restricted page',
+        'route-opt-out': 'route opt-out',
+      }[resp.reason] || '';
+      const act = resp.enabled ? 'active' : 'dormant';
+      el.textContent = 'Current tab: ' + (resp.routeMatched ? 'opted out' : 'allowed')
+        + ' (' + act + ')' + (reasonText ? ' - ' + reasonText : '');
+      el.className = resp.routeMatched || resp.reason === 'restricted' ? 'hint err' : 'hint';
+    } else {
+      el.textContent = 'Current tab state unavailable.';
+      el.className = 'hint err';
+    }
+  } catch (_) {
+    el.textContent = 'Current tab state unavailable.';
+    el.className = 'hint err';
+  }
+}
+
 /* wiring */
 $('toolToggle').addEventListener('change', onToolToggle);
 $('alwaysOnToggle').addEventListener('change', onAlwaysOnToggle);
@@ -807,9 +1174,38 @@ $('copyShare').addEventListener('click', copyShareLink);
 $('saveCapture').addEventListener('click', saveCapture);
 $('downloadBundle').addEventListener('click', downloadBundle);
 $('downloadBackup').addEventListener('click', downloadBackup);
+$('searchInput').addEventListener('input', onSearchInput);
+$('searchInput').addEventListener('keydown', (event) => {
+  // Keyboard reachable: Enter runs the query immediately, Escape clears it.
+  if (event.key === 'Enter') {
+    if (searchTimer) clearTimeout(searchTimer);
+    runSearch();
+  } else if (event.key === 'Escape') {
+    $('searchInput').value = '';
+    if (searchTimer) clearTimeout(searchTimer);
+    $('searchStatus').textContent = '';
+    $('searchStatus').className = 'hint';
+    $('searchResults').hidden = true;
+    $('searchResults').textContent = '';
+  }
+});
+$('routeAdd').addEventListener('click', addRouteOptOut);
+$('routeInput').addEventListener('keydown', (event) => {
+  // Keyboard reachable: Enter adds the opt-out, Escape clears the input.
+  if (event.key === 'Enter') {
+    addRouteOptOut();
+  } else if (event.key === 'Escape') {
+    $('routeInput').value = '';
+    $('routeStatus').textContent = '';
+    $('routeStatus').className = 'hint';
+  }
+});
+$('routeRefresh').addEventListener('click', refreshRouteState);
 checkHub();
 loadEndpoint();
 loadLabel();
+renderRouteOptOuts();
+refreshRouteState();
 loadToolEnabled();
 loadAlwaysOn();
 loadPageState();
