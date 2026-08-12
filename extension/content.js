@@ -151,6 +151,19 @@
   // Edge inset for a docked toolbar/chip (clamped 10-25px per design spec).
   const DOCK_GAP_PX = Math.min(25, Math.max(10, 14));
 
+  /* ---------------- text-selection quick actions (F9) ----------------
+   * Quote limits mirror the schema v1.9 textQuote contract
+   * (schema.ts MAX_QUOTE_TEXT / MAX_QUOTE_CONTEXT) so the extension never
+   * ships a payload the hub would reject. Context sampling is bounded and
+   * independent of the schema cap: at most SEL_CONTEXT_SAMPLE characters
+   * per side are captured, then capQuote applies the schema caps again.
+   * The restore scan is bounded so hostile or huge pages cannot stall the
+   * content script. */
+  const SEL_MAX_QUOTE = 5000;       // schema MAX_QUOTE_TEXT
+  const SEL_MAX_CONTEXT = 500;      // schema MAX_QUOTE_CONTEXT
+  const SEL_CONTEXT_SAMPLE = 120;   // raw context chars captured per side
+  const SEL_MAX_SCAN_NODES = 4000;  // restore walk cap (text nodes)
+
   /* ---------------- state ---------------- */
   const state = {
     annotateOn: true,    // draw mode is the default selection on start
@@ -249,6 +262,22 @@
   let selectionPulseRaf = 0;
   let selectionPulseStarted = 0;
   let lastSelectionCount = -1;
+
+  /* ---------------- text-selection quick actions (F9) state ----------------
+   * selSurface is the ONE compact action surface (Note / Ask AI / Highlight)
+   * built in buildUI and toggled; selSurfaceQuote is the last validated
+   * quote snapshot the surface was shown for. A mousedown on the surface
+   * collapses the page selection BEFORE the click handler runs, so the
+   * quote is snapshotted into selPendingQuote at mousedown and consumed by
+   * the click handler. selListenersBound mirrors the bindEvents/fullExit
+   * lifecycle for diagnostics (exactly one listener set per page). */
+  let selSurface = null;
+  let selSurfaceQuote = null;   // last validated quote snapshot (capture time)
+  let selPendingQuote = null;   // mousedown snapshot consumed by the click
+  let selTopQuote = null;       // top-level textQuote for the quote-linked note
+  let selActionCount = 0;       // actions taken since injection (diag)
+  let selListenersBound = false;
+  let selSurfaceRaf = 0;        // rAF throttle for the refresh check
 
   /* ---------------- Freeze State Capture (schema v1.6) ----------------
    * One extension-owned style element pauses CSS animations and zeroes
@@ -780,6 +809,19 @@
           sent: it.sent,
         })),
       },
+      // Text-selection quick actions (F9): surface visibility, the top-level
+      // quote-linked note quote, action count, exactly-one-listener proof,
+      // and the number of committed quote markers. quoteLen is the live
+      // quote snapshot length (0 when none); markers counts elements that
+      // carry the internal quoteMarker flag.
+      selection: {
+        surface: !!(selSurface && !selSurface.hidden),
+        topQuote: !!selTopQuote,
+        quoteLen: (selSurfaceQuote && selSurfaceQuote.quote) ? selSurfaceQuote.quote.length : 0,
+        actions: selActionCount,
+        listeners: selListenersBound ? 1 : 0,
+        markers: state.elements.filter((en) => en.descriptor && en.descriptor.quoteMarker).length,
+      },
       canvasCtx: !!(canvas && ctx),
       messagesBound: messagesBound,
       // Onboarding (F6): tour + session always-on state for one-instance
@@ -1075,6 +1117,27 @@
             out.anchor = anchorOut;
           }
         }
+        // F9: quote markers persist their textQuote (schema v1.9, capped),
+        // the marker flag, and the last restore resolution so the draft
+        // stays introspectable; restore recomputes the live resolution from
+        // the DOM regardless. Legacy drafts without these fields restore
+        // unchanged (draft format stays backward compatible at v1).
+        if (d.quoteMarker === true) out.quoteMarker = true;
+        if (d.textQuote && typeof d.textQuote === 'object' && !Array.isArray(d.textQuote)) {
+          out.textQuote = capQuote(d.textQuote.quote, d.textQuote.prefix, d.textQuote.suffix);
+        }
+        if (d.quote && typeof d.quote === 'object' && !Array.isArray(d.quote)) {
+          const qr = d.quote;
+          if (qr.version === 1
+            && (qr.resolution === 'exact' || qr.resolution === 'fallback'
+              || qr.resolution === 'ambiguous' || qr.resolution === 'unresolved')) {
+            const quoteOut = { version: 1, resolution: qr.resolution };
+            if (typeof qr.confidence === 'number' && Number.isFinite(qr.confidence)) {
+              quoteOut.confidence = Math.max(0, Math.min(1, qr.confidence));
+            }
+            out.quote = quoteOut;
+          }
+        }
         return out;
       }),
       // F8: thread identity + ordered item history survive the draft. The
@@ -1209,11 +1272,39 @@
       let el = null;
       let res = null;
       try {
-        // Anchor resilience (F2): full deterministic chain, exact replay
-        // first; legacy flat descriptors (and descriptors without cssPath)
-        // resolve through the same fallback signals.
-        res = reanchorElement(desc);
-        if (res.el) el = res.el;
+        // F9: quote markers restore by TEXT, not by cssPath - the
+        // deterministic exact-then-contextual chain over the live DOM.
+        if (desc.quoteMarker === true
+          && desc.textQuote && typeof desc.textQuote === 'object'
+          && !Array.isArray(desc.textQuote)) {
+          const qr = restoreQuoteMatch(
+            desc.textQuote.quote, desc.textQuote.prefix, desc.textQuote.suffix,
+            pageQuoteSegments(document));
+          if (qr.segment && qr.segment.node) {
+            el = qr.segment.node.parentElement || qr.segment.node;
+            res = {
+              el,
+              resolution: qr.resolution === 'exact' ? 'exact' : 'fallback',
+              confidence: qr.resolution === 'exact' ? 1 : 0.85,
+              fallback: qr.resolution === 'fallback' ? ['text'] : [],
+              reason: qr.resolution,
+            };
+          } else {
+            res = {
+              el: null,
+              resolution: 'unresolved',
+              confidence: 0,
+              fallback: [],
+              reason: qr.resolution,
+            };
+          }
+        } else {
+          // Anchor resilience (F2): full deterministic chain, exact replay
+          // first; legacy flat descriptors (and descriptors without cssPath)
+          // resolve through the same fallback signals.
+          res = reanchorElement(desc);
+          if (res.el) el = res.el;
+        }
       } catch (_) { el = null; res = null; }
       const d2 = {
         index: (typeof desc.index === 'number' && Number.isFinite(desc.index)) ? desc.index : maxIndex + 1,
@@ -1247,6 +1338,12 @@
           : [];
         if (hosts.length) d2.shadow = { depth: hosts.length, hosts };
       }
+      // F9: restore the quote marker fields (marker flag + capped textQuote;
+      // the live resolution is recomputed below and stamped on d2.quote).
+      if (desc.quoteMarker === true) d2.quoteMarker = true;
+      if (desc.textQuote && typeof desc.textQuote === 'object' && !Array.isArray(desc.textQuote)) {
+        d2.textQuote = capQuote(desc.textQuote.quote, desc.textQuote.prefix, desc.textQuote.suffix);
+      }
       const outlineEl = createOutline(d2.index);
       state.elements.push({ descriptor: d2, el, outlineEl });
       // Anchor resilience (F2): stamp the truthful resolution state, mark
@@ -1254,7 +1351,17 @@
       // unresolved entry; its instruction is never attached and never
       // dropped - it renders as a ghost at the prior rect.
       if (!res) res = { el: null, resolution: 'unresolved', confidence: 0, fallback: [], reason: 'none' };
-      stampAnchor(d2, res);
+      // F9: quote markers carry their own resolution stamp (the F2 anchor
+      // field stays absent for them - text restore has no cssPath signal).
+      if (d2.quoteMarker) {
+        d2.quote = {
+          version: 1,
+          resolution: res.resolution,
+          confidence: Math.round(res.confidence * 1000) / 1000,
+        };
+      } else {
+        stampAnchor(d2, res);
+      }
       markOutlineAnchor(outlineEl, res.resolution);
       if (res.resolution === 'exact') restored += 1;
       else if (res.resolution === 'fallback') { restored += 1; moved += 1; }
@@ -4090,6 +4197,8 @@
     if (hintProp) scheduleRedraw();
     // Keep Size & Position readout glued to the live element rect.
     updateInspectorMetrics();
+    // F9: the quick-action surface follows the selection on scroll/resize.
+    positionSelSurface();
     // Floating inspector follows its element on scroll; docked panels are
     // viewport-anchored and skip this.
     if (inspPanel && !inspPanel.hidden && !state.dock) positionInspector();
@@ -4722,11 +4831,38 @@
     // Only Escape and the Enter shortcuts (chat card / inspector instruction
     // field) are global actions.
     if (fromUi && e.key !== 'Escape' && !chatEnter && !inspEnter) {
+      // F9: arrow keys move focus between the surface buttons when one of
+      // them has focus (Tab already works natively; the guard below stops
+      // propagation, not default actions). Home/End are not handled: Tab
+      // covers the full cycle.
+      if (selSurface && !selSurface.hidden
+        && (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+        const btns = Array.prototype.slice.call(selSurface.querySelectorAll('.comet-sel-act'));
+        const idx = e.target && btns.indexOf(e.target);
+        if (idx !== -1 && btns.length > 1) {
+          const dir = (e.key === 'ArrowRight' || e.key === 'ArrowDown') ? 1 : -1;
+          const next = btns[(idx + dir + btns.length) % btns.length];
+          e.preventDefault();
+          if (next) next.focus();
+          return;
+        }
+      }
       // Block host-page shortcuts (capture-phase window listeners run before
       // the shadow-root bubble guard at bindEvents). stopImmediatePropagation
       // without preventDefault: the field still receives the character, the
       // page never sees the key.
       e.stopImmediatePropagation();
+      return;
+    }
+
+    // F9: Escape dismisses the text-selection quick-action surface first,
+    // before any mode-specific handling, and never leaks to the page while
+    // the surface is up (stopImmediatePropagation + preventDefault). A
+    // second Escape then runs the normal chat/inspector cancel paths.
+    if (selSurface && !selSurface.hidden && e.key === 'Escape') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      hideSelSurface();
       return;
     }
 
@@ -4758,6 +4894,407 @@
       e.preventDefault();
       cancelChat();
     }
+  }
+
+  /* ---------------- text-selection quick actions (F9) ----------------
+   * Browser-native page text selection opens ONE compact quick-action
+   * surface with Note / Ask AI / Highlight. Capture reads the live page
+   * selection into a schema v1.9 textQuote descriptor (normalized quote
+   * plus bounded prefix/suffix context, caps mirrored from the hub).
+   * Restore is deterministic: exact normalized quote match first, then a
+   * UNIQUE contextual fallback using the stored prefix/suffix; ambiguous
+   * or missing matches stay unresolved (ghost marker at the prior rect),
+   * never a guessed element. Excluded selections (password/input fields,
+   * the extension's own closed shadow UI) produce no surface. The pure
+   * functions here are the mechanism gate fixtures: they execute the
+   * shipped bytes verbatim. */
+
+  // Normalize page text for quote matching: collapse every whitespace run
+  // (including newlines and non-breaking spaces) to one space and trim.
+  function normalizeQuoteText(s) {
+    return String(s == null ? '' : s)
+      .replace(/\u00a0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  // Apply the schema v1.9 textQuote caps. quote must end up non-empty and
+  // within SEL_MAX_QUOTE; prefix/suffix within SEL_MAX_CONTEXT. The result
+  // always carries the three keys so consumers can rely on the shape.
+  function capQuote(quote, prefix, suffix) {
+    return {
+      quote: normalizeQuoteText(quote).slice(0, SEL_MAX_QUOTE),
+      prefix: normalizeQuoteText(prefix).slice(0, SEL_MAX_CONTEXT),
+      suffix: normalizeQuoteText(suffix).slice(0, SEL_MAX_CONTEXT),
+    };
+  }
+
+  // Bounded raw context around a selection inside ONE text node. start/end
+  // are offsets into `text`; at most SEL_CONTEXT_SAMPLE characters per side
+  // are sampled (the schema cap is applied later by capQuote).
+  function quoteContextOf(text, start, end) {
+    const full = String(text == null ? '' : text);
+    const s = Math.max(0, Math.min(full.length, start));
+    const e = Math.max(s, Math.min(full.length, end));
+    return {
+      prefix: full.slice(Math.max(0, s - SEL_CONTEXT_SAMPLE), s),
+      suffix: full.slice(e, Math.min(full.length, e + SEL_CONTEXT_SAMPLE)),
+    };
+  }
+
+  // Exclusion contract: a selection anchored inside a password/input field,
+  // text area, select, or the extension's own UI (closed shadow root) never
+  // produces a quick-action surface. Rich-editable page text stays eligible.
+  function selectionExcludedEl(el) {
+    if (!el || el.nodeType !== 1) return true;
+    const tag = String(el.tagName || '').toUpperCase();
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (shadow) {
+      try {
+        const root = el.getRootNode ? el.getRootNode() : null;
+        if (root === shadow) return true; // selection inside the extension UI
+      } catch (_) { /* ok */ }
+    }
+    return false;
+  }
+
+  // Build the schema v1.9 textQuote descriptor from the live page selection.
+  // Null when there is no usable selection: collapsed, whitespace-only, or
+  // anchored inside an excluded element.
+  function quoteFromSelection() {
+    let sel = null;
+    try { sel = window.getSelection(); } catch (_) { sel = null; }
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+    const range = sel.getRangeAt(0);
+    if (!range || range.collapsed) return null;
+    const anchorEl = (sel.anchorNode && sel.anchorNode.nodeType === 1)
+      ? sel.anchorNode
+      : (sel.anchorNode && sel.anchorNode.parentElement ? sel.anchorNode.parentElement : null);
+    if (selectionExcludedEl(anchorEl)) return null;
+    let quote = '';
+    let prefix = '';
+    let suffix = '';
+    try {
+      quote = range.toString();
+      if (range.startContainer && range.startContainer.nodeType === 3
+        && range.endContainer === range.startContainer) {
+        // Single text node: context comes from the node's own data.
+        const ctx = quoteContextOf(range.startContainer.data, range.startOffset, range.endOffset);
+        prefix = ctx.prefix;
+        suffix = ctx.suffix;
+      } else {
+        // Multi-node selection: bounded context from the enclosing text.
+        let anc = range.commonAncestorContainer;
+        if (anc && anc.nodeType === 3) anc = anc.parentElement;
+        if (anc && anc.nodeType === 1) {
+          const q = normalizeQuoteText(quote);
+          const txt = String(anc.textContent || '');
+          const rel = q ? txt.indexOf(q) : -1;
+          if (rel !== -1) {
+            const ctx = quoteContextOf(txt, rel, rel + q.length);
+            prefix = ctx.prefix;
+            suffix = ctx.suffix;
+          }
+        }
+      }
+    } catch (_) {
+      try { quote = sel.toString(); } catch (_2) { quote = ''; }
+    }
+    const capped = capQuote(quote, prefix, suffix);
+    if (!capped.quote) return null;
+    return capped;
+  }
+
+  // All non-empty text segments of the page (bounded walk). A segment is one
+  // text node with its normalized form; the walk stops at SEL_MAX_SCAN_NODES
+  // so hostile or huge pages cannot stall restore.
+  function pageQuoteSegments(rootDoc) {
+    const out = [];
+    if (!rootDoc) return out;
+    const showText = (typeof NodeFilter !== 'undefined' && NodeFilter.SHOW_TEXT)
+      ? NodeFilter.SHOW_TEXT : 4;
+    let walker = null;
+    try {
+      walker = rootDoc.createTreeWalker
+        ? rootDoc.createTreeWalker(rootDoc.body || rootDoc.documentElement || rootDoc, showText)
+        : null;
+    } catch (_) { walker = null; }
+    if (!walker) return out;
+    let node = walker.nextNode();
+    let n = 0;
+    while (node && n < SEL_MAX_SCAN_NODES) {
+      const raw = node.data || '';
+      const norm = normalizeQuoteText(raw);
+      if (norm) out.push({ node, raw, norm });
+      n += 1;
+      node = walker.nextNode();
+    }
+    return out;
+  }
+
+  // Deterministic quote restore over segments ({node, raw, norm}):
+  //   pass 1 - exact normalized containment (one winner -> exact);
+  //   pass 2 - unique contextual fallback with the stored prefix/suffix
+  //            (one winner -> fallback);
+  //   else    - ambiguous (several candidates, context cannot disambiguate)
+  //            or unresolved (no candidate). Ambiguous and unresolved are
+  //            never guessed.
+  function restoreQuoteMatch(quote, prefix, suffix, segments) {
+    const q = normalizeQuoteText(quote);
+    if (!q || !Array.isArray(segments)) {
+      return { resolution: 'unresolved', segment: null, confidence: 0 };
+    }
+    const exact = [];
+    for (const seg of segments) {
+      if (!seg || typeof seg.norm !== 'string') continue;
+      if (seg.norm.indexOf(q) !== -1) exact.push(seg);
+    }
+    if (exact.length === 1) {
+      return { resolution: 'exact', segment: exact[0], confidence: 1 };
+    }
+    if (exact.length === 0) {
+      return { resolution: 'unresolved', segment: null, confidence: 0 };
+    }
+    const p = normalizeQuoteText(prefix);
+    const s = normalizeQuoteText(suffix);
+    const contextual = [];
+    for (const seg of exact) {
+      const at = seg.norm.indexOf(q);
+      if (at === -1) continue;
+      const before = seg.norm.slice(0, at);
+      const after = seg.norm.slice(at + q.length);
+      const pOk = !p || before.endsWith(p) || before.indexOf(p) !== -1;
+      const sOk = !s || after.startsWith(s) || after.indexOf(s) !== -1;
+      if (pOk && sOk) contextual.push(seg);
+    }
+    if (contextual.length === 1) {
+      return { resolution: 'fallback', segment: contextual[0], confidence: 0.85 };
+    }
+    return { resolution: 'ambiguous', segment: null, confidence: 0 };
+  }
+
+  // The live element the selection belongs to (common ancestor of the
+  // range). Null when the selection is gone or anchored in excluded UI; the
+  // Ask AI / Highlight flows then fall back to an unresolved descriptor.
+  function quoteAnchorElement() {
+    try {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+      const range = sel.getRangeAt(0);
+      let anc = range.commonAncestorContainer;
+      if (anc && anc.nodeType === 3) anc = anc.parentElement;
+      if (anc && anc.nodeType === 1 && !selectionExcludedEl(anc)) return anc;
+      return null;
+    } catch (_) { return null; }
+  }
+
+  // Element descriptor for the quote flows (Ask AI / Highlight). Carries
+  // the schema v1.9 per-element textQuote; the quoteMarker flag and any
+  // quote-resolution bookkeeping are extension-internal and stripped in
+  // descriptorForPayload so the shipped payload stays schema-clean.
+  function quoteDescriptor(q) {
+    const el = quoteAnchorElement();
+    let css = '';
+    let rect = null;
+    if (el) {
+      try { css = cssPath(el); } catch (_) { css = ''; }
+      try { rect = normalizedRectOf(el); } catch (_) { rect = null; }
+    }
+    let href = '';
+    let ariaLabel = '';
+    if (el) {
+      try { href = String(el.getAttribute ? (el.getAttribute('href') || '') : ''); } catch (_) { href = ''; }
+      try { ariaLabel = String(el.getAttribute ? (el.getAttribute('aria-label') || '') : ''); } catch (_) { ariaLabel = ''; }
+    }
+    return {
+      index: state.nextIndex++,
+      tag: el ? String(el.tagName || '').toLowerCase() : 'text',
+      id: el ? String(el.id || '') : '',
+      className: el ? String(el.className || '') : '',
+      text: q.quote.slice(0, MAX_TEXT),
+      href,
+      ariaLabel,
+      cssPath: css,
+      rect,
+      instruction: '',
+      textQuote: q,
+      quoteMarker: true,
+    };
+  }
+
+  // Note: the selected text enters the note queue (queue-first, same as the
+  // annotate note card) and the top-level textQuote descriptor rides with
+  // the batch (schema v1.9 reserves it for quote-linked notes).
+  function selActionNote(q) {
+    const text = q.quote.slice(0, MAX_TEXT);
+    if (!text) return;
+    selTopQuote = q;
+    state.annotNote = text;
+    state.annotNotes.push(text);
+    if (state.annotNotes.length > 20) state.annotNotes.splice(0, state.annotNotes.length - 20);
+    updateNoteCount();
+    persistDraft(); // F3: queued notes survive refresh
+  }
+
+  // Ask AI: opens the EXISTING instruction flow (inspector) with a quote
+  // descriptor staged for Add. Never auto-sends: the user writes the
+  // instruction and presses Add (or cancels).
+  function selActionAsk(q) {
+    const desc = quoteDescriptor(q);
+    openChat(desc, quoteAnchorElement(), false, -1);
+    if (inspInput) inspInput.focus();
+  }
+
+  // Highlight: immediate visual quote marker - a committed element entry
+  // carrying the per-element textQuote, with the standard numbered outline.
+  // Additive like shift-click; the batch ships it like any element.
+  function selActionHighlight(q) {
+    const desc = quoteDescriptor(q);
+    const outlineEl = createOutline(desc.index);
+    state.elements.push({ descriptor: desc, el: quoteAnchorElement(), outlineEl });
+    state.activeIndex = state.elements.length - 1;
+    updateCount();
+    updateSelectionPulse();
+    positionSelections();
+    persistDraft(); // F3: committed markers survive refresh
+  }
+
+  // The canonical quote-state clear (Clear All / confirmed Send / teardown).
+  // Returns the reset state object so the mechanism is testable without
+  // DOM access; the surface DOM hide is a separate call.
+  function clearSelQuoteState() {
+    selTopQuote = null;
+    selPendingQuote = null;
+    return { topQuote: null, pendingQuote: null };
+  }
+
+  function collapseSelection() {
+    try {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed) sel.removeAllRanges();
+    } catch (_) { /* ok */ }
+  }
+
+  function hideSelSurface() {
+    if (!selSurface) return;
+    selSurface.hidden = true;
+  }
+
+  function showSelSurface(q) {
+    if (!selSurface) return;
+    selSurfaceQuote = q;
+    selSurface.hidden = false;
+    positionSelSurface();
+    if (gsapReady && !isReducedMotion()) {
+      gsapEnter(selSurface, { duration: 0.18, from: { opacity: 0, y: 6, scale: 0.96 } });
+    }
+  }
+
+  // Position the surface below the selection rect, clamped to the viewport;
+  // flips above the selection when there is no room below.
+  function positionSelSurface() {
+    if (!selSurface || selSurface.hidden) return;
+    let rect = null;
+    try {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.rangeCount) {
+        rect = sel.getRangeAt(0).getBoundingClientRect();
+      }
+    } catch (_) { rect = null; }
+    const w = selSurface.offsetWidth || 230;
+    const h = selSurface.offsetHeight || 34;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    let x;
+    let y;
+    if (rect && rect.width > 0) {
+      x = Math.round(Math.min(vw - w - 8, Math.max(8, rect.left + rect.width / 2 - w / 2)));
+      y = rect.bottom + 8;
+      if (y + h > vh - 8 && rect.top - h - 8 > 0) y = rect.top - h - 8;
+      y = Math.round(Math.min(vh - h - 8, Math.max(8, y)));
+    } else {
+      x = Math.round(vw - w - 12);
+      y = Math.round(vh - h - 12);
+    }
+    selSurface.style.left = x + 'px';
+    selSurface.style.top = y + 'px';
+  }
+
+  // One rAF-throttled refresh: show the surface when a valid selection
+  // exists, hide it otherwise. Also the entry point exposed to the harness.
+  function refreshSelSurface() {
+    if (selSurfaceRaf) { cancelAnimationFrame(selSurfaceRaf); selSurfaceRaf = 0; }
+    const q = quoteFromSelection();
+    if (!q) {
+      hideSelSurface();
+      selSurfaceQuote = null;
+      return;
+    }
+    showSelSurface(q);
+  }
+
+  function scheduleSelSurfaceCheck() {
+    if (selSurfaceRaf) cancelAnimationFrame(selSurfaceRaf);
+    selSurfaceRaf = requestAnimationFrame(() => {
+      selSurfaceRaf = 0;
+      refreshSelSurface();
+    });
+  }
+
+  function onSelMouseUp(e) {
+    if (!host || !host.parentNode) return;
+    // Interaction inside our own UI never re-triggers the surface. A press
+    // on the surface itself is consumed by its mousedown snapshot + click
+    // handler (the mouseup/click arrive after the page selection has been
+    // collapsed, so the surface must stay up for the click to act).
+    if (e && e.composedPath && e.composedPath().indexOf(host) !== -1) {
+      if (!(selSurface && e.composedPath().indexOf(selSurface) !== -1)) hideSelSurface();
+      return;
+    }
+    scheduleSelSurfaceCheck();
+  }
+
+  function onSelKeyUp(e) {
+    // Keyboard selection (Shift+arrows) also opens the surface.
+    if (e.key === 'Shift' || e.key.indexOf('Arrow') === 0) scheduleSelSurfaceCheck();
+  }
+
+  function onSelChange() {
+    if (!selSurface || selSurface.hidden) return;
+    // A press on the surface itself collapses the page selection before the
+    // click handler runs; the mousedown snapshot already captured the quote,
+    // so do not dismiss here (do not rely on focus: Safari buttons do not
+    // take focus on click).
+    if (selPendingQuote) return;
+    const q = quoteFromSelection();
+    if (!q || (selSurfaceQuote && q.quote !== selSurfaceQuote.quote)) {
+      hideSelSurface();
+      selSurfaceQuote = null;
+    } else {
+      positionSelSurface();
+    }
+  }
+
+  function onSelActionClick(e) {
+    const btn = e.target && e.target.closest ? e.target.closest('[data-sel-act]') : null;
+    if (!btn || !selSurface) return;
+    e.preventDefault();
+    e.stopPropagation();
+    // Consume the mousedown snapshot first (the press collapsed the page
+    // selection), then the surface's own snapshot; the live selection is a
+    // last resort for keyboard activation. The surface may already be
+    // hidden by the time the click lands - it was visible at press time.
+    const q = selPendingQuote || selSurfaceQuote || quoteFromSelection();
+    selPendingQuote = null;
+    if (!q) { hideSelSurface(); return; }
+    if (btn.dataset.selAct === 'note') selActionNote(q);
+    else if (btn.dataset.selAct === 'ask') selActionAsk(q);
+    else if (btn.dataset.selAct === 'highlight') selActionHighlight(q);
+    selActionCount += 1;
+    hideSelSurface();
+    collapseSelection();
+    diagLog('sel:' + btn.dataset.selAct,
+      'quote=' + q.quote.length + ' prefix=' + q.prefix.length + ' suffix=' + q.suffix.length);
   }
 
   /* ---------------- element inspector (v1.2) ---------------- */
@@ -6840,6 +7377,9 @@
       }
     }
     updateSelectionPulse();
+    // F9: a mode switch dismisses any open quick-action surface (the quote
+    // capture is momentary; the picker/draw flows own the next interaction).
+    hideSelSurface();
   }
 
   function setAnnotate(on, opts) {
@@ -6922,6 +7462,7 @@
     redraw();
     clearDraft(); // F3: Clear All removes the persisted URL draft
     threadReset(); // F8: Clear All starts a fresh thread
+    clearSelQuoteState(); // F9: Clear All drops the top-level quote too
   }
 
   /* ---------------- Freeze State Capture (schema v1.6) ---------------- */
@@ -7169,6 +7710,17 @@
     } else {
       delete d.anchor;
     }
+    // F9: quote markers ship their schema v1.9 textQuote (canonical, capped)
+    // but NEVER their extension-internal bookkeeping (quoteMarker flag,
+    // quote-resolution stamp) - the hub would store them, and they carry no
+    // contract. Stripped here so the payload stays schema-clean.
+    if (d.textQuote && typeof d.textQuote === 'object' && !Array.isArray(d.textQuote)) {
+      d.textQuote = capQuote(d.textQuote.quote, d.textQuote.prefix, d.textQuote.suffix);
+    } else {
+      delete d.textQuote;
+    }
+    delete d.quoteMarker;
+    delete d.quote;
     return d;
   }
 
@@ -7355,7 +7907,12 @@
       strokes: state.strokes.map((s) => ({ color: s.color, width: s.width, points: s.points })),
       // v1.4: every selected descriptor carries its own instruction + edits.
       elements: state.elements.map(descriptorForPayload),
+      // F9: the quote-linked note's textQuote descriptor ships at the top
+      // level (schema v1.9); quote markers carry their own per-element
+      // textQuote via descriptorForPayload. Omitted when no quote action
+      // was taken, so legacy sends stay byte-compatible.
     };
+    if (selTopQuote) payload.textQuote = selTopQuote;
     // F8: thread identity on the annotation. The batch belongs to the
     // page-context thread (top-level threadId, schema v1.9); when it
     // continues a thread that already shipped, parentId references the
@@ -7464,6 +8021,9 @@
       updateSelectionPulse();
       redraw();
       clearDraft(); // F3: draft clears ONLY after a confirmed successful POST
+      // F9: the quote-linked note ships with the batch, then resets so the
+      // next batch starts without a stale top-level textQuote.
+      clearSelQuoteState();
       // F8: stamp the stored annotation id on every shipped thread item so
       // the next send carries a valid parentId (fire-and-forget).
       threadLearnSentId();
@@ -7686,6 +8246,15 @@
     sendHideTimer = 0;
     if (sendHideDoneTimer) clearTimeout(sendHideDoneTimer);
     sendHideDoneTimer = 0;
+    // F9: quote state dies with the host (the surface DOM is gone; the
+    // top-level quote and the action counter reset for the next inject).
+    if (selSurfaceRaf) { cancelAnimationFrame(selSurfaceRaf); selSurfaceRaf = 0; }
+    selSurface = null;
+    selSurfaceQuote = null;
+    selPendingQuote = null;
+    selTopQuote = null;
+    selActionCount = 0;
+    selListenersBound = false;
     sendBusy = false;
     if (collapseTimer) clearTimeout(collapseTimer);
     collapseTimer = 0;
@@ -7775,6 +8344,12 @@
     window.removeEventListener('mousedown', onPageMouseDown, true);
     window.removeEventListener('click', onPageClick, true);
     window.removeEventListener('keydown', onKeyDown, true);
+    // F9: remove the selection quick-action listeners (surface element dies
+    // with the host; its own listeners go with it).
+    window.removeEventListener('mouseup', onSelMouseUp);
+    window.removeEventListener('keyup', onSelKeyUp);
+    document.removeEventListener('selectionchange', onSelChange);
+    selListenersBound = false;
     window.removeEventListener('pointerup', endDrag);
     window.removeEventListener('mouseup', endDrag);
     document.removeEventListener('scroll', repositionAll, true);
@@ -8158,6 +8733,29 @@
     sentToastEl.hidden = true;
     sentToastEl.textContent = 'Sent ✓';
 
+    // F9: ONE compact text-selection quick-action surface (Note / Ask AI /
+    // Highlight). Hidden by default; shown on a valid page selection and
+    // repositioned over the selection rect. pointer-events opt in on the
+    // host (the host itself is pointer-events:none).
+    selSurface = document.createElement('div');
+    selSurface.className = 'comet-sel-actions';
+    selSurface.setAttribute('role', 'toolbar');
+    selSurface.setAttribute('aria-label', 'Text selection actions');
+    selSurface.hidden = true;
+    selSurface.innerHTML =
+      '<button type="button" class="comet-sel-act" data-sel-act="note" title="Queue the selected text as a quote-linked note">Note</button>' +
+      '<button type="button" class="comet-sel-act" data-sel-act="ask" title="Ask AI about the selected text (opens the instruction flow)">Ask AI</button>' +
+      '<button type="button" class="comet-sel-act" data-sel-act="highlight" title="Store a visual quote marker for the selected text">Highlight</button>';
+    // Snapshot the quote at mousedown: the press collapses the page
+    // selection BEFORE the click handler runs, so the action must not read
+    // the live selection at click time.
+    selSurface.addEventListener('mousedown', (e) => {
+      if (selSurface && !selSurface.hidden) {
+        selPendingQuote = selSurfaceQuote || quoteFromSelection();
+      }
+      e.stopPropagation();
+    });
+
     shadow.appendChild(toolbar);
     shadow.appendChild(chipEl);
     shadow.appendChild(selLayer);
@@ -8166,6 +8764,7 @@
     shadow.appendChild(canvas);
     shadow.appendChild(chatCard);
     shadow.appendChild(inspPanel);
+    shadow.appendChild(selSurface);
     shadow.appendChild(sentToastEl);
 
     // Diagnostics overlay (Ctrl+Shift+D to toggle). Sits inside the shadow
@@ -8454,6 +9053,14 @@
       inspPanel.addEventListener('pointerleave', onInspPointerLeave);
     }
     if (inspDockEl) inspDockEl.addEventListener('click', onDockClick);
+    // F9: text-selection quick actions. Exactly ONE listener set per page
+    // context: surface clicks + the mouseup/keyup/selectionchange trio that
+    // drives surface show/hide. All are removed in fullExit.
+    if (selSurface) selSurface.addEventListener('click', onSelActionClick);
+    window.addEventListener('mouseup', onSelMouseUp);
+    window.addEventListener('keyup', onSelKeyUp);
+    document.addEventListener('selectionchange', onSelChange);
+    selListenersBound = true;
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mousedown', onPageMouseDown, true);
     window.addEventListener('click', onPageClick, true);
@@ -8679,6 +9286,31 @@
       get threadId() { return thread.id; },
       get threadItems() { return thread.items.map((it) => Object.assign({}, it)); },
       get threadCount() { return thread.items.length; },
+      // Text-selection quick actions (F9): harness hooks. The mechanism
+      // gate drives normalizeQuoteText / capQuote / quoteContextOf /
+      // selectionExcludedEl / restoreQuoteMatch with exact, normalized,
+      // ambiguous, input-exclusion, cap, draft-restore, and clear fixtures;
+      // quoteFromSelection / pageQuoteSegments / refreshSelSurface /
+      // clearSelQuoteState are the DOM-coupled paths used behaviorally.
+      normalizeQuoteText,
+      capQuote,
+      quoteContextOf,
+      selectionExcludedEl,
+      quoteFromSelection,
+      restoreQuoteMatch,
+      pageQuoteSegments,
+      quoteAnchorElement,
+      refreshSelSurface,
+      hideSelSurface,
+      clearSelQuoteState,
+      get selSurfaceVisible() { return !!(selSurface && !selSurface.hidden); },
+      get selSurfaceQuote() { return selSurfaceQuote ? Object.assign({}, selSurfaceQuote) : null; },
+      get selTopQuote() { return selTopQuote ? Object.assign({}, selTopQuote) : null; },
+      get selActionCount() { return selActionCount; },
+      get selListenersBound() { return selListenersBound; },
+      get selMarkerCount() {
+        return state.elements.filter((en) => en.descriptor && en.descriptor.quoteMarker).length;
+      },
     };
   }
 
