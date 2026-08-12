@@ -1,4 +1,4 @@
-/** Shared annotation schema (v1.4), single source of truth for hub + MCP. */
+/** Shared annotation schema (v1.5), single source of truth for hub + MCP. */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -28,6 +28,16 @@ export const ALLOWED_EDIT_KEYS = new Set([
   "margin",
   "padding",
   "borderRadius",
+  // Schema v1.5: text-formatting keys emitted by the inspector text editor.
+  "textAlign",
+  "textTransform",
+  "letterSpacing",
+  "wordSpacing",
+  "whiteSpace",
+  "verticalAlign",
+  "textDecoration",
+  "fontStyle",
+  "textShadow",
 ]);
 
 export const NAME_RE = /^[A-Za-z0-9._-]+$/;

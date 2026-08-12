@@ -79,6 +79,28 @@ describe("validatePayload", () => {
     assert.equal(validatePayload(p), null);
   });
 
+  it("accepts the schema v1.5 text-formatting edit keys", () => {
+    const p = payload();
+    p.elements = [
+      {
+        index: 1,
+        tag: "span",
+        edits: {
+          textAlign: "center",
+          textTransform: "uppercase",
+          letterSpacing: "2px",
+          wordSpacing: "3px",
+          whiteSpace: "nowrap",
+          verticalAlign: "middle",
+          textDecoration: "underline",
+          fontStyle: "italic",
+          textShadow: "1px 1px 2px #000",
+        },
+      },
+    ];
+    assert.equal(validatePayload(p), null);
+  });
+
   it("rejects unknown edits keys", () => {
     const p = payload();
     p.elements = [{ index: 1, tag: "button", edits: { bogusKey: "1px" } }];

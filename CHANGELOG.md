@@ -4,6 +4,18 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [2.5.0] - Unreleased
+
+### Fixed
+
+- **Text formatting edits now validate end-to-end (schema v1.5)** - the nine
+  inspector-emitted text-format keys (`textAlign`, `textTransform`,
+  `letterSpacing`, `wordSpacing`, `whiteSpace`, `verticalAlign`,
+  `textDecoration`, `fontStyle`, `textShadow`) are accepted by the hub,
+  stored byte-for-byte, and delivered; previously the hub rejected them with
+  HTTP 400, breaking the text editor's Send. Unknown edit keys remain
+  strictly rejected.
+
 ## [2.4.0] - 2026-08-11
 
 ### Added
