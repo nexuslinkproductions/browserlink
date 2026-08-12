@@ -24,6 +24,8 @@ import {
 } from "../src/adapters/hermes.ts";
 import { register as registerWebhook } from "../src/adapters/webhook.ts";
 import { MAX_MESSAGE_TEXT_LENGTH } from "../src/schema.ts";
+// F7 parity probe: MCP annotations_list must agree with the REST search.
+import { annotationsList as mcpAnnotationsList } from "../src/mcp.ts";
 
 const TINY_PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -1401,6 +1403,259 @@ describe("share page route", () => {
           assert.ok(after, `file still present: ${p}`);
           assert.equal(after[0], size, `size unchanged: ${p}`);
           assert.equal(after[1], mtime, `mtime unchanged: ${p}`);
+        }
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * F7: GET /annotations search and filters (local full-text recall).
+ * Section kept separate from other suites so concurrent feature edits never
+ * touch these probes. Every test name carries 'search', 'filter', or
+ * 'annotations_list' for the mechanism gate's --test-name-pattern.
+ * ------------------------------------------------------------------------- */
+describe("F7 search and filter route", () => {
+  const seedRecords = [
+    {
+      source: "test",
+      url: "https://fixture.test/alpha",
+      title: "Alpha page",
+      viewport: { w: 100, h: 100 },
+      label: "Needle one",
+      notes: ["productivity hack for review"],
+      note: "legacy joined",
+      strokes: [],
+      elements: [
+        {
+          index: 1,
+          tag: "button",
+          text: "Shop now",
+          instruction: "Make this blue and round",
+        },
+      ],
+    },
+    {
+      source: "test",
+      url: "https://fixture.test/beta",
+      title: "Beta page",
+      viewport: { w: 100, h: 100 },
+      label: "Needle two",
+      notes: ["unrelated note"],
+      strokes: [],
+      elements: [],
+    },
+    {
+      source: "test",
+      url: "https://other.test/gamma",
+      title: "Gamma page",
+      viewport: { w: 100, h: 100 },
+      label: "Unicode record",
+      notes: ["caf\u00e9 creme"], // composed e-acute (NFC)
+      strokes: [],
+      elements: [{ index: 1, tag: "p", text: "body", instruction: "keep" }],
+    },
+  ];
+
+  async function seedAll(hubBase: string): Promise<string[]> {
+    const names: string[] = [];
+    for (const record of seedRecords) {
+      const res = await request(hubBase, "POST", "/annotations", record);
+      assert.equal(res.status, 200);
+      names.push(res.json.file as string);
+      await new Promise((r) => setTimeout(r, 15)); // distinct mtimes
+    }
+    return names;
+  }
+
+  test("search matches across label url title notes and element fields, newest first", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const names = await seedAll(hub.base);
+        // Label hit, case-insensitive.
+        let res = await request(hub.base, "GET", "/annotations?q=NEEDLE");
+        assert.equal(res.status, 200);
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[1], names[0]],
+          "label matches, newest first",
+        );
+        assert.equal(res.json.skippedCorrupt, 0);
+        // Element instruction hit.
+        res = await request(hub.base, "GET", "/annotations?q=blue");
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[0]],
+          "element instruction matches",
+        );
+        // Note hit.
+        res = await request(hub.base, "GET", "/annotations?q=productivity");
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[0]],
+          "note matches",
+        );
+        // URL hit.
+        res = await request(hub.base, "GET", "/annotations?q=gamma");
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[2]],
+          "url matches",
+        );
+        // Title hit.
+        res = await request(hub.base, "GET", "/annotations?q=Alpha");
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[0]],
+          "title matches",
+        );
+        // Legacy joined note hit.
+        res = await request(hub.base, "GET", "/annotations?q=legacy%20joined");
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[0]],
+          "legacy note matches",
+        );
+        // NFC normalization: decomposed query matches the composed stored note.
+        res = await request(hub.base, "GET", "/annotations?q=cafe\u0301");
+        assert.equal(res.status, 200);
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [names[2]],
+          "decomposed query hits composed note (NFC)",
+        );
+        // No match: empty files, zero diagnostics.
+        res = await request(hub.base, "GET", "/annotations?q=nomatch");
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.json.files, []);
+        assert.equal(res.json.skippedCorrupt, 0);
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("search filters compose with url and since using AND semantics", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        await seedAll(hub.base);
+        // url filter alone.
+        let res = await request(hub.base, "GET", "/annotations?url=fixture");
+        assert.equal(res.status, 200);
+        assert.equal(res.json.files.length, 2, "both fixture records match url");
+        assert.equal(res.json.skippedCorrupt, 0);
+        // q AND url.
+        res = await request(hub.base, "GET", "/annotations?q=needle&url=fixture");
+        assert.equal(res.status, 200);
+        assert.equal(res.json.files.length, 2, "needle records are on fixture");
+        // q AND url excluding: needle records are on fixture, not other.
+        res = await request(hub.base, "GET", "/annotations?q=needle&url=other");
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.json.files, []);
+        // since in the past admits everything stored now.
+        res = await request(
+          hub.base,
+          "GET",
+          "/annotations?q=needle&url=fixture&since=2026-01-01T00:00:00.000Z",
+        );
+        assert.equal(res.status, 200);
+        assert.equal(res.json.files.length, 2);
+        // since in the future admits nothing.
+        res = await request(hub.base, "GET", "/annotations?since=2099-01-01T00:00:00.000Z");
+        assert.equal(res.status, 200);
+        assert.deepEqual(res.json.files, []);
+        assert.equal(res.json.skippedCorrupt, 0);
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("empty q search preserves the plain newest-first list behavior", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        await seedAll(hub.base);
+        const plain = await request(hub.base, "GET", "/annotations");
+        assert.equal(plain.status, 200);
+        assert.ok(!("skippedCorrupt" in plain.json), "plain list has no diagnostics");
+        const empty = await request(hub.base, "GET", "/annotations?q=");
+        assert.equal(empty.status, 200);
+        assert.deepEqual(empty.json, plain.json, "empty q is byte-identical to the plain list");
+        assert.ok(!("skippedCorrupt" in empty.json));
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("invalid since returns 400 on the search route", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const res = await request(hub.base, "GET", "/annotations?since=not-a-date");
+        assert.equal(res.status, 400);
+        assert.deepEqual(res.json, { error: "invalid since timestamp" });
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("corrupt records are skipped with an explicit diagnostics count in search", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const posted = await request(hub.base, "POST", "/annotations", seedRecords[0]);
+        assert.equal(posted.status, 200);
+        const annDir = path.join(dir, "annotations");
+        await writeFile(path.join(annDir, "20260101-000000-900.json"), "{ not json");
+        const res = await request(hub.base, "GET", "/annotations?q=needle");
+        assert.equal(res.status, 200);
+        assert.deepEqual(
+          res.json.files.map((f: { name: string }) => f.name),
+          [posted.json.file],
+          "only the complete matching record is returned",
+        );
+        assert.equal(res.json.skippedCorrupt, 1, "corrupt record counted, never fatal");
+        // The plain list still shows the corrupt file (no record reads).
+        const plain = await request(hub.base, "GET", "/annotations");
+        assert.equal(plain.json.files.length, 2);
+        assert.ok(!("skippedCorrupt" in plain.json));
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("REST search and MCP annotations_list fixtures match in the same order", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        await seedAll(hub.base);
+        const cases: Array<{ q?: string; url?: string }> = [
+          { q: "needle" },
+          { q: "needle", url: "fixture" },
+          { url: "fixture" },
+          { q: "cafe\u0301" },
+          { q: "pop" },
+        ];
+        for (const filters of cases) {
+          const params: string[] = [];
+          if (filters.q) params.push(`q=${encodeURIComponent(filters.q)}`);
+          if (filters.url) params.push(`url=${encodeURIComponent(filters.url)}`);
+          const query = params.join("&");
+          const res = await request(hub.base, "GET", `/annotations?${query}`);
+          assert.equal(res.status, 200);
+          const restNames = res.json.files.map((f: { name: string }) => f.name);
+          const mcpNames = (
+            await mcpAnnotationsList(20, { q: filters.q, url: filters.url })
+          ).map((f) => f.name);
+          assert.deepEqual(mcpNames, restNames, `REST/MCP parity for ${query}`);
         }
       } finally {
         await hub.close();

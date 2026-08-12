@@ -151,6 +151,38 @@
     color: #9aa0a6;
   }
   .gap { margin-top: 14px; }
+  .search-list {
+    margin-top: 4px;
+    display: grid;
+    gap: 8px;
+  }
+  .search-item {
+    padding: 8px 9px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .search-item .page {
+    margin: 0 0 3px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #e8eaed;
+    overflow-wrap: anywhere;
+  }
+  .search-item .excerpt {
+    margin: 0 0 4px;
+    font-size: 11px;
+    color: #bdc1c6;
+    overflow-wrap: anywhere;
+  }
+  .search-item .meta {
+    margin: 0;
+    font-size: 10px;
+    color: #9aa0a6;
+    overflow-wrap: anywhere;
+  }
+  .search-item .meta.shot { color: #35c759; }
+  .search-note { margin-top: 6px; font-size: 11px; color: #9aa0a6; }
 </style>
 </head>
 <body>
@@ -225,6 +257,13 @@
 
   <button id="downloadBackup" type="button" title="Download one snapshot of every stored annotation">Backup all annotations</button>
   <div id="backupResult" class="result"></div>
+
+  <div class="gap"></div>
+  <label for="searchInput">Search annotations</label>
+  <input id="searchInput" type="text" placeholder="Search notes, text, instructions..."
+         autocomplete="off" spellcheck="false" aria-describedby="searchStatus">
+  <div id="searchStatus" class="hint"></div>
+  <div id="searchResults" class="search-list" hidden></div>
 
   <div class="gap"></div>
   <p class="note">No account, no cloud: annotations, drafts, and downloads

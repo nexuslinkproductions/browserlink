@@ -30,7 +30,7 @@ else `~/.browserlink/annotations`. Annotations are stored under
 
 | Route | Method | Body | Response |
 |---|---|---|---|
-| `/annotations` | GET | - | `{files: [{name, size, mtime}]}` newest first (JSON files only) |
+| `/annotations` | GET | - | `{files: [{name, size, mtime}]}` newest first (JSON files only); optional `q`, `url`, and `since` query params filter the corpus (see [Search](#search-f7)) |
 | `/annotations` | POST | annotation payload (schema v1.8) | `200 {ok: true, file: "<name>.json"}`; `400` validation error, `413` payload over 10 MB, `400` malformed JSON |
 | `/annotations/<name>` | GET | - | stored annotation JSON or `404 {error: "not found"}` |
 | `/annotations/<name>/export.md` | GET | - | `200` Markdown AI brief (`text/markdown; charset=utf-8`) or `404` |
@@ -46,6 +46,24 @@ Annotation names must match `^[A-Za-z0-9._-]+$`; unsafe names (traversal
 like `..`, slashes) answer `400 {error: "invalid annotation name"}` on the
 export and share routes, and `404` on the plain annotation read; missing
 files answer `404 {error: "not found"}` everywhere.
+
+## Search (F7)
+
+`GET /annotations` accepts three optional query parameters that compose
+with AND semantics:
+
+| Param | Meaning |
+|---|---|
+| `q` | Full-text term: case-insensitive, NFC-normalized substring match across label, URL, page title, notes (and the legacy joined note), and per-element text and instruction |
+| `url` | URL substring filter, matched with the same normalization as `q` |
+| `since` | ISO 8601 timestamp; only annotations stored at or after it are returned. An unparseable value answers `400 {error: "invalid since timestamp"}` |
+
+An empty or absent `q` (with no other filter) preserves the plain
+newest-first list behavior and the exact `{files}` response shape. When any
+filter is present the response is `{files, skippedCorrupt}`:
+`skippedCorrupt` counts JSON records that could not be parsed and were
+skipped, so one corrupt record can never fail the whole query. Results stay
+newest-first, matching the plain list ordering.
 
 ## Export (Copy AI Brief)
 

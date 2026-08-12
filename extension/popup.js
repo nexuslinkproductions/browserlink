@@ -45,6 +45,13 @@
  *   - Every button reports the outcome honestly: format and file name on
  *     success, absent screenshot, empty corpus, hub offline, or a
  *     cancelled/failed download on failure. Copy AI Brief is unchanged.
+ *   - Search (F7): a debounced full-text query against
+ *     <endpoint>/annotations?q=<term> recalls stored annotations by their
+ *     label, URL, title, notes, and element text or instruction. Each result
+ *     shows the page, a matching excerpt, and screenshot availability; the
+ *     status line distinguishes an empty corpus, no match, a malformed
+ *     response, and a hub that is offline, and reports how many corrupt
+ *     records the hub skipped.
  */
 'use strict';
 
@@ -789,6 +796,172 @@ async function downloadBackup() {
   }
 }
 
+/* ---- Search annotations (F7): debounced local full-text recall ---- */
+
+const SEARCH_DEBOUNCE_MS = 250;
+const SEARCH_RESULT_CAP = 8;
+let searchTimer = null;
+
+/* NFC-normalized lowercase text, mirroring the hub search normalization. */
+function searchFold(value) {
+  return String(value == null ? '' : value).normalize('NFC').toLowerCase();
+}
+
+/* The same searchable fields the hub indexes: label, URL, title, notes,
+ * the legacy joined note, and per-element text and instruction. */
+function annotationSearchBlob(ann) {
+  const parts = [];
+  if (ann && typeof ann === 'object') {
+    for (const key of ['label', 'url', 'title']) {
+      if (typeof ann[key] === 'string') parts.push(ann[key]);
+    }
+    if (Array.isArray(ann.notes)) {
+      for (const note of ann.notes) {
+        if (typeof note === 'string') parts.push(note);
+      }
+    }
+    if (typeof ann.note === 'string') parts.push(ann.note);
+    if (Array.isArray(ann.elements)) {
+      for (const el of ann.elements) {
+        if (!el || typeof el !== 'object') continue;
+        for (const key of ['text', 'instruction']) {
+          if (typeof el[key] === 'string') parts.push(el[key]);
+        }
+      }
+    }
+  }
+  return parts.join('\n');
+}
+
+/* A short window around the first q hit. Matching runs on the NFC-folded
+ * text so indices align with the normalized blob being sliced. */
+function makeExcerpt(blob, qLower) {
+  const normalized = blob.normalize('NFC');
+  const idx = normalized.toLowerCase().indexOf(qLower);
+  if (idx < 0) return '';
+  const from = Math.max(0, idx - 45);
+  const to = Math.min(normalized.length, idx + qLower.length + 70);
+  let excerpt = normalized.slice(from, to).replace(/\s+/g, ' ');
+  if (from > 0) excerpt = '… ' + excerpt;
+  if (to < normalized.length) excerpt = excerpt + ' …';
+  return excerpt;
+}
+
+async function runSearch() {
+  const input = $('searchInput');
+  const status = $('searchStatus');
+  const results = $('searchResults');
+  const q = (input.value || '').trim();
+  if (!q) {
+    status.textContent = '';
+    status.className = 'hint';
+    results.hidden = true;
+    results.textContent = '';
+    return;
+  }
+  status.textContent = 'searching…';
+  status.className = 'hint';
+  results.hidden = true;
+  let endpoint;
+  try {
+    endpoint = await resolveEndpoint();
+  } catch (_) {
+    status.textContent = 'Search unavailable: hub offline.';
+    status.className = 'hint err';
+    return;
+  }
+  try {
+    const res = await fetch(endpoint + '/annotations?q=' + encodeURIComponent(q));
+    if (!res.ok) {
+      status.textContent = 'Search failed: hub answered ' + res.status + '.';
+      status.className = 'hint err';
+      return;
+    }
+    let body = null;
+    try {
+      body = await res.json();
+    } catch (_) { body = null; }
+    if (!body || !Array.isArray(body.files)) {
+      status.textContent = 'Search failed: malformed response from hub.';
+      status.className = 'hint err';
+      return;
+    }
+    const files = body.files;
+    if (files.length === 0) {
+      // Distinguish an empty corpus from a no-match query.
+      let corpusCount = 0;
+      try {
+        const plain = await fetch(endpoint + '/annotations');
+        const plainBody = await plain.json();
+        if (plainBody && Array.isArray(plainBody.files)) corpusCount = plainBody.files.length;
+      } catch (_) { /* corpus probe is best-effort */ }
+      status.className = 'hint';
+      status.textContent = corpusCount === 0
+        ? 'No annotations stored yet.'
+        : 'No matches for "' + q + '".';
+      return;
+    }
+    const qLower = searchFold(q);
+    const items = [];
+    const cap = Math.min(files.length, SEARCH_RESULT_CAP);
+    for (let i = 0; i < cap; i++) {
+      const file = files[i];
+      if (!file || !file.name) continue;
+      let ann = null;
+      try {
+        const detail = await fetch(
+          endpoint + '/annotations/' + encodeURIComponent(String(file.name)),
+        );
+        if (detail.ok) ann = await detail.json();
+      } catch (_) { ann = null; }
+      if (!ann || typeof ann !== 'object') continue;
+      const blob = annotationSearchBlob(ann);
+      const page = String(ann.title || ann.url || file.name);
+      const excerpt = makeExcerpt(blob, qLower);
+      const hasShot = typeof ann.screenshotFile === 'string' && ann.screenshotFile.length > 0;
+      items.push({ name: String(file.name), page: page, excerpt: excerpt, hasShot: hasShot });
+    }
+    // Render with textContent only: stored annotations are untrusted.
+    results.textContent = '';
+    for (const item of items) {
+      const row = document.createElement('div');
+      row.className = 'search-item';
+      const page = document.createElement('p');
+      page.className = 'page';
+      page.textContent = item.page;
+      row.appendChild(page);
+      if (item.excerpt) {
+        const excerpt = document.createElement('p');
+        excerpt.className = 'excerpt';
+        excerpt.textContent = item.excerpt;
+        row.appendChild(excerpt);
+      }
+      const meta = document.createElement('p');
+      meta.className = item.hasShot ? 'meta shot' : 'meta';
+      meta.textContent = item.name + ' · ' + (item.hasShot ? 'screenshot' : 'no screenshot');
+      row.appendChild(meta);
+      results.appendChild(row);
+    }
+    status.className = 'hint';
+    status.textContent = files.length > cap
+      ? cap + ' of ' + files.length + ' matches shown.'
+      : files.length + ' match' + (files.length === 1 ? '' : 'es');
+    if (typeof body.skippedCorrupt === 'number' && body.skippedCorrupt > 0) {
+      status.textContent += ' · ' + body.skippedCorrupt + ' corrupt record' +
+        (body.skippedCorrupt === 1 ? '' : 's') + ' skipped';
+    }
+    results.hidden = false;
+  } catch (_) {
+    status.textContent = 'Search unavailable: hub offline.';
+    status.className = 'hint err';
+  }
+}
+
+function onSearchInput() {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(runSearch, SEARCH_DEBOUNCE_MS);
+}
+
 /* wiring */
 $('toolToggle').addEventListener('change', onToolToggle);
 $('alwaysOnToggle').addEventListener('change', onAlwaysOnToggle);
@@ -807,6 +980,21 @@ $('copyShare').addEventListener('click', copyShareLink);
 $('saveCapture').addEventListener('click', saveCapture);
 $('downloadBundle').addEventListener('click', downloadBundle);
 $('downloadBackup').addEventListener('click', downloadBackup);
+$('searchInput').addEventListener('input', onSearchInput);
+$('searchInput').addEventListener('keydown', (event) => {
+  // Keyboard reachable: Enter runs the query immediately, Escape clears it.
+  if (event.key === 'Enter') {
+    if (searchTimer) clearTimeout(searchTimer);
+    runSearch();
+  } else if (event.key === 'Escape') {
+    $('searchInput').value = '';
+    if (searchTimer) clearTimeout(searchTimer);
+    $('searchStatus').textContent = '';
+    $('searchStatus').className = 'hint';
+    $('searchResults').hidden = true;
+    $('searchResults').textContent = '';
+  }
+});
 checkHub();
 loadEndpoint();
 loadLabel();

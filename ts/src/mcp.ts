@@ -101,6 +101,67 @@ export async function hubRequest(
 
 export type AnnotationFileInfo = { name: string; size: number; mtime: number };
 
+export type AnnotationListOptions = {
+  /** Full-text term across label, URL, title, notes, element text and instruction. */
+  q?: string;
+  /** URL substring filter (same normalization as q). */
+  url?: string;
+  /** ISO 8601 timestamp; only annotations stored at or after it are returned. */
+  since?: string;
+};
+
+/* ---------------------------------------------------------------------------
+ * F7: local full-text search. Same normalization, ordering, and result set
+ * as GET /annotations?q=&url=&since= on the hub: NFC-normalized,
+ * case-folded substring match across label, URL, title, notes, the legacy
+ * joined note, and per-element text and instruction. Unreadable records are
+ * skipped, never fatal, mirroring the REST route's skippedCorrupt behavior.
+ * ------------------------------------------------------------------------- */
+function normalizeSearchText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value.normalize("NFC").toLowerCase();
+}
+
+function annotationSearchText(annotation: JsonObject): string {
+  const parts: string[] = [];
+  for (const key of ["label", "url", "title"]) {
+    const value = annotation[key];
+    if (typeof value === "string") parts.push(value);
+  }
+  if (Array.isArray(annotation.notes)) {
+    for (const note of annotation.notes) {
+      if (typeof note === "string") parts.push(note);
+    }
+  }
+  const legacy = annotation.note;
+  if (typeof legacy === "string") parts.push(legacy);
+  if (Array.isArray(annotation.elements)) {
+    for (const element of annotation.elements) {
+      if (element === null || typeof element !== "object" || Array.isArray(element)) {
+        continue;
+      }
+      const record = element as JsonObject;
+      for (const key of ["text", "instruction"]) {
+        const value = record[key];
+        if (typeof value === "string") parts.push(value);
+      }
+    }
+  }
+  return parts.join("\n").normalize("NFC").toLowerCase();
+}
+
+async function tryReadAnnotation(name: string): Promise<JsonObject | null> {
+  try {
+    const value = JSON.parse(
+      await fs.readFile(join(annotationsDir(), name), "utf8"),
+    ) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    return value as JsonObject;
+  } catch {
+    return null;
+  }
+}
+
 export async function listAnnotationFiles(): Promise<AnnotationFileInfo[]> {
   const directory = annotationsDir();
   let entries;
@@ -126,6 +187,49 @@ export async function listAnnotationFiles(): Promise<AnnotationFileInfo[]> {
   return result;
 }
 
+export async function listAnnotationFilesFiltered(
+  options: AnnotationListOptions = {},
+): Promise<AnnotationFileInfo[]> {
+  const q = normalizeSearchText((options.q ?? "").trim());
+  const urlFilter = normalizeSearchText((options.url ?? "").trim());
+  const sinceRaw = options.since ?? "";
+  let sinceMs: number | null = null;
+  if (sinceRaw !== "") {
+    const parsed = Date.parse(sinceRaw);
+    if (Number.isNaN(parsed)) {
+      throw new Error("invalid since timestamp");
+    }
+    sinceMs = parsed;
+  }
+  const all = await listAnnotationFiles();
+  const filtering = q !== "" || urlFilter !== "" || sinceMs !== null;
+  if (!filtering) return all;
+
+  const out: AnnotationFileInfo[] = [];
+  for (const info of all) {
+    if (sinceMs !== null && info.mtime * 1000 < sinceMs) continue;
+    const annotation = await tryReadAnnotation(info.name);
+    if (annotation === null) continue; // corrupt record: skipped like REST
+    if (urlFilter !== "" && !normalizeSearchText(annotation.url).includes(urlFilter)) {
+      continue;
+    }
+    if (q !== "" && !annotationSearchText(annotation).includes(q)) continue;
+    out.push(info);
+  }
+  return out;
+}
+
+export async function annotationsList(
+  limit = 20,
+  options: AnnotationListOptions = {},
+): Promise<AnnotationFileInfo[]> {
+  if (limit < 0) {
+    throw new Error("limit must be non-negative");
+  }
+  const files = await listAnnotationFilesFiltered(options);
+  return files.slice(0, limit);
+}
+
 export async function hubStatus(): Promise<JsonObject> {
   const adapters: string[] = [];
   if (process.env.HERMES_API_URL && process.env.HERMES_API_KEY) {
@@ -135,14 +239,6 @@ export async function hubStatus(): Promise<JsonObject> {
     adapters.push("webhook");
   }
   return { ok: true, version: VERSION, dataDir: dataDir(), adapters };
-}
-
-export async function annotationsList(limit = 20): Promise<AnnotationFileInfo[]> {
-  if (limit < 0) {
-    throw new Error("limit must be non-negative");
-  }
-  const files = await listAnnotationFiles();
-  return files.slice(0, limit);
 }
 
 export async function annotationsGet(name: string): Promise<JsonObject> {
@@ -300,10 +396,17 @@ export function createMcpServer(): McpServer {
   server.registerTool(
     "annotations_list",
     {
-      description: "List annotation files, newest first.",
-      inputSchema: { limit: z.number().int().default(20).describe("Max files to return") },
+      description:
+        "List annotation files, newest first. Optional q (full-text term across label, URL, title, notes, element text and instruction), url (URL substring), and since (ISO 8601 timestamp) filters match the hub REST search semantics.",
+      inputSchema: {
+        limit: z.number().int().default(20).describe("Max files to return"),
+        q: z.string().optional().describe("Full-text term; case-insensitive NFC-normalized substring match"),
+        url: z.string().optional().describe("URL substring filter (same normalization as q)"),
+        since: z.string().optional().describe("ISO 8601 timestamp; only annotations stored at or after it"),
+      },
     },
-    async ({ limit }) => asText(await annotationsList(limit ?? 20)),
+    async ({ limit, q, url, since }) =>
+      asText(await annotationsList(limit ?? 20, { q, url, since })),
   );
 
   server.registerTool(

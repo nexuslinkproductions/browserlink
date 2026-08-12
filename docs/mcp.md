@@ -10,7 +10,7 @@ chat. Requires hub listening on `http://127.0.0.1:8787` (override with
 | Tool | Args | Returns |
 |---|---|---|
 | `hub_status` | none | `{ok, version, dataDir, adapters}` from local data-dir resolution |
-| `annotations_list` | `limit` (default 20) | newest-first file list `{name,size,mtime}` |
+| `annotations_list` | `limit` (default 20); `q`, `url`, `since` (all optional) | newest-first file list `{name,size,mtime}`, filtered with the same normalization, ordering, and result set as `GET /annotations?q=&url=&since=` |
 | `annotations_latest` | none | newest annotation object, or `{}` |
 | `annotations_get` | `name` | one annotation by safe file name |
 | `annotations_watch` | `seconds` (default 10) | names of files that appear while waiting |
@@ -78,5 +78,11 @@ Optional env:
 - Connect tools talk to the hub over HTTP (`urllib`). The hub must be running.
 - Annotation list/get/watch read the filesystem under `BROWSERLINK_DATA_DIR`
   (or the Hermes / default fallbacks documented in `docs/protocol.md`).
+- `annotations_list` search filters (F7) mirror the hub REST search: `q` is
+  a case-insensitive NFC-normalized substring match across label, URL, page
+  title, notes, and per-element text and instruction; `url` and `since`
+  compose with AND; an invalid `since` rejects with an error. Records that
+  cannot be read are skipped exactly like the REST route's `skippedCorrupt`
+  diagnostics, so REST and MCP return the same names in the same order.
 - Delivery to Hermes still needs `HERMES_API_URL` and `HERMES_API_KEY` on the
   hub process; the session comes from `target.json` when connected.

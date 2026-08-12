@@ -183,6 +183,61 @@ function stringOf(value: unknown): string {
 }
 
 /* ---------------------------------------------------------------------------
+ * F7: local full-text search.
+ *
+ * GET /annotations?q=<term>&url=<substring>&since=<ISO timestamp> filters the
+ * corpus before the newest-first listing. Search text is the NFC-normalized,
+ * case-folded concatenation of label, URL, title, notes, the legacy joined
+ * note, and per-element text and instruction. A JSON record that cannot be
+ * parsed as an object is skipped, never fatal, and counted in skippedCorrupt
+ * so callers can diagnose a partial corpus.
+ * ------------------------------------------------------------------------- */
+function normalizeSearchText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value.normalize("NFC").toLowerCase();
+}
+
+/** The full searchable text of one annotation (same fields as the docs). */
+function annotationSearchText(annotation: JsonObject): string {
+  const parts: string[] = [];
+  for (const key of ["label", "url", "title"]) {
+    const value = annotation[key];
+    if (typeof value === "string") parts.push(value);
+  }
+  if (Array.isArray(annotation.notes)) {
+    for (const note of annotation.notes) {
+      if (typeof note === "string") parts.push(note);
+    }
+  }
+  const legacy = annotation.note;
+  if (typeof legacy === "string") parts.push(legacy);
+  if (Array.isArray(annotation.elements)) {
+    for (const element of annotation.elements) {
+      if (element === null || typeof element !== "object" || Array.isArray(element)) {
+        continue;
+      }
+      const record = element as JsonObject;
+      for (const key of ["text", "instruction"]) {
+        const value = record[key];
+        if (typeof value === "string") parts.push(value);
+      }
+    }
+  }
+  return parts.join("\n").normalize("NFC").toLowerCase();
+}
+
+/** Read one stored annotation as an object, or null when unreadable. */
+function tryReadAnnotation(filePath: string): JsonObject | null {
+  try {
+    const value = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    return value as JsonObject;
+  } catch {
+    return null;
+  }
+}
+
+/* ---------------------------------------------------------------------------
  * Deterministic ZIP writer (store method, no compression).
  *
  * Depends only on the standard library (CRC-32 table built inline), so bundle
@@ -977,7 +1032,24 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
       }
       if (pathname === "/annotations") {
         const directory = annotationsDir();
+        const parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+        const q = normalizeSearchText((parsedUrl.searchParams.get("q") ?? "").trim());
+        const urlFilter = normalizeSearchText(
+          (parsedUrl.searchParams.get("url") ?? "").trim(),
+        );
+        const sinceRaw = parsedUrl.searchParams.get("since") ?? "";
+        let sinceMs: number | null = null;
+        if (sinceRaw !== "") {
+          const parsed = Date.parse(sinceRaw);
+          if (Number.isNaN(parsed)) {
+            sendJson(res, 400, { error: "invalid since timestamp" });
+            return;
+          }
+          sinceMs = parsed;
+        }
+        const filtering = q !== "" || urlFilter !== "" || sinceMs !== null;
         const files: Array<{ name: string; size: number; mtime: number }> = [];
+        let skippedCorrupt = 0;
         try {
           if (fs.existsSync(directory) && fs.statSync(directory).isDirectory()) {
             for (const name of fs.readdirSync(directory)) {
@@ -985,9 +1057,25 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
               const filePath = path.join(directory, name);
               try {
                 const st = fs.statSync(filePath);
-                if (st.isFile()) {
-                  files.push({ name, size: st.size, mtime: st.mtimeMs / 1000 });
+                if (!st.isFile()) continue;
+                if (sinceMs !== null && st.mtimeMs < sinceMs) continue;
+                if (filtering) {
+                  const annotation = tryReadAnnotation(filePath);
+                  if (annotation === null) {
+                    skippedCorrupt += 1;
+                    continue;
+                  }
+                  if (
+                    urlFilter !== "" &&
+                    !normalizeSearchText(annotation.url).includes(urlFilter)
+                  ) {
+                    continue;
+                  }
+                  if (q !== "" && !annotationSearchText(annotation).includes(q)) {
+                    continue;
+                  }
                 }
+                files.push({ name, size: st.size, mtime: st.mtimeMs / 1000 });
               } catch {
                 continue;
               }
@@ -997,7 +1085,11 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
           // empty list
         }
         files.sort((a, b) => b.mtime - a.mtime);
-        sendJson(res, 200, { files });
+        if (filtering) {
+          sendJson(res, 200, { files, skippedCorrupt });
+        } else {
+          sendJson(res, 200, { files });
+        }
         return;
       }
       // Convenience alias: export the newest stored annotation (same

@@ -256,3 +256,131 @@ describe("mcp connect tools against temp hub", () => {
     });
   });
 });
+
+/* ---------------------------------------------------------------------------
+ * F7: annotations_list search filters. Same semantics as the hub REST search
+ * (NFC-normalized, case-folded substring match over label/url/title/notes/
+ * element text/instruction; url and since compose with AND; invalid since
+ * rejects). Test names carry 'search', 'filter', or 'annotations_list' for
+ * the mechanism gate's --test-name-pattern.
+ * ------------------------------------------------------------------------- */
+describe("mcp annotations_list search filters", () => {
+  const mcpSeed = [
+    {
+      name: "20260101-000000-000.json",
+      record: {
+        url: "https://fixture.test/alpha",
+        title: "Alpha",
+        label: "Needle one",
+        notes: ["productivity hack"],
+        elements: [],
+      },
+    },
+    {
+      name: "20260101-000001-000.json",
+      record: {
+        url: "https://fixture.test/beta",
+        title: "Beta",
+        label: "Needle two",
+        notes: ["unrelated"],
+        elements: [
+          { index: 1, tag: "p", text: "Some body", instruction: "Make it pop" },
+        ],
+      },
+    },
+    {
+      name: "20260101-000002-000.json",
+      record: {
+        url: "https://other.test/gamma",
+        title: "Gamma",
+        label: "Unicode record",
+        notes: ["caf\u00e9 creme"], // composed e-acute (NFC)
+        elements: [],
+      },
+    },
+  ];
+
+  async function seedMcp(dir: string): Promise<void> {
+    const annotations = path.join(dir, "annotations");
+    await mkdir(annotations, { recursive: true });
+    for (const item of mcpSeed) {
+      await writeFile(
+        path.join(annotations, item.name),
+        JSON.stringify(item.record),
+      );
+      await new Promise((r) => setTimeout(r, 20)); // distinct mtimes
+    }
+  }
+
+  test("annotations_list q search matches across fields newest first", async () => {
+    await withTempDataDir(async (dir) => {
+      await seedMcp(dir);
+      const names = (list: { name: string }[]) => list.map((f) => f.name);
+      const byNeedle = await annotationsList(20, { q: "NEEDLE" });
+      assert.deepEqual(names(byNeedle), [
+        "20260101-000001-000.json",
+        "20260101-000000-000.json",
+      ]);
+      const byPop = await annotationsList(20, { q: "pop" });
+      assert.deepEqual(names(byPop), ["20260101-000001-000.json"]);
+      const byGamma = await annotationsList(20, { q: "gamma" });
+      assert.deepEqual(names(byGamma), ["20260101-000002-000.json"]);
+      // NFC: decomposed query hits the composed stored note.
+      const decomposed = await annotationsList(20, { q: "cafe\u0301" });
+      assert.deepEqual(names(decomposed), ["20260101-000002-000.json"]);
+      const noMatch = await annotationsList(20, { q: "absent" });
+      assert.deepEqual(noMatch, []);
+    });
+  });
+
+  test("annotations_list url and since filters compose with q", async () => {
+    await withTempDataDir(async (dir) => {
+      await seedMcp(dir);
+      const names = (list: { name: string }[]) => list.map((f) => f.name);
+      const byUrl = await annotationsList(20, { url: "fixture" });
+      assert.deepEqual(names(byUrl), [
+        "20260101-000001-000.json",
+        "20260101-000000-000.json",
+      ]);
+      const combined = await annotationsList(20, { q: "needle", url: "fixture" });
+      assert.deepEqual(names(combined), [
+        "20260101-000001-000.json",
+        "20260101-000000-000.json",
+      ]);
+      const excluded = await annotationsList(20, { q: "needle", url: "other" });
+      assert.deepEqual(excluded, []);
+      const sinceAll = await annotationsList(20, { since: "2026-01-01T00:00:00.000Z" });
+      assert.deepEqual(names(sinceAll), [
+        "20260101-000002-000.json",
+        "20260101-000001-000.json",
+        "20260101-000000-000.json",
+      ]);
+      const sinceFuture = await annotationsList(20, { since: "2099-01-01T00:00:00.000Z" });
+      assert.deepEqual(sinceFuture, []);
+    });
+  });
+
+  test("annotations_list invalid since rejects", async () => {
+    await withTempDataDir(async () => {
+      await assert.rejects(
+        () => annotationsList(20, { since: "not-a-date" }),
+        /invalid since timestamp/,
+      );
+    });
+  });
+
+  test("annotations_list empty q returns the full newest-first list", async () => {
+    await withTempDataDir(async (dir) => {
+      await seedMcp(dir);
+      const names = (list: { name: string }[]) => list.map((f) => f.name);
+      const full = await annotationsList(20, { q: "" });
+      assert.deepEqual(names(full), [
+        "20260101-000002-000.json",
+        "20260101-000001-000.json",
+        "20260101-000000-000.json",
+      ]);
+      const noOpts = await annotationsList(20);
+      assert.deepEqual(names(noOpts), names(full));
+    });
+  });
+});
