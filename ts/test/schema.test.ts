@@ -995,6 +995,90 @@ describe("validatePayload", () => {
     q.parentId = "item-2";
     assert.equal(validatePayload(q), null);
   });
+
+  // H12: negative element indices rejected.
+  it("rejects negative element index", () => {
+    const p = payload();
+    p.elements = [{ index: -5, tag: "button" }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].index must be a non-negative integer",
+    );
+  });
+
+  // H15: text caps enforced hub-side (matching extension MAX_INSTR/MAX_TEXT).
+  it("rejects overlong element instruction", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", instruction: "x".repeat(501) }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].instruction must be at most 500 characters",
+    );
+  });
+
+  it("rejects overlong element text", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", text: "x".repeat(201) }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].text must be at most 200 characters",
+    );
+  });
+
+  it("rejects overlong edits values", () => {
+    const p = payload();
+    p.elements = [
+      { index: 1, tag: "button", edits: { fontSize: "x".repeat(501) } },
+    ];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].edits.fontSize must be at most 500 characters",
+    );
+  });
+
+  it("rejects overlong title", () => {
+    assert.equal(
+      validatePayload({ ...payload(), title: "x".repeat(501) }),
+      "title must be at most 500 characters",
+    );
+  });
+
+  it("rejects overlong note and notes entries", () => {
+    assert.equal(
+      validatePayload({ ...payload(), note: "x".repeat(201) }),
+      "note must be at most 200 characters",
+    );
+    assert.equal(
+      validatePayload({ ...payload(), notes: ["ok", "x".repeat(201)] }),
+      "notes[1] must be at most 200 characters",
+    );
+  });
+
+  it("rejects too many notes entries", () => {
+    const p = payload();
+    p.notes = Array.from({ length: 21 }, () => "n");
+    assert.equal(
+      validatePayload(p),
+      "notes must have at most 20 entries",
+    );
+  });
+
+  it("accepts caps-at-limit text values", () => {
+    const p = payload();
+    p.title = "x".repeat(500);
+    p.note = "x".repeat(200);
+    p.notes = Array.from({ length: 20 }, () => "x".repeat(200));
+    p.elements = [
+      {
+        index: 0,
+        tag: "button",
+        text: "x".repeat(200),
+        instruction: "x".repeat(500),
+        edits: { width: "x".repeat(500) },
+      },
+    ];
+    assert.equal(validatePayload(p), null);
+  });
 });
 
 describe("validateTargetBody", () => {

@@ -350,9 +350,14 @@ export async function annotationsLatest(): Promise<JsonObject> {
   return annotationsGet(files[0].name);
 }
 
+// H14: annotations_watch awaits inside the single-threaded stdio server, so
+// an unbounded seconds value would block every other MCP tool for hours.
+// Cap the wait at 120s; the zod schema enforces the same bound.
+export const MAX_WATCH_SECONDS = 120;
+
 export async function annotationsWatch(seconds = 10): Promise<string[]> {
-  if (seconds < 0) {
-    throw new Error("seconds must be non-negative");
+  if (seconds < 0 || seconds > MAX_WATCH_SECONDS) {
+    throw new Error(`seconds must be between 0 and ${MAX_WATCH_SECONDS}`);
   }
   const before = new Set((await listAnnotationFiles()).map((item) => item.name));
   if (seconds) {
@@ -519,7 +524,13 @@ export function createMcpServer(): McpServer {
     {
       description: "Wait for new annotation files and return their names.",
       inputSchema: {
-        seconds: z.number().default(10).describe("Seconds to wait for new files"),
+        seconds: z
+          .number()
+          .int()
+          .min(0)
+          .max(MAX_WATCH_SECONDS)
+          .default(10)
+          .describe(`Seconds to wait for new files (0-${MAX_WATCH_SECONDS})`),
       },
     },
     async ({ seconds }) => asText(await annotationsWatch(seconds ?? 10)),

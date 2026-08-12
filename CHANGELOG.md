@@ -4,6 +4,62 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Hardened
+
+- **Unique annotation file names (H1)** - concurrent stores in the same
+  millisecond can no longer collide: `storeAnnotation` bumps a `-N` suffix
+  while the target name exists, so two simultaneous sends always produce
+  two distinct files and neither delivery is deduped away.
+- **Cross-origin request gate (H4)** - the hub now validates the `Origin`
+  header on every route: absent origins (curl, MCP, local tooling),
+  `chrome-extension:` / `moz-extension:` origins, and same-origin requests
+  are allowed; everything else is rejected with 403 `origin not allowed`.
+  Web pages can no longer POST annotations, redirect delivery, or read the
+  local annotation history without permission.
+- **Honest body handling (H10)** - `readJsonBody` accepts chunked
+  (`Transfer-Encoding`) requests, applies a 30s read deadline, rejects
+  declared-length mismatches with 400 `body length mismatch`, and never
+  claims `invalid JSON` for a truncated stream.
+- **Corrupt annotations are visible (H11)** - rendered routes
+  (export.md, share, share.png, bundle, thread) now return 500
+  `corrupt annotation` when a stored file fails to parse, instead of
+  hiding data-integrity problems behind 404.
+- **Documented screenshot ceiling reachable (H13)** - the raw body cap is
+  now 14MB (with the 4/3 base64 inflation documented), so a decoded
+  screenshot at the full documented 10MB contract is accepted instead of
+  being 413'd before validation.
+- **Element index validation (H12)** - `elements[].index` must be
+  non-negative; negative indexes are rejected with 400.
+- **Text length caps at the hub (H15)** - element instructions, text,
+  edits values, and titles are bounded to their documented limits at
+  validation time, matching the extension's own caps, so non-extension
+  clients cannot store megabyte strings that flow uncapped into exports.
+- **MCP watch bound (H14)** - `annotations_watch` seconds are capped
+  (max 120) so one call can no longer block the single-threaded stdio
+  server for hours.
+- **Hermes 5xx backoff actually sleeps (H3)** - the `/chat` fallback
+  retry loop now applies its documented backoff to HTTP 5xx responses
+  instead of hammering the upstream back-to-back.
+- **Sender-tab screenshot guard (H2)** - the extension only captures when
+  the sender tab is the active tab of its own window; otherwise the
+  screenshot is omitted (honest annotation without `screenshot`) rather
+  than storing a different page's capture.
+- **Send path endpoint consistency (H5)** - sends resolve the hub endpoint
+  exactly like the health check (stale stored endpoint falls back to
+  `DEFAULT_ENDPOINT`), so sends always target the endpoint the popup
+  reports as connected.
+- **Thread id from the send response (H6)** - the extension stamps the
+  thread `parentId` from the POST response `file` (the exact annotation
+  just stored), eliminating the cross-tab mtime race that produced
+  rejected `cross-thread parent` replies.
+- **Bounded draft store (H7)** - drafts are capped at 25 per profile with
+  oldest-first eviction by `savedAt`, and storage failures on config
+  writes are surfaced instead of silently swallowed.
+- **Send timeout (H9)** - the hub POST is bounded by a 20s abort timeout;
+  a stalled hub surfaces as a send failure and releases the busy lock.
+
 ## [2.7.0] - 2026-08-12
 
 ### Added

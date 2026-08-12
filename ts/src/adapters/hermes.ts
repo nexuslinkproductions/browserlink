@@ -532,6 +532,24 @@ async function deliverViaChat(
         );
         return;
       }
+      // H3: 5xx is transient - retry with the same attempt*1000s backoff as
+      // the network-error branch below. Without the sleep the three retries
+      // fired back-to-back, hammering a failing server.
+      if (attempt < maxAttempts) {
+        console.warn(
+          `Hermes adapter: /chat fallback HTTP ${response.status} (attempt ${attempt}); retrying in ${attempt}s`,
+        );
+        await new Promise((resolveWait) =>
+          setTimeout(resolveWait, attempt * 1000),
+        );
+        continue;
+      }
+      logError({
+        adapter: "hermes",
+        annotationId,
+        sessionId,
+        error: `HTTP ${response.status} after ${maxAttempts} attempts`,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (attempt < maxAttempts) {

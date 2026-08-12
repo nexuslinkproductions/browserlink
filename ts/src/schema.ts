@@ -129,6 +129,18 @@ export type EnvironmentSnapshot = {
 export const TEXT_QUOTE_KEYS = ["quote", "prefix", "suffix"] as const;
 export const MAX_QUOTE_TEXT = 5000;
 export const MAX_QUOTE_CONTEXT = 500;
+
+// H15: hub-side text caps matching the extension's own limits (MAX_INSTR
+// 500 and MAX_TEXT 200 in extension/content.js). The hub previously only
+// enforced the whole-body cap, so a client could store megabytes of
+// instruction/text/title that then flowed uncapped into export.md and
+// adapter messages.
+export const MAX_INSTR = 500; // per-element instruction; thread/notes text
+export const MAX_ELEMENT_TEXT = 200; // element text (extension MAX_TEXT)
+export const MAX_EDIT_VALUE = 500; // per-edit CSS value
+export const MAX_TITLE = 500; // page title
+export const MAX_NOTE_TEXT = 200; // top-level note / notes entries
+export const MAX_NOTES = 20; // notes queue length (extension slice(0, 20))
 export type TextQuote = {
   quote: string;
   prefix?: string;
@@ -399,6 +411,9 @@ export function validatePayload(payload: unknown): string | null {
   if (title !== undefined && title !== null && typeof title !== "string") {
     return "title must be a string";
   }
+  if (typeof title === "string" && title.length > MAX_TITLE) {
+    return `title must be at most ${MAX_TITLE} characters`;
+  }
 
   const viewport = obj.viewport;
   if (viewport === null || typeof viewport !== "object" || Array.isArray(viewport)) {
@@ -462,11 +477,34 @@ export function validatePayload(payload: unknown): string | null {
       }
       const el = element as Record<string, unknown>;
       const index = el.index;
-      if (typeof index !== "number" || !Number.isInteger(index)) {
-        return `elements[${elementIndex}].index must be an integer`;
+      // H12: reject negative indices (a negative index would render as
+      // "Element -5" in exports and break the extension's element picker).
+      if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
+        return `elements[${elementIndex}].index must be a non-negative integer`;
       }
       if (Object.keys(el).length < 2) {
         return `elements[${elementIndex}] must include at least one key besides index`;
+      }
+      // H15: per-element text caps. The extension slices these itself
+      // (instruction 500, text 200); the hub now enforces the same limits
+      // so an oversized client payload cannot flow uncapped into export.md.
+      const instruction = el.instruction;
+      if (instruction !== undefined && instruction !== null) {
+        if (typeof instruction !== "string") {
+          return `elements[${elementIndex}].instruction must be a string`;
+        }
+        if (instruction.length > MAX_INSTR) {
+          return `elements[${elementIndex}].instruction must be at most ${MAX_INSTR} characters`;
+        }
+      }
+      const elText = el.text;
+      if (elText !== undefined && elText !== null) {
+        if (typeof elText !== "string") {
+          return `elements[${elementIndex}].text must be a string`;
+        }
+        if (elText.length > MAX_ELEMENT_TEXT) {
+          return `elements[${elementIndex}].text must be at most ${MAX_ELEMENT_TEXT} characters`;
+        }
       }
       const edits = el.edits;
       if (edits !== undefined && edits !== null) {
@@ -479,6 +517,9 @@ export function validatePayload(payload: unknown): string | null {
           }
           if (typeof value !== "string") {
             return `elements[${elementIndex}].edits.${key} must be a string`;
+          }
+          if (value.length > MAX_EDIT_VALUE) {
+            return `elements[${elementIndex}].edits.${key} must be at most ${MAX_EDIT_VALUE} characters`;
           }
         }
       }
@@ -673,6 +714,36 @@ export function validatePayload(payload: unknown): string | null {
     }
     // Normalize to trimmed form for adapters / stored annotations.
     obj.sessionId = trimmed;
+  }
+
+  // H15: top-level note and notes caps. The extension slices the joined
+  // note and every queue entry to 200 characters and ships at most 20
+  // entries; the hub now enforces the same limits.
+  const note = obj.note;
+  if (note !== undefined && note !== null) {
+    if (typeof note !== "string") {
+      return "note must be a string";
+    }
+    if (note.length > MAX_NOTE_TEXT) {
+      return `note must be at most ${MAX_NOTE_TEXT} characters`;
+    }
+  }
+  const notes = obj.notes;
+  if (notes !== undefined && notes !== null) {
+    if (!Array.isArray(notes)) {
+      return "notes must be a list";
+    }
+    if (notes.length > MAX_NOTES) {
+      return `notes must have at most ${MAX_NOTES} entries`;
+    }
+    for (let notesIndex = 0; notesIndex < notes.length; notesIndex++) {
+      if (typeof notes[notesIndex] !== "string") {
+        return `notes[${notesIndex}] must be a string`;
+      }
+      if ((notes[notesIndex] as string).length > MAX_NOTE_TEXT) {
+        return `notes[${notesIndex}] must be at most ${MAX_NOTE_TEXT} characters`;
+      }
+    }
   }
 
   if ("screenshot" in obj) {
