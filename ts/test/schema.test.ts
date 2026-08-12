@@ -79,6 +79,28 @@ describe("validatePayload", () => {
     assert.equal(validatePayload(p), null);
   });
 
+  it("accepts the schema v1.5 text-formatting edit keys", () => {
+    const p = payload();
+    p.elements = [
+      {
+        index: 1,
+        tag: "span",
+        edits: {
+          textAlign: "center",
+          textTransform: "uppercase",
+          letterSpacing: "2px",
+          wordSpacing: "3px",
+          whiteSpace: "nowrap",
+          verticalAlign: "middle",
+          textDecoration: "underline",
+          fontStyle: "italic",
+          textShadow: "1px 1px 2px #000",
+        },
+      },
+    ];
+    assert.equal(validatePayload(p), null);
+  });
+
   it("rejects unknown edits keys", () => {
     const p = payload();
     p.elements = [{ index: 1, tag: "button", edits: { bogusKey: "1px" } }];
@@ -103,6 +125,67 @@ describe("validatePayload", () => {
     assert.equal(validatePayload(p), "elements[0].edits must be an object");
   });
 
+  it("accepts all valid intent and severity enum values", () => {
+    for (const intent of ["fix", "change", "question", "approve"]) {
+      for (const severity of ["blocking", "important", "suggestion"]) {
+        const p = payload();
+        p.elements = [{ index: 1, tag: "button", intent, severity }];
+        assert.equal(validatePayload(p), null, `intent=${intent} severity=${severity}`);
+      }
+    }
+  });
+
+  it("accepts intent alone and severity alone (schema v1.6 optional fields)", () => {
+    const onlyIntent = payload();
+    onlyIntent.elements = [{ index: 1, tag: "button", intent: "question" }];
+    assert.equal(validatePayload(onlyIntent), null);
+    const onlySeverity = payload();
+    onlySeverity.elements = [{ index: 1, tag: "button", severity: "suggestion" }];
+    assert.equal(validatePayload(onlySeverity), null);
+  });
+
+  it("accepts legacy elements without intent/severity (backward compatible)", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", text: "Log in", edits: { width: "48px" } }];
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("rejects unknown intent values", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", intent: "bogus" }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].intent must be one of fix, change, question, approve",
+    );
+  });
+
+  it("rejects unknown severity values", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", severity: "urgent" }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].severity must be one of blocking, important, suggestion",
+    );
+  });
+
+  it("rejects non-string intent", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", intent: 42 }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].intent must be one of fix, change, question, approve",
+    );
+  });
+
+  it("rejects non-string severity", () => {
+    const p = payload();
+    p.elements = [{ index: 1, tag: "button", severity: 42 }];
+    assert.equal(
+      validatePayload(p),
+      "elements[0].severity must be one of blocking, important, suggestion",
+    );
+  });
+
   it("accepts a valid PNG data URL screenshot", () => {
     const p = payload();
     p.screenshot = TINY_PNG_DATA_URL;
@@ -124,6 +207,130 @@ describe("validatePayload", () => {
       validatePayload(p),
       "strokes[0].points must contain at least two points",
     );
+  });
+
+  it("accepts a full captureState object (schema v1.6)", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: true,
+      hoveredSelector: "p#format-me",
+      activeElementSelector: "input#big-input",
+      openDetailsSelectors: ["#open-me"],
+    };
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts captureState with null selectors and empty details list", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: false,
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: [],
+    };
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts captureState with only animationsFrozen", () => {
+    const p = payload();
+    p.captureState = { animationsFrozen: true };
+    assert.equal(validatePayload(p), null);
+  });
+
+  it("accepts legacy payloads without captureState (backward compatible)", () => {
+    const p = payload();
+    assert.equal(validatePayload(p), null);
+    assert.equal("captureState" in p, false);
+  });
+
+  it("rejects unknown captureState keys", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: true,
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: [],
+      bogusKey: "x",
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState has unknown key 'bogusKey'",
+    );
+  });
+
+  it("rejects non-boolean animationsFrozen", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: "true",
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: [],
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState.animationsFrozen must be a boolean",
+    );
+  });
+
+  it("rejects captureState missing animationsFrozen", () => {
+    const p = payload();
+    p.captureState = {
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: [],
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState.animationsFrozen must be a boolean",
+    );
+  });
+
+  it("rejects non-string hoveredSelector", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: true,
+      hoveredSelector: 42,
+      activeElementSelector: null,
+      openDetailsSelectors: [],
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState.hoveredSelector must be a string or null",
+    );
+  });
+
+  it("rejects non-list openDetailsSelectors", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: true,
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: "#open-me",
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState.openDetailsSelectors must be a list",
+    );
+  });
+
+  it("rejects non-string entries in openDetailsSelectors", () => {
+    const p = payload();
+    p.captureState = {
+      animationsFrozen: true,
+      hoveredSelector: null,
+      activeElementSelector: null,
+      openDetailsSelectors: ["#ok", 7],
+    };
+    assert.equal(
+      validatePayload(p),
+      "captureState.openDetailsSelectors[1] must be a string",
+    );
+  });
+
+  it("rejects a non-object captureState", () => {
+    const p = payload();
+    p.captureState = ["animationsFrozen", true];
+    assert.equal(validatePayload(p), "captureState must be an object");
   });
 });
 

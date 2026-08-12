@@ -1,4 +1,4 @@
-# browserlink v1.2 — Interactive Element Inspector (Update A)
+# browserlink v1.2 - Interactive Element Inspector (Update A)
 
 Repo: /Users/marcelspatz/browserlink. Ships as its OWN PR (feat/inspector-v1.2 -> main),
 tag v1.2.0 after merge. Do NOT touch the v1.3 (connect) feature files.

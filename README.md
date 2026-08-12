@@ -3,7 +3,7 @@
 **Annotate in your browser. Deliver to any AI harness.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v2.3.0-4a9eff.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v2.5.0-4a9eff.svg)](CHANGELOG.md)
 [![CI](https://github.com/nexuslinkproductions/browserlink/actions/workflows/ci.yml/badge.svg)](https://github.com/nexuslinkproductions/browserlink/actions)
 [![MCP](https://img.shields.io/badge/MCP-server-ffd166.svg)](docs/mcp.md)
 [![Chromium](https://img.shields.io/badge/Chromium-MV3-ff5252.svg)](extension/manifest.json)
@@ -109,6 +109,25 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
   (tag, id, classes, text, href, cssPath, rect).
 - **Instruction chat** - a chat card per element: type your thoughts, edit on
   re-click, batch them all into one send.
+- **Intent and Priority** - optional per-element chips (fix/change/question/
+  approve and blocking/important/suggestion) that ship inside each element and
+  print as Intent/Priority labels in the harness message.
+- **Freeze State Capture** - one-click Freeze pauses CSS animations and
+  transitions for a clean, stable crop (active state is reported in the
+  send), and annotations carry structured `captureState` metadata: the frozen
+  flag plus the last hovered, focused, and open native details selectors.
+  Works on any site without app instrumentation; the injected freeze style is
+  always removed on exit.
+- **Persistent Drafts** - unsent strokes, queued notes, and element
+  instructions survive a refresh: drafts are stored locally per canonical
+  URL and restored with best-effort cssPath re-anchoring (unresolved markers
+  are counted, never dropped). No account, no cloud sync; a draft clears
+  only after a confirmed Send or Clear All.
+- **Copy AI Brief** - one click copies the newest annotation as an AI-ready
+  Markdown brief: page URL/title/viewport, per-element cssPaths,
+  instructions, edits, Intent/Priority, capture state, notes, stroke
+  summary, and local `@file`/`@image` references (`GET
+  /annotations/latest/export.md`).
 - **Activation toggle** - a master switch in the popup (default ON, persisted
   per profile): deactivates the tool on the current page with one click, and
   re-activates it straight from the popup.

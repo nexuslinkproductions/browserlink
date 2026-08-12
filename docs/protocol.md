@@ -1,7 +1,13 @@
-# browserlink protocol - annotation schema v1.5
+# browserlink protocol - annotation schema v1.6
 
 The public contract between the extension, the hub, and any harness. Versioned;
 changes require a new minor or major version and a compatibility shim.
+
+**Schema v1.6** (backward compatible with v1.0 through v1.5): adds optional
+per-element `elements[].intent` and `elements[].severity` metadata chosen from
+strict enums and an optional top-level `captureState` object carrying Freeze
+State Capture metadata (see below). Wrong types and unknown keys return HTTP
+400; payloads without either field remain valid.
 
 **Schema v1.5** (backward compatible with v1.0 through v1.4): extends
 `elements[].edits` with text-formatting keys used by the inspector editor
@@ -49,6 +55,8 @@ HTTP 400.
       "cssPath": "html body form button",
       "rect": { "x": 0.4, "y": 0.5, "w": 0.2, "h": 0.05 },
       "instruction": "Make this blue and round",
+      "intent": "fix",
+      "severity": "blocking",
       "edits": { "width": "48px", "fontSize": "16px", "color": "#0af",
                  "text": "Shop now" } }
   ]
@@ -65,8 +73,9 @@ HTTP 400.
 | `viewport` | object | required; `w`, `h` positive integers |
 | `label` | string | optional; user context label, ≤ 200 chars |
 | `strokes` | array | required; each: `color` string, `width` number > 0, `points` array of ≥ 2 `[x, y]` pairs, each coordinate in `[0, 1]` (normalized to the annotation viewport) |
-| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below) |
+| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below) |
 | `screenshot` | string | optional (schema v1.4); PNG data URL `data:image/png;base64,<data>`; max 10MB decoded; non-PNG or invalid base64 → HTTP 400 |
+| `captureState` | object | optional (schema v1.6); Freeze State Capture metadata, exactly four typed fields (see below); unknown keys → HTTP 400 |
 
 The hub stores the payload and may rewrite `screenshot` (see below). It may
 add `ts` (epoch ms) and `savedAt` (ISO-8601 UTC).
@@ -114,6 +123,62 @@ Rules:
 - Non-string values are rejected by hub validation with HTTP 400.
 - Consumers apply the edits onto the captured element; values are applied as
   given (CSS values for style properties, plain text for `text`/`href`).
+
+### elements[].intent and elements[].severity (schema v1.6)
+
+Optional per-element metadata picked in the element chat card and stored inside
+`elements[]` (never duplicated at the top level). Both fields are optional and
+independent: an element can carry either, both, or neither. The hub validates
+them as strict enums.
+
+| Field | Type | Allowed values |
+|---|---|---|
+| `intent` | string (enum) | `fix`, `change`, `question`, `approve` |
+| `severity` | string (enum) | `blocking`, `important`, `suggestion` |
+
+Rules:
+
+- Absent fields are always valid (backward compatible with all earlier
+  schemas); they mean "not specified".
+- Wrong types (e.g. `"intent": 42`) and unknown values (e.g.
+  `"severity": "urgent"`) are rejected by hub validation with HTTP 400.
+- The wire key is `severity`; harness-facing text renders it under the
+  user-facing label **Priority**.
+
+### captureState (schema v1.6)
+
+Optional top-level object carrying Freeze State Capture metadata: whether the
+page's CSS animations and transitions were paused for the capture period, and
+the observed hovered / focused / open-details state at send time. The
+extension reports observed state only; it never emulates `:hover` or other
+pseudo-classes. Payloads without `captureState` are stored unchanged
+(backward compatible with every earlier schema).
+
+```json
+"captureState": {
+  "animationsFrozen": true,
+  "hoveredSelector": "p#format-me",
+  "activeElementSelector": "input#big-input",
+  "openDetailsSelectors": ["details#open-me"]
+}
+```
+
+| Field | Type | Rules |
+|---|---|---|
+| `animationsFrozen` | boolean | **required** whenever `captureState` is present; true while the Freeze control is active (one extension-owned style element pauses animations and zeroes transition duration/delay for the capture period) |
+| `hoveredSelector` | string \| null | optional; the last meaningful hovered selector observed by the element-mode hover tracking, or null when none was observed |
+| `activeElementSelector` | string \| null | optional; `document.activeElement` selector when it is a real page element, or null (never the extension's own UI) |
+| `openDetailsSelectors` | array of strings | optional; cssPath of every open native `<details[open]>` element at send time; `[]` when none |
+
+Rules:
+
+- `captureState` must be an object with exactly these four fields; unknown
+  keys are rejected by hub validation with HTTP 400.
+- Wrong types (e.g. `"animationsFrozen": "true"`, a number in
+  `openDetailsSelectors`) are rejected with HTTP 400.
+- Selectors are informational metadata for the harness; consumers must not
+  rely on them being live `querySelector` targets (elements may change
+  between capture and consumption).
 
 ### Responses
 
@@ -216,9 +281,12 @@ Consumers map them back by multiplying with their own viewport dimensions.
 
 ## Versioning
 
-This is **schema v1.5**: backward compatible with v1.0 through v1.4. The
-v1.5 text-formatting `edits` keys are additive; older payloads validate and
-store unchanged. Schema v1.4 added optional `screenshot` / `screenshotFile`.
-Schema v1.1 added optional `elements[].edits`. Breaking changes (new required
-fields, coordinate semantics, endpoint removal) bump to v2 with a deprecation
-window: the hub accepts both versions for one minor release.
+This is **schema v1.6**: backward compatible with v1.0 through v1.5. The
+v1.6 additions are additive and optional: the per-element `intent` /
+`severity` enums and the top-level `captureState` object; older payloads
+validate and store unchanged. Schema v1.5 extended
+`elements[].edits` with text-formatting keys. Schema v1.4 added optional
+`screenshot` / `screenshotFile`. Schema v1.1 added optional `elements[].edits`.
+Breaking changes (new required fields, coordinate semantics, endpoint removal)
+bump to v2 with a deprecation window: the hub accepts both versions for one
+minor release.

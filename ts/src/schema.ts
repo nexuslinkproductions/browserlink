@@ -1,10 +1,10 @@
-/** Shared annotation schema (v1.4), single source of truth for hub + MCP. */
+/** Shared annotation schema (v1.6), single source of truth for hub + MCP. */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-export const VERSION = "2.2.0";
+export const VERSION = "2.5.0";
 
 export const SCREENSHOT_PREFIX = "data:image/png;base64,";
 export const MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024;
@@ -28,9 +28,39 @@ export const ALLOWED_EDIT_KEYS = new Set([
   "margin",
   "padding",
   "borderRadius",
+  // Schema v1.5: text-formatting keys emitted by the inspector text editor.
+  "textAlign",
+  "textTransform",
+  "letterSpacing",
+  "wordSpacing",
+  "whiteSpace",
+  "verticalAlign",
+  "textDecoration",
+  "fontStyle",
+  "textShadow",
 ]);
 
 export const NAME_RE = /^[A-Za-z0-9._-]+$/;
+
+// Schema v1.6: optional per-element intent and severity. Both are optional
+// for full backward compatibility; when present they must be exact enum
+// values (wrong types and unknown values are rejected with HTTP 400).
+export const INTENT_VALUES = ["fix", "change", "question", "approve"] as const;
+export const SEVERITY_VALUES = ["blocking", "important", "suggestion"] as const;
+export type Intent = (typeof INTENT_VALUES)[number];
+export type Severity = (typeof SEVERITY_VALUES)[number];
+
+// Schema v1.6: optional top-level capture state (Freeze State Capture).
+// Only these four fields are accepted; unknown keys are rejected with
+// HTTP 400. animationsFrozen is required whenever captureState is present.
+// Type alias (not interface): implicit index signatures keep this assignable
+// to JsonValue for the AnnotationPayload string index.
+export type CaptureState = {
+  animationsFrozen: boolean;
+  hoveredSelector: string | null;
+  activeElementSelector: string | null;
+  openDetailsSelectors: string[];
+};
 
 export type JsonValue =
   | null
@@ -60,6 +90,7 @@ export interface AnnotationPayload {
   elements?: Array<Record<string, JsonValue>>;
   screenshot?: string;
   screenshotFile?: string;
+  captureState?: CaptureState;
   [key: string]: JsonValue | undefined;
 }
 
@@ -315,6 +346,27 @@ export function validatePayload(payload: unknown): string | null {
           }
         }
       }
+      // Schema v1.6: optional intent and severity, strict enums. Both are
+      // optional; absent fields stay valid (backward compatible). Wrong
+      // types and unknown values are rejected.
+      const intent = el.intent;
+      if (intent !== undefined) {
+        if (
+          typeof intent !== "string" ||
+          !(INTENT_VALUES as readonly string[]).includes(intent)
+        ) {
+          return `elements[${elementIndex}].intent must be one of fix, change, question, approve`;
+        }
+      }
+      const severity = el.severity;
+      if (severity !== undefined) {
+        if (
+          typeof severity !== "string" ||
+          !(SEVERITY_VALUES as readonly string[]).includes(severity)
+        ) {
+          return `elements[${elementIndex}].severity must be one of blocking, important, suggestion`;
+        }
+      }
     }
   }
 
@@ -365,6 +417,50 @@ export function validatePayload(payload: unknown): string | null {
     }
     if (raw.length > MAX_SCREENSHOT_BYTES) {
       return "screenshot exceeds 10MB decoded size";
+    }
+  }
+
+  // Schema v1.6: optional top-level captureState (Freeze State Capture).
+  // Backward compatible: payloads without captureState stay valid. When
+  // present it must be an object with exactly the four typed fields and
+  // nothing else; animationsFrozen is required, the two selectors are
+  // optional string|null, openDetailsSelectors is an optional string list.
+  const CAPTURE_STATE_KEYS = [
+    "animationsFrozen",
+    "hoveredSelector",
+    "activeElementSelector",
+    "openDetailsSelectors",
+  ] as const;
+  if ("captureState" in obj) {
+    const cs = obj.captureState;
+    if (cs === null || typeof cs !== "object" || Array.isArray(cs)) {
+      return "captureState must be an object";
+    }
+    const cso = cs as Record<string, unknown>;
+    for (const key of Object.keys(cso)) {
+      if (!(CAPTURE_STATE_KEYS as readonly string[]).includes(key)) {
+        return `captureState has unknown key '${key}'`;
+      }
+    }
+    if (typeof cso.animationsFrozen !== "boolean") {
+      return "captureState.animationsFrozen must be a boolean";
+    }
+    for (const key of ["hoveredSelector", "activeElementSelector"] as const) {
+      const value = cso[key];
+      if (value !== undefined && value !== null && typeof value !== "string") {
+        return `captureState.${key} must be a string or null`;
+      }
+    }
+    const openDetails = cso.openDetailsSelectors;
+    if (openDetails !== undefined && openDetails !== null) {
+      if (!Array.isArray(openDetails)) {
+        return "captureState.openDetailsSelectors must be a list";
+      }
+      for (let i = 0; i < openDetails.length; i++) {
+        if (typeof openDetails[i] !== "string") {
+          return `captureState.openDetailsSelectors[${i}] must be a string`;
+        }
+      }
     }
   }
 

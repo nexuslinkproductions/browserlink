@@ -1,11 +1,11 @@
-# browserlink v1.3 — Invoke & Connect from Any Chat (Update B)
+# browserlink v1.3 - Invoke & Connect from Any Chat (Update B)
 
 Repo: /Users/marcelspatz/browserlink. Ships as its OWN PR (feat/connect-v1.3 -> main),
 tag v1.3.0 after merge. Do NOT touch the v1.2 (inspector) feature files.
 
 Goal: from ANY harness chat (Hermes, Claude Code, Cursor, Codex, ...), a user
-can invoke the tool — the browser extension activates and annotations deliver
-to THAT chat — without manually linking chat to tool.
+can invoke the tool - the browser extension activates and annotations deliver
+to THAT chat - without manually linking chat to tool.
 
 ## Architecture
   any harness chat -> MCP tool browserlink_connect(sessionId, label, activate)
@@ -38,7 +38,7 @@ docs/mcp.md, README.md, CHANGELOG.md, tests/test_hub.py, tests/test_mcp.py
      \nLabel: <label>\nE1: button#submit.btn 'Log in' - instruction: ... -
      edits: width=48px fontSize=16px\n..." (elements enumerated; strokes
      summarized as "N stroke(s)")
-3. MCP (mcp/mcp_server.py) — new tools (keep existing ones):
+3. MCP (mcp/mcp_server.py) - new tools (keep existing ones):
    - browserlink_connect(sessionId: str, label: str = "", activate: bool =
      True) -> hub POST /target + /activate; returns {"ok", "sessionId",
      "label", "activate"}
@@ -47,7 +47,7 @@ docs/mcp.md, README.md, CHANGELOG.md, tests/test_hub.py, tests/test_mcp.py
    - browserlink_status() -> hub GET /status + GET /target merged
    - mcp docs (docs/mcp.md): document the three tools + per-harness examples
      (Claude Code .mcp.json entry, Hermes: `hermes mcp add browserlink --command
-     browserlink-mcp` as a user-side command — do NOT run it)
+     browserlink-mcp` as a user-side command - do NOT run it)
 4. EXTENSION (extension/service-worker.js):
    - chrome.alarms.create("browserlink-poll", {periodInMinutes: 0.5}) on
      install/startup; alarm handler: GET <endpoint>/target; if target.activate

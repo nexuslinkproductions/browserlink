@@ -24,6 +24,7 @@ import {
 } from "./schema.ts";
 import * as hermes from "./adapters/hermes.ts";
 import * as webhook from "./adapters/webhook.ts";
+import { formatAnnotationMarkdown } from "./markdown.ts";
 
 export {
   dataDir,
@@ -311,6 +312,37 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
   reloadAdapters();
   const fetchImpl = options.fetchImpl ?? fetch;
 
+  // Serve one stored annotation as a Markdown AI brief. Unsafe names answer
+  // 400 "invalid annotation name"; missing files answer 404 "not found".
+  function serveExportMd(res: http.ServerResponse, name: string): void {
+    const filePath = path.join(annotationsDir(), name);
+    try {
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+        sendJson(res, 404, { error: "not found" });
+        return;
+      }
+      const annotation = JSON.parse(
+        fs.readFileSync(filePath, "utf8"),
+      ) as JsonObject;
+      const markdown = formatAnnotationMarkdown(
+        annotation,
+        name,
+        annotationsDir(),
+      );
+      const body = Buffer.from(markdown, "utf8");
+      res.writeHead(200, {
+        "Content-Type": "text/markdown; charset=utf-8",
+        "Content-Length": body.length,
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+      });
+      res.end(body);
+    } catch {
+      sendJson(res, 404, { error: "not found" });
+    }
+  }
+
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? "GET";
     const pathname = requestPathname(req.url);
@@ -370,6 +402,50 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
         }
         files.sort((a, b) => b.mtime - a.mtime);
         sendJson(res, 200, { files });
+        return;
+      }
+      // Convenience alias: export the newest stored annotation (same
+      // mtime ordering as GET /annotations) as Markdown.
+      if (pathname === "/annotations/latest/export.md") {
+        const directory = annotationsDir();
+        let newest: string | null = null;
+        try {
+          if (fs.existsSync(directory) && fs.statSync(directory).isDirectory()) {
+            const files: Array<{ name: string; mtime: number }> = [];
+            for (const name of fs.readdirSync(directory)) {
+              if (!name.endsWith(".json") || !NAME_RE.test(name)) continue;
+              const filePath = path.join(directory, name);
+              try {
+                const st = fs.statSync(filePath);
+                if (st.isFile()) files.push({ name, mtime: st.mtimeMs });
+              } catch {
+                continue;
+              }
+            }
+            files.sort((a, b) => b.mtime - a.mtime);
+            newest = files.length > 0 ? files[0].name : null;
+          }
+        } catch {
+          newest = null;
+        }
+        if (newest === null) {
+          sendJson(res, 404, { error: "not found" });
+          return;
+        }
+        serveExportMd(res, newest);
+        return;
+      }
+      if (pathname.startsWith("/annotations/") && pathname.endsWith("/export.md")) {
+        const name = pathname.slice(
+          "/annotations/".length,
+          -"/export.md".length,
+        );
+        // Unsafe names (any "/", "\", or "..") answer 400; missing files 404.
+        if (!isSafeName(name)) {
+          sendJson(res, 400, { error: "invalid annotation name" });
+          return;
+        }
+        serveExportMd(res, name);
         return;
       }
       if (pathname.startsWith("/annotations/")) {

@@ -48,7 +48,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists — skipping"
+            echo "Release $TAG already exists - skipping"
             exit 0
           fi
           PRERELEASE_ARGS=()

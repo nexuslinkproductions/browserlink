@@ -64,6 +64,12 @@
  * elements[] entries carry "edits": {property: desiredValue} when edited.
  * status shows "bridge offline" on failure; success clears the status (the
  * markers are cleared only after a successful send.
+ * Drafts (F3) persist across refresh in chrome.storage.local, keyed by the
+ * canonical URL (origin + pathname + search, hash excluded): normalized
+ * strokes, queued notes, and element descriptors (instruction + optional
+ * intent/severity) restore on reinject with best-effort cssPath
+ * re-anchoring. The draft clears only after a confirmed successful Send or
+ * Clear All; live CSS/text edits are never stored or replayed.
  *
  * The page DOM is NEVER touched beyond appending the shadow host.
  */
@@ -80,6 +86,10 @@
   const BRIDGE_OFFLINE = 'bridge offline';
   const MAX_TEXT = 200;
   const MAX_INSTR = 500;
+  // Schema v1.6: optional per-element intent and severity chips (both unset
+  // by default; exactly one of each may be selected per element).
+  const INTENTS = ['fix', 'change', 'question', 'approve'];
+  const SEVERITIES = ['blocking', 'important', 'suggestion'];
   const MAX_CSS_PATH = 8;
   const MAX_PARENT_WALK = 5;
   const HL_COLOR = '#4a9eff';
@@ -112,6 +122,7 @@
     collapsedCats: {},   // { Text: true, Layout: false, ... } inspector category collapse
     dock: null,          // inspector edge dock: 'left'|'top'|'right'|'bottom'|null (null = floating popup)
     inspSize: null,      // {w, h} inspector panel size from the corner resize handle
+    frozen: false,       // Freeze State Capture: page motion paused for the capture period
   };
 
   // Element inspector: {el, descriptor} - descriptor is the object that
@@ -148,6 +159,7 @@
   let hoverBoxEl = null;     // stronger element-mode hover box (v1.6; coexists with hlEl)
   let hoverBoxRaf = 0;       // rAF throttle for scroll/resize box recompute
   let chatCard = null;
+  let inspMetaEl = null; // intent/severity chip row inside the element inspector
   let chatHead = null;
   let chatInput = null;
   let chipEl = null;         // 48px collapsed chip
@@ -185,6 +197,31 @@
   let selectionPulseRaf = 0;
   let selectionPulseStarted = 0;
   let lastSelectionCount = -1;
+
+  /* ---------------- Freeze State Capture (schema v1.6) ----------------
+   * One extension-owned style element pauses CSS animations and zeroes
+   * transition duration/delay for the capture period. State is reported,
+   * never emulated: we retain the last meaningful hovered selector from the
+   * element-mode hover tracking and sample document.activeElement plus open
+   * native <details> at send time. The style element is ALWAYS removed on
+   * fullExit/teardown; nothing is written into author styles. */
+  const FREEZE_STYLE_ID = 'browserlink-freeze-style';
+  // :root gives the rule (0,1,0) specificity: it beats element-level author
+  // !important rules and ties class-level ones (we are appended last in the
+  // cascade, so ties resolve in our favor). Appending to documentElement
+  // (after <body>) is the last author stylesheet position. Page styles with
+  // id-level !important animation rules can still win; rewriting every
+  // stylesheet rule is explicitly out of scope, this is a capture aid.
+  const FREEZE_CSS =
+    ':root *,' +
+    ':root *::before,:root *::after{' +
+    'animation-play-state:paused !important;' +
+    'transition-duration:0s !important;' +
+    'transition-delay:0s !important;' +
+    '}';
+  const MAX_OPEN_DETAILS = 50; // defensive cap on reported selectors
+  let freezeStyleEl = null;    // the injected style element (extension-owned)
+  let lastHoveredSelector = null; // last meaningful hovered selector observed
 
   /* ---------------- drag + per-tab persistence ---------------- */
   let drag = null;             // active toolbar/chip pointer drag
@@ -273,6 +310,18 @@
 
   // Lazy JSON snapshot of tool state. Nothing is cached; callers pay the cost
   // only when they ask (diag(), dump(), or the overlay panel).
+  function diagMetaCounts(key, values) {
+    const counts = {};
+    for (const v of values) counts[v] = 0;
+    for (const en of state.elements) {
+      const d = en && en.descriptor;
+      if (d && typeof d[key] === 'string' && Object.prototype.hasOwnProperty.call(counts, d[key])) {
+        counts[d[key]] += 1;
+      }
+    }
+    return counts;
+  }
+
   function diagDump() {
     return {
       tool: 'browserlink',
@@ -303,11 +352,32 @@
           tag: (en.descriptor && en.descriptor.tag) ? en.descriptor.tag : '',
           instructionLen: (en.descriptor && en.descriptor.instruction) ? en.descriptor.instruction.length : 0,
         })),
+        // Schema v1.6: committed metadata counts by intent and severity.
+        meta: {
+          intent: diagMetaCounts('intent', INTENTS),
+          severity: diagMetaCounts('severity', SEVERITIES),
+        },
       },
       annotNote: state.annotNote || '',
       annotNotes: state.annotNotes.length,
       strokes: state.strokes.length,
       captureRect: diagLastCaptureRect,
+      // Freeze State Capture: frozen flag + last observed hovered selector.
+      freeze: {
+        frozen: !!(state.frozen && freezeInjected()),
+        hoveredSelector: lastHoveredSelector,
+      },
+      // Persistent Drafts (F3): restore bookkeeping. Null until the first
+      // restore attempt for this page context; after Clear All or a
+      // confirmed successful Send the key is removed and stats reset.
+      draft: draftStats ? {
+        key: draftStats.key,
+        ageMs: draftStats.ageMs,
+        restored: draftStats.restored,
+        restoredStrokes: draftStats.restoredStrokes,
+        restoredNotes: draftStats.restoredNotes,
+        unresolved: draftStats.unresolved,
+      } : { key: null, ageMs: 0, restored: 0, restoredStrokes: 0, restoredNotes: 0, unresolved: 0 },
       canvasCtx: !!(canvas && ctx),
       messagesBound: messagesBound,
       health: diagHealth(false),
@@ -467,6 +537,238 @@
         });
       } catch (_) { resolve(); }
     });
+  }
+
+  /* ---------------- Persistent Drafts (F3) ----------------
+   * Draft persistence across page refresh, stored in chrome.storage.local
+   * under a key derived from the canonical URL (origin + pathname + search,
+   * hash excluded). The stored draft is compact: normalized strokes, queued
+   * notes, and element descriptors (instruction + optional intent/severity).
+   * NO screenshots, NO page HTML, NO CSS/text edits. The draft is cleared
+   * only after a confirmed successful Send or Clear All; failed sends keep
+   * it. This is separate from the per-tab chrome.storage.session state
+   * (key "browserlink:<tabId>") and never collides with it.
+   */
+  const DRAFT_PERSIST_MS = 300; // debounce window for writeDraft
+  const DRAFT_SAVE_VERSION = 1;
+  let draftTimer = 0;
+  // Restore bookkeeping for diagnostics: null until a restore attempt ran.
+  let draftStats = null;
+  // One restore per page context: reinjection on the same page must not
+  // replay the draft (in-memory state already survives a same-page exit).
+  let draftRestoredForLoad = false;
+
+  function canonicalDraftUrl() {
+    let u = null;
+    try {
+      u = new URL(String(location.href || ''));
+    } catch (_) { u = null; }
+    if (u) {
+      u.hash = '';
+      return u.origin + u.pathname + u.search;
+    }
+    const href = String(location.href || '');
+    const hashAt = href.indexOf('#');
+    return hashAt === -1 ? href : href.slice(0, hashAt);
+  }
+
+  function draftKey() {
+    return 'draft:' + canonicalDraftUrl();
+  }
+
+  // Compact serialization of the current in-memory draft. Only strokes,
+  // notes, and element descriptors ship; edits/screenshots/html never do.
+  function draftPayload() {
+    return {
+      v: DRAFT_SAVE_VERSION,
+      url: canonicalDraftUrl(),
+      savedAt: new Date().toISOString(),
+      strokes: state.strokes.map((s) => ({
+        color: s.color,
+        width: s.width,
+        points: s.points,
+      })),
+      notes: state.annotNotes.slice(0, 20).map((n) => String(n).slice(0, MAX_INSTR)),
+      elements: state.elements.map((en) => {
+        const d = en && en.descriptor ? en.descriptor : {};
+        const out = {
+          index: d.index,
+          tag: d.tag,
+          id: d.id,
+          className: d.className,
+          text: d.text,
+          href: d.href,
+          ariaLabel: d.ariaLabel,
+          cssPath: d.cssPath,
+          rect: d.rect,
+          instruction: String(d.instruction || '').slice(0, MAX_INSTR),
+        };
+        // Schema v1.6: optional per-element intent/severity survive the draft.
+        if (INTENTS.indexOf(d.intent) !== -1) out.intent = d.intent;
+        if (SEVERITIES.indexOf(d.severity) !== -1) out.severity = d.severity;
+        return out;
+      }),
+    };
+  }
+
+  function writeDraft() {
+    draftTimer = 0;
+    const key = draftKey();
+    const draft = draftPayload();
+    if (!draft.strokes.length && !draft.notes.length && !draft.elements.length) {
+      try { chrome.storage.local.remove(key).catch(() => {}); } catch (_) { /* storage unavailable */ }
+      return;
+    }
+    try {
+      const obj = {};
+      obj[key] = draft;
+      chrome.storage.local.set(obj).catch(() => {});
+    } catch (_) { /* storage unavailable */ }
+  }
+
+  // Debounced persist: every state mutation schedules one write.
+  function persistDraft() {
+    if (draftTimer) clearTimeout(draftTimer);
+    draftTimer = setTimeout(writeDraft, DRAFT_PERSIST_MS);
+  }
+
+  // Immediate write for refresh durability (pagehide flush). Skips the
+  // empty-removal path of writeDraft so exiting the tool (which empties the
+  // in-memory state) can never clear a stored draft: only confirmed Send
+  // success or Clear All clears it.
+  function flushDraft() {
+    if (draftTimer) { clearTimeout(draftTimer); draftTimer = 0; }
+    if (!state.strokes.length && !state.annotNotes.length && !state.elements.length) {
+      // In-memory draft is empty: mirror that in storage so an undo/remove
+      // right before a fast refresh cannot resurrect stale content. Only
+      // while the tool is active AND this context restored a draft
+      // (draftStats non-null): after fullExit the host is gone and exiting
+      // must never clear a stored draft.
+      if (host && host.parentNode && draftStats) {
+        try { chrome.storage.local.remove(draftKey()).catch(() => {}); } catch (_) { /* ok */ }
+      }
+      return;
+    }
+    writeDraft();
+  }
+
+  // Refresh durability: pagehide fires before the page context is torn
+  // down, so a fast refresh right after the last stroke/note cannot lose
+  // the debounced draft. Removed on fullExit so exiting never writes.
+  function onPageHide() {
+    flushDraft();
+  }
+
+  // Clear the persisted URL draft (confirmed Send success / Clear All).
+  function clearDraft() {
+    if (draftTimer) { clearTimeout(draftTimer); draftTimer = 0; }
+    draftStats = null;
+    try { chrome.storage.local.remove(draftKey()).catch(() => {}); } catch (_) { /* storage unavailable */ }
+  }
+
+  // Restore the URL-scoped draft after UI construction. Strokes replay via
+  // redraw; element markers re-anchor best-effort via document.querySelector
+  // on the stored cssPath inside a guarded try/catch (never throws, never
+  // mutates the page). Descriptors that cannot be re-anchored are retained
+  // in storage (the draft is untouched here) and reported via an unresolved
+  // count; the next user mutation writes a fresh draft.
+  async function restoreDraftIfAny() {
+    if (draftRestoredForLoad) return;
+    draftRestoredForLoad = true;
+    if (state.strokes.length || state.elements.length || state.annotNotes.length) return;
+    const key = draftKey();
+    let got = null;
+    try {
+      got = await chrome.storage.local.get(key);
+    } catch (_) { got = null; }
+    const d = got && got[key];
+    if (!d || typeof d !== 'object' || d.v !== DRAFT_SAVE_VERSION) return;
+    const strokes = Array.isArray(d.strokes) ? d.strokes : [];
+    const notes = Array.isArray(d.notes) ? d.notes : [];
+    const elements = Array.isArray(d.elements) ? d.elements : [];
+    if (!strokes.length && !notes.length && !elements.length) return;
+    let restoredStrokes = 0;
+    for (const s of strokes) {
+      if (!s || !Array.isArray(s.points) || s.points.length < 2) continue;
+      const pts = [];
+      for (const p of s.points) {
+        if (!Array.isArray(p) || p.length < 2) continue;
+        const x = Number(p[0]);
+        const y = Number(p[1]);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        pts.push([clamp01(x), clamp01(y)]);
+      }
+      if (pts.length < 2) continue;
+      state.strokes.push({
+        color: (typeof s.color === 'string' && s.color) ? s.color : COLORS[0],
+        width: WIDTHS.indexOf(s.width) !== -1 ? s.width : state.width,
+        points: pts,
+      });
+      restoredStrokes += 1;
+    }
+    const restoredNotes = notes.slice(0, 20)
+      .map((n) => String(n).slice(0, MAX_INSTR))
+      .filter((n) => !!n);
+    if (restoredNotes.length) {
+      state.annotNotes = restoredNotes;
+      state.annotNote = restoredNotes[restoredNotes.length - 1];
+    }
+    let restored = 0;
+    let unresolved = 0;
+    let maxIndex = 0;
+    for (const desc of elements) {
+      if (!desc || typeof desc !== 'object') continue;
+      let el = null;
+      if (typeof desc.cssPath === 'string' && desc.cssPath) {
+        try {
+          const found = document.querySelector(desc.cssPath);
+          if (found && found.nodeType === 1 && found.getRootNode() === document) el = found;
+        } catch (_) { el = null; }
+      }
+      if (!el) { unresolved += 1; continue; }
+      const d2 = {
+        index: (typeof desc.index === 'number' && Number.isFinite(desc.index)) ? desc.index : maxIndex + 1,
+        tag: String(desc.tag || el.tagName.toLowerCase()),
+        id: String(desc.id || el.id || ''),
+        className: String(desc.className || ''),
+        text: String(desc.text || '').slice(0, MAX_TEXT),
+        href: String(desc.href || ''),
+        ariaLabel: String(desc.ariaLabel || ''),
+        cssPath: String(desc.cssPath || ''),
+        rect: (desc.rect && typeof desc.rect === 'object') ? desc.rect : null,
+        instruction: String(desc.instruction || '').slice(0, MAX_INSTR),
+      };
+      if (INTENTS.indexOf(desc.intent) !== -1) d2.intent = desc.intent;
+      if (SEVERITIES.indexOf(desc.severity) !== -1) d2.severity = desc.severity;
+      const outlineEl = createOutline(d2.index);
+      state.elements.push({ descriptor: d2, el, outlineEl });
+      restored += 1;
+      if (d2.index > maxIndex) maxIndex = d2.index;
+    }
+    if (maxIndex >= state.nextIndex) state.nextIndex = maxIndex + 1;
+    if (state.strokes.length) redraw();
+    if (state.elements.length) {
+      updateCount();
+      positionSelections();
+    }
+    if (state.annotNotes.length) updateNoteCount();
+    draftStats = {
+      key,
+      savedAt: (typeof d.savedAt === 'string') ? d.savedAt : null,
+      ageMs: (typeof d.savedAt === 'string') ? Math.max(0, Date.now() - Date.parse(d.savedAt)) : 0,
+      restored,
+      restoredStrokes,
+      restoredNotes: restoredNotes.length,
+      unresolved,
+    };
+    const bits = [];
+    if (restoredStrokes) bits.push(restoredStrokes + (restoredStrokes === 1 ? ' stroke' : ' strokes'));
+    if (restoredNotes.length) bits.push(restoredNotes.length + (restoredNotes.length === 1 ? ' note' : ' notes'));
+    if (restored) bits.push(restored + (restored === 1 ? ' element' : ' elements'));
+    if (unresolved) bits.push(unresolved + ' unresolved');
+    if (bits.length) setStatus('Draft restored: ' + bits.join(', '), 'ok');
+    diagLog('draft:restored', 'strokes=' + restoredStrokes + ' notes=' + restoredNotes.length
+      + ' elements=' + restored + ' unresolved=' + unresolved);
   }
 
   /* ---------------- toolbar position / collapse / edge dock ---------------- */
@@ -1689,6 +1991,7 @@
     if (s.points.length >= 2) state.strokes.push(s); // spec: min 2 points
     redraw();
     showSendButton(); // new stroke -> Send button returns
+    persistDraft(); // F3: the draft survives refresh
   }
 
   /* ---------------- element mode: hit resolution ---------------- */
@@ -1782,6 +2085,9 @@
   }
 
   function describeElement(el) {
+    // Freeze State Capture: an element picked under the cursor is also the
+    // last meaningful hovered element; keep its selector for captureState.
+    retainHoveredSelector(el);
     const tag = el.tagName.toLowerCase();
     const r = el.getBoundingClientRect();
     let cls = '';
@@ -2046,6 +2352,10 @@
           let hit = null;
           try { hit = document.elementFromPoint(mouse.x, mouse.y); } catch (_) { hit = null; }
           try { hoveredEl = resolveMeaningful(hit); } catch (_) { hoveredEl = null; }
+          // Retain the last meaningful hovered selector (Freeze State
+          // Capture): only real page hover targets update it, and it is
+          // never cleared by moving over our own UI or empty page areas.
+          if (hoveredEl) retainHoveredSelector(hoveredEl);
         }
       }
       try { positionHover(); } catch (_) {
@@ -2204,6 +2514,7 @@
     syncInspAdd();
     updateCount();
     updateSelectionPulse();
+    persistDraft(); // F3: selection removed from the persisted draft
   }
 
   function clearCommittedSelections() {
@@ -2268,8 +2579,50 @@
     }
     if (inspInput) inspInput.value = inspDesc.instruction || '';
     if (inspInput) inspInput.focus();
+    // Schema v1.6: prefill the inspector's intent/severity chip row from the
+    // committed descriptor (edit mode re-click keeps existing metadata). The
+    // row lives in the element inspector next to the instruction field; the
+    // chat card is annotate-note only, so the chips are never on the card.
+    syncInspMeta();
     syncInspAdd();
     updateSelectionUI();
+  }
+
+  // Schema v1.6: intent/severity chips live next to the instruction field.
+  // Selecting a chip sets the value on the pending descriptor; selecting
+  // the active chip again clears it (both fields stay optional). Rendering
+  // reads pending.descriptor so the edit path prefills on re-click.
+  function syncInspMeta() {
+    if (!inspMetaEl) return;
+    const desc = (pending && pending.descriptor) ? pending.descriptor : null;
+    const intent = desc && typeof desc.intent === 'string' ? desc.intent : '';
+    const severity = desc && typeof desc.severity === 'string' ? desc.severity : '';
+    const chips = inspMetaEl.querySelectorAll('.comet-meta-chip');
+    for (const chip of chips) {
+      const mine = chip.dataset.intent ? chip.dataset.intent === intent : chip.dataset.severity === severity;
+      chip.classList.toggle('is-selected', mine);
+      chip.setAttribute('aria-pressed', mine ? 'true' : 'false');
+    }
+  }
+
+  function onInspMetaClick(e) {
+    if (!pending || !pending.descriptor || !inspMetaEl) return;
+    const chip = e.target && e.target.closest ? e.target.closest('.comet-meta-chip') : null;
+    if (!chip || !inspMetaEl.contains(chip)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const d = pending.descriptor;
+    if (chip.dataset.intent) {
+      const value = chip.dataset.intent;
+      if (d.intent === value) delete d.intent;
+      else d.intent = value;
+    } else if (chip.dataset.severity) {
+      const value = chip.dataset.severity;
+      if (d.severity === value) delete d.severity;
+      else d.severity = value;
+    }
+    syncInspMeta();
+    persistDraft(); // F3: intent/severity metadata survives refresh
   }
 
   function addChat() {
@@ -2292,6 +2645,11 @@
       committedIndex = state.elements.length - 1;
       state.activeIndex = committedIndex;
     }
+    // Schema v1.6: commit the chip metadata on the descriptor. Both are
+    // optional; anything outside the enums is dropped rather than shipped.
+    const metaDesc = pending.descriptor;
+    if (INTENTS.indexOf(metaDesc.intent) === -1) delete metaDesc.intent;
+    if (SEVERITIES.indexOf(metaDesc.severity) === -1) delete metaDesc.severity;
     pending = null;
     if (chatInput) chatInput.value = '';
     if (inspInput) inspInput.value = state.elements[committedIndex].descriptor.instruction || '';
@@ -2299,6 +2657,7 @@
     syncInspAdd();
     updateCount();
     updateSelectionPulse();
+    persistDraft(); // F3: committed element (instruction + intent/severity)
   }
 
   function cancelChat() {
@@ -2312,6 +2671,7 @@
     if (inspInput) inspInput.value = '';
     syncInspAdd();
     closeInspector(); // deselection closes the inspector
+    persistDraft(); // F3: pending state resolved, draft reflects committed only
   }
 
   /* ---- annotate-mode note card (not bound to any element) ---- */
@@ -2325,6 +2685,8 @@
     chatInput.value = state.annotNotes.join('\n'); // re-shows the committed notes
     chatCard.classList.add('comet-chat-note');
     chatCard.hidden = false;
+    // The intent/severity chips are element-only and live in the element
+    // inspector, which note mode never opens; nothing to hide here.
     // Premium pop: layered scale + slide + opacity (MD3 Emphasized, 240ms).
     // Reduced motion -> gsapEnter snaps straight to the final state.
     gsapEnter(chatCard, {
@@ -2357,6 +2719,7 @@
     chatInput.value = '';
     chatInput.focus(); // stays open for the next note (queue-first)
     updateNoteCount();
+    persistDraft(); // F3: queued notes survive refresh
   }
 
   // Toolbar chip showing how many annotation notes are queued. Notes ship
@@ -2415,6 +2778,7 @@
       state.activeIndex = state.elements.length - 1;
       updateCount();
       updateSelectionPulse();
+      persistDraft(); // F3: shift-click commits without addChat
       openChat(d, el, true, state.activeIndex);
       return;
     }
@@ -4634,6 +4998,7 @@
   function undo() {
     state.strokes.pop();
     redraw();
+    persistDraft(); // F3: undo is a draft mutation (draft shrinks or clears)
   }
 
   function clearAll() {
@@ -4650,6 +5015,126 @@
     updateCount();
     updateSelectionPulse();
     redraw();
+    clearDraft(); // F3: Clear All removes the persisted URL draft
+  }
+
+  /* ---------------- Freeze State Capture (schema v1.6) ---------------- */
+  function freezeInjected() {
+    return !!(freezeStyleEl && freezeStyleEl.parentNode);
+  }
+
+  // Toolbar active state for the Freeze control (explicit on/off, like the
+  // mode buttons). Called after every freeze state change and on build.
+  function syncFreezeBtn() {
+    if (!toolbar) return;
+    const btn = toolbar.querySelector('[data-act="freeze"]');
+    if (!btn) return;
+    btn.classList.toggle('active', !!(state.frozen && freezeInjected()));
+  }
+
+  // Retain the last meaningful hovered selector for captureState. Only page
+  // elements (never our closed shadow UI, never html/body) are recorded;
+  // later hovers replace it, but moving off the page never clears it, so the
+  // reported value is always the last state actually observed.
+  function retainHoveredSelector(el) {
+    if (!el || el.nodeType !== 1) return;
+    try {
+      if (el.getRootNode() !== document) return;
+      if (el === document.documentElement || el === document.body) return;
+      if (host && host.contains(el)) return;
+    } catch (_) { return; }
+    try { lastHoveredSelector = cssPath(el); } catch (_) { /* keep prior */ }
+  }
+
+  // Inject the ONE extension-owned style element pausing animations and
+  // zeroing transition duration/delay. Appended to documentElement so it is
+  // last in the author cascade. Idempotent; never touches author styles.
+  function injectFreezeStyle() {
+    if (freezeInjected()) return freezeStyleEl;
+    const el = document.createElement('style');
+    el.id = FREEZE_STYLE_ID;
+    el.setAttribute('data-browserlink-owner', 'freeze');
+    el.textContent = FREEZE_CSS;
+    try {
+      document.documentElement.appendChild(el);
+      freezeStyleEl = el;
+    } catch (_) {
+      // Injection failed (detached document, etc.): stay unfrozen and honest.
+      freezeStyleEl = null;
+    }
+    return freezeStyleEl;
+  }
+
+  // ALWAYS removes the injected freeze style. Called from setFrozen(false),
+  // fullExit, and teardownHost, so every exit/error path (power, popup off,
+  // reinject while exiting, init failure) leaves the page exactly as found.
+  function removeFreeze() {
+    if (freezeStyleEl && freezeStyleEl.parentNode) {
+      try { freezeStyleEl.parentNode.removeChild(freezeStyleEl); } catch (_) { /* ok */ }
+    }
+    freezeStyleEl = null;
+    state.frozen = false;
+    syncFreezeBtn();
+  }
+
+  function setFrozen(on) {
+    if (on) {
+      if (injectFreezeStyle()) {
+        state.frozen = true;
+        syncFreezeBtn();
+        diagLog('freeze', 'on');
+      } else {
+        diagLog('freeze', 'on-failed');
+      }
+    } else if (state.frozen || freezeStyleEl) {
+      removeFreeze();
+      diagLog('freeze', 'off');
+    }
+  }
+
+  function toggleFreeze() {
+    setFrozen(!(state.frozen && freezeInjected()));
+  }
+
+  // Live capture-state metadata for send(). Returns null when nothing is
+  // reportable (legacy payload parity) and always reports animationsFrozen
+  // when the freeze is active. Selectors are OBSERVED state: the retained
+  // hover selector, the current document.activeElement when it is a real
+  // page element, and any open native <details> elements, exactly as they
+  // appear in the page. No pseudo-class emulation, no synthesized events.
+  function captureStatePayload() {
+    const frozen = !!(state.frozen && freezeInjected());
+    let hoveredSelector = null;
+    if (lastHoveredSelector) hoveredSelector = lastHoveredSelector;
+    let activeElementSelector = null;
+    try {
+      const ae = document.activeElement;
+      if (ae && ae.nodeType === 1 && ae.getRootNode() === document) {
+        if (ae !== document.documentElement && ae !== document.body) {
+          if (!(host && host.contains(ae))) {
+            activeElementSelector = cssPath(ae);
+          }
+        }
+      }
+    } catch (_) { /* keep null */ }
+    let openDetailsSelectors = [];
+    try {
+      openDetailsSelectors = Array.from(document.querySelectorAll('details[open]'))
+        .slice(0, MAX_OPEN_DETAILS)
+        .map((d) => {
+          try { return cssPath(d); } catch (_) { return null; }
+        })
+        .filter((s) => !!s);
+    } catch (_) { /* keep [] */ }
+    if (!frozen && !hoveredSelector && !activeElementSelector && !openDetailsSelectors.length) {
+      return null; // nothing observed: legacy payload without captureState
+    }
+    return {
+      animationsFrozen: frozen,
+      hoveredSelector: hoveredSelector,
+      activeElementSelector: activeElementSelector,
+      openDetailsSelectors: openDetailsSelectors,
+    };
   }
 
   // Return the visible union in CSS pixels. The service worker applies dpr
@@ -4695,6 +5180,13 @@
   function descriptorForPayload(en) {
     const d = Object.assign({}, en.descriptor);
     d.instruction = String(d.instruction || '').trim().slice(0, MAX_INSTR);
+    // Schema v1.6: ship optional intent/severity inside elements[] (no
+    // top-level duplication); empty or invalid values are dropped.
+    for (const key of ['intent', 'severity']) {
+      const v = d[key];
+      if (typeof v !== 'string' || !v.trim()) delete d[key];
+      else d[key] = v.trim();
+    }
     if (d.edits) {
       const edits = {};
       for (const k of Object.keys(d.edits)) {
@@ -4877,10 +5369,16 @@
     const captureRect = computeCaptureRect(state.elements);
     if (captureRect) payload.captureRect = captureRect;
     diagLastCaptureRect = captureRect;
+    // Schema v1.6: optional captureState (freeze flag + observed hovered,
+    // focused, and open native details selectors). Omitted entirely when
+    // nothing was observed, so legacy sends stay byte-compatible.
+    const captureState = captureStatePayload();
+    if (captureState) payload.captureState = captureState;
     const sendStartMs = Date.now();
     diagLog('send:start', 'elements=' + state.elements.length
       + ' strokes=' + state.strokes.length
-      + ' captureRect=' + (captureRect ? 'yes' : 'no'));
+      + ' captureRect=' + (captureRect ? 'yes' : 'no')
+      + ' captureState=' + (captureState ? 'yes' : 'no'));
     setStatus('sending…', '');
     let ok = false;
     // Hide the tool surface (toolbar, chip, hover box, canvas) so the
@@ -4965,6 +5463,7 @@
       updateCount();
       updateSelectionPulse();
       redraw();
+      clearDraft(); // F3: draft clears ONLY after a confirmed successful POST
       // Nothing left to send: let the button collapse away after 2.5s.
       sendHideTimer = setTimeout(hideSendButton, 2500);
     } else {
@@ -4982,6 +5481,7 @@
       case 'power': fullExit(); break;
       case 'annotate': toggleAnnotate(); break;
       case 'element': toggleElement(); break;
+      case 'freeze': toggleFreeze(); break;
       case 'color': cycleColor(); break;
       case 'undo': undo(); break;
       case 'clear': clearAll(); break;
@@ -5123,6 +5623,7 @@
 
   function teardownHost() {
     stopInspectorRingTween();
+    removeFreeze(); // Freeze State Capture: always remove the injected style
     toolbarDockLayoutToken += 1;
     stopToolbarOrientationMorph();
     if (toolbarDragRaf) {
@@ -5190,6 +5691,10 @@
     state.elements = [];
     state.activeIndex = -1;
     state.nextIndex = 1;
+    // F3: this page context's restore bookkeeping dies with the host; a
+    // later same-page reinject skips restore, so flushDraft must not treat
+    // the emptied state as a user-initiated empty draft.
+    draftStats = null;
     // UI state is gone with the DOM; rebuild from chrome.storage.session on
     // reinject (setCollapsed early-returns when the value is unchanged, so
     // the collapsed/position state must be reset here).
@@ -5199,6 +5704,7 @@
     state.toolbarDock = null;
     state.dock = null;
     state.collapsedCats = {};
+    lastHoveredSelector = null; // freeze capture: no stale hover across sessions
     window.__hermesAnnotateInjected = false;
     window.__browserlinkInjected = false;
   }
@@ -5206,6 +5712,10 @@
   // Full exit: animate the host out, then remove it and all listeners.
   function fullExit() {
     if (exitTimer) return;
+    // Freeze State Capture: unfreeze immediately so the page keeps running
+    // during the exit animation (teardownHost also calls removeFreeze, so
+    // every exit/error path is covered; this call is simply the early one).
+    removeFreeze();
     // Cancel any pending pointer capture (draw strokes + drag handles).
     if (state.capturedPointerId != null && canvas) {
       try {
@@ -5260,6 +5770,7 @@
     document.removeEventListener('scroll', repositionAll, true);
     window.removeEventListener('resize', onWindowResize);
     window.removeEventListener('orientationchange', onWindowResize);
+    window.removeEventListener('pagehide', onPageHide); // exiting never writes a draft
     saveTabState({ enabled: false }); // deactivation persists per tab
     try {
       chrome.storage.local.set({ toolEnabled: false }); // master switch stays off across refreshes
@@ -5346,6 +5857,10 @@
       const d = defaultPosition();
       applyPosition(d.x, d.y);
     }
+    // F3: restore the URL-scoped draft after the UI is constructed (strokes
+    // replayed via redraw, element markers re-anchored best-effort). Fire
+    // and forget: a storage failure must never block toolbar restore.
+    restoreDraftIfAny();
     // Toolbar edge dock is per-tab (null = floating). Apply before collapse so
     // the chip/toolbar land on the docked edge when restoring collapsed state.
     // Default dock: first run (no saved dock) pins the toolbar to the LEFT
@@ -5473,6 +5988,7 @@
       '  <button type="button" data-act="annotate" class="comet-btn comet-mode-btn" title="Toggle drawing" aria-label="Annotate">✎</button>' +
       '  <button type="button" data-act="element" class="comet-btn comet-mode-btn" title="Element picker: hover to highlight, click to select + instruct" aria-label="Element">▣</button>' +
       '</span>' +
+      '<button type="button" data-act="freeze" class="comet-btn comet-icon-btn comet-freeze" title="Freeze: pause page animations and transitions for a clean capture. Active state is reported in the send; click again to resume." aria-label="Freeze page motion">⏸</button>' +
       '<button type="button" data-act="color" class="comet-swatch" title="Cycle color">' +
       '  <span class="dot" style="background:#ff5252"></span>' +
       '  <span class="dot" style="background:#4a9eff"></span>' +
@@ -5567,6 +6083,28 @@
       '  </div>' +
       '  <textarea class="comet-chat-input comet-insp-instr" rows="2" ' +
       ' placeholder="Your thoughts/instructions for this element…"></textarea>' +
+      // Schema v1.6: per-element intent/severity chips live in the element
+      // inspector, stacked under the instruction field (the chat card is
+      // annotate-note only, so the row must not live on the card).
+      '<div class="comet-chat-meta">' +
+      '  <div class="comet-chat-meta-group">' +
+      '    <span class="comet-chat-meta-label">Intent</span>' +
+      '    <div class="comet-chat-meta-chips" role="group" aria-label="Intent">' +
+      '      <button type="button" class="comet-meta-chip" data-intent="fix">Fix</button>' +
+      '      <button type="button" class="comet-meta-chip" data-intent="change">Change</button>' +
+      '      <button type="button" class="comet-meta-chip" data-intent="question">Question</button>' +
+      '      <button type="button" class="comet-meta-chip" data-intent="approve">Approve</button>' +
+      '    </div>' +
+      '  </div>' +
+      '  <div class="comet-chat-meta-group">' +
+      '    <span class="comet-chat-meta-label">Priority</span>' +
+      '    <div class="comet-chat-meta-chips" role="group" aria-label="Priority">' +
+      '      <button type="button" class="comet-meta-chip" data-severity="blocking">Blocking</button>' +
+      '      <button type="button" class="comet-meta-chip" data-severity="important">Important</button>' +
+      '      <button type="button" class="comet-meta-chip" data-severity="suggestion">Suggestion</button>' +
+      '    </div>' +
+      '  </div>' +
+      '</div>' +
       '  <button type="button" class="comet-btn comet-insp-add">Add</button>' +
       '</div>' +
       '<div class="comet-insp-glow" aria-hidden="true"></div>' +
@@ -5622,6 +6160,7 @@
     inspCountEl = inspPanel.querySelector('.comet-insp-count');
     inspSelectionCountEl = inspPanel.querySelector('.comet-selection-count');
     inspSelectionList = inspPanel.querySelector('.comet-selection-list');
+    inspMetaEl = inspPanel.querySelector('.comet-chat-meta'); // intent/severity chip row (inspector)
     inspResetAllBtn = inspPanel.querySelector('.comet-insp-reset-all');
     inspInput = inspPanel.querySelector('.comet-insp-instr');
     inspAddEl = inspPanel.querySelector('.comet-insp-add');
@@ -5830,6 +6369,7 @@
         else if (state.annotateOn && !state.elementMode) hideAnnotNoteCard();
       }
     });
+    inspPanel.addEventListener('click', onInspMetaClick);
     chatInput.addEventListener('input', () => {
       if (pending && pending.descriptor) pending.descriptor.instruction = chatInput.value;
       if (inspInput) inspInput.value = chatInput.value;
@@ -5875,6 +6415,7 @@
     document.addEventListener('scroll', repositionAll, true); // incl. inner scrollers
     window.addEventListener('resize', onWindowResize);
     window.addEventListener('orientationchange', onWindowResize);
+    window.addEventListener('pagehide', onPageHide); // F3: flush draft on refresh
     if (!messagesBound) {
       messagesBound = true;
       chrome.runtime.onMessage.addListener(onRuntimeMessage);
@@ -5967,6 +6508,21 @@
       get activeElement() { return inspector.el; },
       get hoverBoxEl() { return hoverBoxEl; },
       get hlEl() { return hlEl; },
+      setFrozen,
+      toggleFreeze,
+      freezeInjected,
+      captureStatePayload,
+      get frozen() { return !!(state.frozen && freezeInjected()); },
+      get lastHoveredSelector() { return lastHoveredSelector; },
+      // Persistent Drafts (F3): draft API for harness assertions.
+      persistDraft,
+      flushDraft,
+      clearDraft,
+      restoreDraftIfAny,
+      get draftKey() { return draftStats ? draftStats.key : null; },
+      get restoredCount() { return draftStats ? draftStats.restored : 0; },
+      get unresolvedCount() { return draftStats ? draftStats.unresolved : 0; },
+      get draftStats() { return draftStats ? Object.assign({}, draftStats) : null; },
       onPageClick,
       onPageMouseDown,
       onMouseMove,

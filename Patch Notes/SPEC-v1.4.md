@@ -1,4 +1,4 @@
-# browserlink v1.4 — Attachment Delivery (screenshot + annotation file land in chat)
+# browserlink v1.4 - Attachment Delivery (screenshot + annotation file land in chat)
 
 Repo: /Users/marcelspatz/browserlink. Ships as its own PR (feat/attachments-v1.4 -> main),
 tag v1.4.0 after merge.
@@ -35,9 +35,9 @@ if cleaner). No git. No hermes config. Do NOT touch content.js/overlay.css.
 4. DOCS: protocol.md documents the optional `screenshot` field (data URL,
    stored as PNG, delivered as @image ref) as schema v1.4, backward
    compatible. CHANGELOG [1.4.0] entry. No em-dashes.
-5. TESTS: hub test — payload with a tiny valid base64 PNG stores the PNG file
+5. TESTS: hub test - payload with a tiny valid base64 PNG stores the PNG file
    and the JSON carries screenshotFile; payload with a non-PNG data URL -> 400;
-   payload without screenshot unchanged. Adapter test — message contains
+   payload without screenshot unchanged. Adapter test - message contains
    @image and @file lines when files exist, omits them when missing.
 
 ## Acceptance (run and report)

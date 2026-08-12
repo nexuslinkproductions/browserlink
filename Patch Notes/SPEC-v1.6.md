@@ -1,10 +1,10 @@
-# SPEC v1.6 — Inspector categories, hover boxes, editor-highlight exclusion
+# SPEC v1.6 - Inspector categories, hover boxes, editor-highlight exclusion
 
 Deterministic build spec. Extension-only wave: `extension/content.js` + `extension/overlay.css`.
 No Python, no MCP, no README/CHANGELOG, no git. `node --check` must pass. All existing
 test hooks (`window.__BL_TEST__` → `__BL_INSPECTOR__` / `__BL_TEST_API__`) must be preserved.
 
-## Feature A — Collapsible inspector categories
+## Feature A - Collapsible inspector categories
 
 The inspector (`renderInspector`, rows in `inspRows`) currently renders every property
 row flat, forcing scroll. Group rows by category with collapsible headers.
@@ -28,7 +28,7 @@ row flat, forcing scroll. Group rows by category with collapsible headers.
   `onInspectorFormatClick`, `onInspectorReset`, pointer-over/focus hints.
 - `getRows` must still return ALL rows (collapsed is a view concern only).
 
-## Feature B — Hover boxes in element mode
+## Feature B - Hover boxes in element mode
 
 In element mode, hovering must make it obvious an element is there BEFORE clicking.
 
@@ -43,7 +43,7 @@ In element mode, hovering must make it obvious an element is there BEFORE clicki
   no per-frame layout thrash (cache the rect, invalidate on scroll/resize).
 - The box must not appear in annotate mode, only element mode.
 
-## Feature C — Property-hint highlight excludes editor UI
+## Feature C - Property-hint highlight excludes editor UI
 
 Hovering a property row highlights what it affects on the page (`drawPropertyHint`).
 It must NEVER highlight elements inside the inspector/editor itself (the editor's

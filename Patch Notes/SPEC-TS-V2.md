@@ -1,4 +1,4 @@
-# browserlink v2.0 — TypeScript rewrite (hub + MCP, shared schema)
+# browserlink v2.0 - TypeScript rewrite (hub + MCP, shared schema)
 
 Repo: /Users/marcelspatz/browserlink. Ships as its own PR (feat/ts-v2 -> main),
 tag v2.0.0 after merge. The Python implementation stays as the legacy path
