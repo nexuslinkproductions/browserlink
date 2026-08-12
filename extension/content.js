@@ -132,6 +132,8 @@
   const BRIDGE_OFFLINE = 'bridge offline';
   const MAX_TEXT = 200;
   const MAX_INSTR = 500;
+  const MAX_TITLE = 500; // matches hub MAX_TITLE; long SEO titles must not 400 a send
+  const MAX_EDIT_VALUE = 500; // matches hub MAX_EDIT_VALUE; long hrefs/pasted values
   // Schema v1.6: optional per-element intent and severity chips (both unset
   // by default; exactly one of each may be selected per element).
   const INTENTS = ['fix', 'change', 'question', 'approve'];
@@ -6169,8 +6171,8 @@
     }
     try {
       if (el.tagName === 'A' || el.tagName === 'AREA') {
-        const href = el.getAttribute('href') || el.href || '';
-        out.push({ prop: 'href', kind: 'text', current: String(href), value: String(href) });
+        const href = String(el.getAttribute('href') || el.href || '').slice(0, MAX_EDIT_VALUE);
+        out.push({ prop: 'href', kind: 'text', current: href, value: href });
       }
     } catch (_) { /* ok */ }
     return out;
@@ -6278,7 +6280,9 @@
     if (value === undefined || value === null || String(value).trim() === '') {
       delete inspector.descriptor.edits[prop];
     } else {
-      inspector.descriptor.edits[prop] = String(value);
+      // Cap at the hub's MAX_EDIT_VALUE (500): long tracking hrefs / pasted
+      // values must not 400 a send that the extension itself produced.
+      inspector.descriptor.edits[prop] = String(value).slice(0, MAX_EDIT_VALUE);
     }
     updateInspectorState();
   }
@@ -8095,7 +8099,7 @@
     const payload = {
       source: 'comet-extension',
       url: location.href,
-      title: document.title || '',
+      title: String(document.title || '').slice(0, MAX_TITLE),
       viewport: { w: window.innerWidth, h: window.innerHeight },
       label: label.slice(0, MAX_TEXT),
       // Schema v1.9 (F4): env snapshot captured once at send start.

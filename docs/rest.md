@@ -1,9 +1,13 @@
 # browserlink REST API
 
 The local hub (`browserlink-hub`) listens on `127.0.0.1:8787` by default
-(`--port` to change). All responses are UTF-8 JSON unless noted. CORS is
-open (`Access-Control-Allow-Origin: *`, methods `GET,POST,OPTIONS`, headers
-`Content-Type`); `OPTIONS` answers `204`.
+(`--port` to change). All responses are UTF-8 JSON unless noted. CORS: responses carry
+`Access-Control-Allow-Origin: *` (methods `GET,POST,OPTIONS`, headers
+`Content-Type`); `OPTIONS` answers `204`. Requests are additionally gated
+by the `Origin` header (hardened): absent origins (curl, MCP, local
+tooling), `chrome-extension:` / `moz-extension:` origins, and same-origin
+requests are allowed; any other origin is rejected with
+`403 {error: "origin not allowed"}`.
 
 Data dir resolution: `BROWSERLINK_DATA_DIR`, else `HERMES_HOME/annotations`,
 else `~/.browserlink/annotations`. Annotations are stored under
@@ -31,7 +35,7 @@ else `~/.browserlink/annotations`. Annotations are stored under
 | Route | Method | Body | Response |
 |---|---|---|---|
 | `/annotations` | GET | - | `{files: [{name, size, mtime}]}` newest first (JSON files only); optional `q`, `url`, and `since` query params filter the corpus (see [Search](#search-f7)) |
-| `/annotations` | POST | annotation payload (schema v1.9) | `200 {ok: true, file: "<name>.json"}`; `400` validation error, `413` payload over 10 MB, `400` malformed JSON |
+| `/annotations` | POST | annotation payload (schema v1.9) | `200 {ok: true, file: "<name>.json"}`; `400` validation error, `413` payload over 14 MB raw (decoded screenshot ≤ 10 MB), `400` malformed JSON |
 | `/annotations/<name>` | GET | - | stored annotation JSON or `404 {error: "not found"}` |
 | `/annotations/<name>/export.md` | GET | - | `200` Markdown AI brief (`text/markdown; charset=utf-8`) or `404` |
 | `/annotations/latest/export.md` | GET | - | `200` Markdown AI brief of the newest annotation or `404` |
