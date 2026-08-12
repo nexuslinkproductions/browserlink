@@ -144,6 +144,19 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
   link opens on this machine; other devices on your LAN can open it only if
   you deliberately expose the hub. It is never a public link and needs no
   account.
+- **Local save and backup** - the popup saves the newest capture as PNG or
+  JPEG (JPEG is converted locally in the browser) and downloads the newest
+  annotation bundle: a deterministic ZIP of the annotation JSON, the AI
+  brief Markdown, and the PNG when present, with a manifest naming the
+  schema and files (`GET /annotations/<name>/bundle`). A full-corpus backup
+  downloads one consistent snapshot of every stored annotation and its PNG
+  (`GET /annotations/backup.zip`), valid even when the corpus is empty.
+  Archives contain only safe relative paths; annotations without screenshots
+  declare the absent image instead of failing. Downloads are browser-native
+  (`chrome.downloads`): you pick the destination in the normal download
+  dialog, and nothing is uploaded anywhere - no account, no cloud. Missing
+  screenshots, empty corpora, offline hubs, and cancelled downloads are all
+  reported honestly. Copy AI Brief is unchanged.
 - **Activation toggle** - a master switch in the popup (default ON, persisted
   per profile): deactivates the tool on the current page with one click, and
   re-activates it straight from the popup.

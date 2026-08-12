@@ -8,6 +8,34 @@ All notable changes to browserlink are documented here. Format follows
 
 ### Added
 
+- **Local save and backup** - the popup gains three browser-native download
+  actions (no upload, no account; the destination is chosen in the browser's
+  normal download dialog via `chrome.downloads`):
+  - **Save newest capture** - downloads the newest annotation's stored
+    screenshot as PNG (as stored) or JPEG (converted locally with
+    OffscreenCanvas); the chosen format matches the downloaded file bytes
+    and extension.
+  - **Download newest bundle** - `GET /annotations/<name>/bundle` (and the
+    `/annotations/latest/bundle` alias) streams a deterministic ZIP with a
+    manifest (`schema: browserlink.annotation.bundle.v1`) naming the
+    included files, the annotation JSON byte-for-byte, the AI brief Markdown
+    (same sections as `export.md`, with `@file:`/`@image:` references
+    relative to the bundle so the archive is portable and never discloses
+    absolute host paths), and the PNG when present. A missing PNG is
+    declared as `screenshot: null`, never stubbed.
+  - **Backup all annotations** - `GET /annotations/backup.zip` streams one
+    consistent snapshot of the whole corpus (`schema:
+    browserlink.corpus.backup.v1`, `count`, per-record screenshot flags);
+    an empty corpus still produces a valid explicit empty backup. PNGs are
+    stored before their JSON (atomic renames), so every archive is a
+    complete before-or-after snapshot, never a partial file set, even while
+    annotations are written concurrently.
+  - Archives are deterministic (name-sorted entries, fixed timestamps) and
+    contain only safe relative paths (never absolute filesystem paths or
+    traversal names). The extension gains the minimal `downloads` permission
+    to start downloads and observe completion or cancellation; failures
+    (hub offline, empty corpus, absent screenshot, cancelled download) are
+    reported honestly. Copy AI Brief is unchanged.
 - **Share link (local read-only annotation page)** - `GET
   /annotations/<name>/share` renders one stored annotation as a readable,
   read-only HTML page: page URL, title, viewport, label, notes, per-element

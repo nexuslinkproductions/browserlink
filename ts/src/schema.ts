@@ -1,4 +1,4 @@
-/** Shared annotation schema (v1.7), single source of truth for hub + MCP. */
+/** Shared annotation schema (v1.8), single source of truth for hub + MCP. */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -64,6 +64,29 @@ export const MAX_HOSTS = 8;
 export const MAX_HOST_SELECTOR = 500;
 export type FrameMetadata = { path?: number[]; crossOrigin?: boolean };
 export type ShadowMetadata = { depth?: number; hosts?: string[] };
+
+// Schema v1.8 (F2 anchor resilience): optional per-element anchor metadata
+// describing how a stored element was re-anchored on a changed live page.
+// version is the anchor format version (1); resolution is a strict enum
+// (exact = original cssPath replay, fallback = deterministic signal chain,
+// unresolved = no candidate reached the confidence threshold); confidence is
+// the 0..1 score of the winning path; fallback lists the deterministic
+// signals used, in order (attrs, text, aria, rect). All fields are strictly
+// validated: unknown nested keys, wrong types, unknown enum values, and
+// out-of-range numbers are rejected with HTTP 400, while legacy elements
+// without anchor stay valid.
+export const ANCHOR_VERSION = 1;
+export const ANCHOR_RESOLUTIONS = ["exact", "fallback", "unresolved"] as const;
+export const ANCHOR_FALLBACK_SIGNALS = ["attrs", "text", "aria", "rect"] as const;
+export const MAX_ANCHOR_FALLBACK_SIGNALS = 4;
+export type AnchorResolution = (typeof ANCHOR_RESOLUTIONS)[number];
+export type AnchorFallbackSignal = (typeof ANCHOR_FALLBACK_SIGNALS)[number];
+export type AnchorMetadata = {
+  version?: number;
+  resolution?: AnchorResolution;
+  confidence?: number;
+  fallback?: AnchorFallbackSignal[];
+};
 
 // Schema v1.6: optional top-level capture state (Freeze State Capture).
 // Only these four fields are accepted; unknown keys are rejected with
@@ -453,6 +476,61 @@ export function validatePayload(payload: unknown): string | null {
               so.hosts[i].length > MAX_HOST_SELECTOR
             ) {
               return `elements[${elementIndex}].shadow.hosts[${i}] must be a non-empty string of at most ${MAX_HOST_SELECTOR} characters`;
+            }
+          }
+        }
+      }
+      // Schema v1.8: optional anchor metadata (F2 anchor resilience). Must be
+      // an object with only the four known keys; version and resolution are
+      // required whenever anchor is present, confidence must be 0..1, and
+      // fallback must be a non-empty list of strict enum signals with at
+      // most MAX_ANCHOR_FALLBACK_SIGNALS entries. Unknown nested keys, wrong
+      // types, unknown enum values, and out-of-range numbers are rejected.
+      // Legacy elements without anchor stay valid (backward compatible).
+      const anchor = el.anchor;
+      if (anchor !== undefined) {
+        if (anchor === null || typeof anchor !== "object" || Array.isArray(anchor)) {
+          return `elements[${elementIndex}].anchor must be an object`;
+        }
+        const ao = anchor as Record<string, unknown>;
+        for (const key of Object.keys(ao)) {
+          if (
+            key !== "version" &&
+            key !== "resolution" &&
+            key !== "confidence" &&
+            key !== "fallback"
+          ) {
+            return `elements[${elementIndex}].anchor has unknown key '${key}'`;
+          }
+        }
+        if (ao.version !== ANCHOR_VERSION) {
+          return `elements[${elementIndex}].anchor.version must be ${ANCHOR_VERSION}`;
+        }
+        if (
+          typeof ao.resolution !== "string" ||
+          !(ANCHOR_RESOLUTIONS as readonly string[]).includes(ao.resolution)
+        ) {
+          return `elements[${elementIndex}].anchor.resolution must be one of exact, fallback, unresolved`;
+        }
+        if (ao.confidence !== undefined) {
+          if (!isNumber(ao.confidence) || ao.confidence < 0 || ao.confidence > 1) {
+            return `elements[${elementIndex}].anchor.confidence must be a number from 0 to 1`;
+          }
+        }
+        if (ao.fallback !== undefined) {
+          if (
+            !Array.isArray(ao.fallback) ||
+            ao.fallback.length === 0 ||
+            ao.fallback.length > MAX_ANCHOR_FALLBACK_SIGNALS
+          ) {
+            return `elements[${elementIndex}].anchor.fallback must be a non-empty list of at most ${MAX_ANCHOR_FALLBACK_SIGNALS} signals`;
+          }
+          for (let i = 0; i < ao.fallback.length; i++) {
+            if (
+              typeof ao.fallback[i] !== "string" ||
+              !(ANCHOR_FALLBACK_SIGNALS as readonly string[]).includes(ao.fallback[i])
+            ) {
+              return `elements[${elementIndex}].anchor.fallback[${i}] must be one of attrs, text, aria, rect`;
             }
           }
         }
