@@ -1,7 +1,20 @@
-# browserlink protocol - annotation schema v1.6
+# browserlink protocol - annotation schema v1.8
 
 The public contract between the extension, the hub, and any harness. Versioned;
 changes require a new minor or major version and a compatibility shim.
+
+**Schema v1.8** (backward compatible with v1.0 through v1.7): adds optional
+per-element `elements[].anchor` metadata recording how a stored element was
+re-anchored on a changed live page (resolution state, confidence, and the
+deterministic fallback signals used, see below). Wrong types, unknown nested
+keys, unknown enum values, and out-of-range numbers return HTTP 400; elements
+without the field remain valid.
+
+**Schema v1.7** (backward compatible with v1.0 through v1.6): adds optional
+per-element `elements[].frame` and `elements[].shadow` deep-pick metadata
+carrying same-origin iframe and open shadow-root reach information (see
+below). Wrong types, unknown nested keys, and out-of-range values return HTTP
+400; elements without either field remain valid.
 
 **Schema v1.6** (backward compatible with v1.0 through v1.5): adds optional
 per-element `elements[].intent` and `elements[].severity` metadata chosen from
@@ -73,7 +86,7 @@ HTTP 400.
 | `viewport` | object | required; `w`, `h` positive integers |
 | `label` | string | optional; user context label, ≤ 200 chars |
 | `strokes` | array | required; each: `color` string, `width` number > 0, `points` array of ≥ 2 `[x, y]` pairs, each coordinate in `[0, 1]` (normalized to the annotation viewport) |
-| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below) |
+| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below), `frame`/`shadow` optional deep-picker objects (schema v1.7, see below), `anchor` optional object (schema v1.8, see below) |
 | `screenshot` | string | optional (schema v1.4); PNG data URL `data:image/png;base64,<data>`; max 10MB decoded; non-PNG or invalid base64 → HTTP 400 |
 | `captureState` | object | optional (schema v1.6); Freeze State Capture metadata, exactly four typed fields (see below); unknown keys → HTTP 400 |
 
@@ -144,6 +157,104 @@ Rules:
   `"severity": "urgent"`) are rejected by hub validation with HTTP 400.
 - The wire key is `severity`; harness-facing text renders it under the
   user-facing label **Priority**.
+
+### elements[].frame and elements[].shadow (schema v1.7)
+
+Optional per-element deep-pick metadata emitted by the F1 deep picker. Both
+fields are independent and optional: an element can carry either, both, or
+neither. Legacy elements without them are stored unchanged (backward
+compatible with every earlier schema).
+
+`frame` describes the same-origin iframe chain between the top document and
+the element's document:
+
+| Field | Type | Rules |
+|---|---|---|
+| `path` | array of ints | optional; iframe index chain from the top document to the element's document (`[]` or absent = top document); each entry is the index of the frame element among all `iframe`/`frame` elements in its parent document (document order); at most 8 entries, each a non-negative integer |
+| `crossOrigin` | boolean | optional; `true` marks a bounded best-effort target: the element IS a cross-origin frame element whose inner DOM is not accessible, and `path` describes the chain to the document containing that frame element. The extension never claims or attempts inner-DOM access for such targets |
+
+`shadow` describes the open shadow-host boundary chain between the document
+and the element:
+
+| Field | Type | Rules |
+|---|---|---|
+| `depth` | int | optional; number of open shadow boundaries crossed (0 or absent = flat DOM element); integer from 0 to 8 |
+| `hosts` | array of strings | optional; cssPath of each shadow host from the document outward (hosts[0] is the outermost host, in the document; hosts[last] directly contains the element). Each entry is a non-empty string of at most 500 characters; at most 8 entries. Closed shadow roots are never represented |
+
+Example:
+
+```json
+{ "index": 1, "tag": "span", "cssPath": "div > span:nth-of-type(2)",
+  "frame": { "path": [0, 1] },
+  "shadow": { "depth": 2, "hosts": ["#widget-host", "#inner-host"] } }
+```
+
+Rules:
+
+- `frame` must be an object with only the keys `path` and `crossOrigin`;
+  unknown nested keys (e.g. `"frame": { "url": "..." }`) are rejected by hub
+  validation with HTTP 400.
+- `shadow` must be an object with only the keys `depth` and `hosts`; unknown
+  nested keys are rejected with HTTP 400.
+- Wrong types, negative or non-integer `path` entries, overlong `path`/`hosts`
+  lists, out-of-range `depth`, and empty/overlong host selectors are rejected
+  with HTTP 400.
+- `cssPath` stays root-relative: for shadow elements it resolves inside the
+  innermost shadow root named by `hosts`, and for frame elements inside the
+  document named by `frame.path`. Consumers replay in order: frame path, then
+  shadow hosts, then cssPath.
+- `rect` is always normalized to the TOP annotation viewport, including for
+  elements inside same-origin iframes (the extension translates child-frame
+  rectangles into top-level viewport coordinates).
+
+### elements[].anchor (schema v1.8)
+
+Optional per-element anchor metadata emitted by the F2 anchor-resilience
+replay when a stored element is restored on a page whose DOM has drifted.
+The field records the truthful resolution state so consumers know whether
+the element was found exactly, re-anchored by fallback signals, or left
+unresolved. Legacy elements without it are stored unchanged (backward
+compatible with every earlier schema).
+
+| Field | Type | Rules |
+|---|---|---|
+| `version` | int | required; the anchor format version, currently `1` |
+| `resolution` | string enum | required; one of `exact` (original cssPath replay), `fallback` (deterministic signal chain below), `unresolved` (no candidate reached the confidence threshold) |
+| `confidence` | number | optional; the 0..1 score of the winning path (`exact` 1, `attrs` 0.95, `text`/`aria` 0.85, `rect` 0.7); must be 0..1 when present |
+| `fallback` | array of string enums | optional; the deterministic signals used, in order, each from `attrs`, `text`, `aria`, `rect`; non-empty and at most 4 entries; present only when `resolution` is `fallback` |
+
+Example:
+
+```json
+{ "index": 1, "tag": "button", "cssPath": "ul#mut-list > li:nth-of-type(2)",
+  "anchor": { "version": 1, "resolution": "fallback", "confidence": 0.85,
+              "fallback": ["text"] } }
+```
+
+Replay order and rules:
+
+- Exact `cssPath` replay is always the first and fastest path (frame path,
+  then shadow hosts, then cssPath), exactly as in schema v1.7. It wins with
+  confidence 1 when it resolves to exactly one usable (connected and
+  visible) element.
+- When the exact path fails, fallback signals run in fixed order:
+  - stable attributes: the stored `id` (when present) must match exactly
+    AND the stored class tokens (when present) must overlap at least 0.8;
+  - normalized text/aria: whitespace-collapsed, case-insensitive match of
+    the stored `text` (unique candidate), else of the stored `ariaLabel`;
+  - prior rectangle proximity: a unique candidate within 0.18 of the
+    stored normalized rect center (as a fraction of the viewport diagonal).
+- A tier wins only when it finds exactly one usable candidate. Duplicate
+  candidates, hidden or detached elements, and empty tiers fall through to
+  the next tier; when no tier wins, the element stays `unresolved` and is
+  never attached to a different element.
+- `anchor` must be an object with only the keys `version`, `resolution`,
+  `confidence`, and `fallback`; unknown nested keys, wrong types, unknown
+  enum values, missing `version`/`resolution`, and `confidence` outside
+  0..1 are rejected with HTTP 400.
+- Re-anchoring never deletes stored drafts and never loops: history
+  pushState/replaceState/popstate and hashchange collapse into one bounded
+  pass after the DOM stabilizes, with no duplicate markers or listeners.
 
 ### captureState (schema v1.6)
 
@@ -266,7 +377,7 @@ Responses:
 |---|---|
 | `GET /annotations` | `{"files": [{"name","size","mtime"}]}` newest first |
 | `GET /annotations/<name>` | the stored JSON (same schema, plus `ts`, `savedAt`) |
-| `GET /health` | `{"ok": true, "version": "1.0.0"}` |
+| `GET /health` | `{"ok": true, "version": "2.6.0"}` |
 | `GET /status` | `{"ok": true, "version", "dataDir", "adapters": [...], "target": {"sessionId","label"} or null}` |
 | `GET /target` | current delivery target, or `404 {"error":"no target"}` |
 | `POST /target` | set or clear delivery target |
@@ -281,10 +392,13 @@ Consumers map them back by multiplying with their own viewport dimensions.
 
 ## Versioning
 
-This is **schema v1.6**: backward compatible with v1.0 through v1.5. The
-v1.6 additions are additive and optional: the per-element `intent` /
-`severity` enums and the top-level `captureState` object; older payloads
-validate and store unchanged. Schema v1.5 extended
+This is **schema v1.8**: backward compatible with v1.0 through v1.7. The
+v1.8 additions are additive and optional: per-element `anchor` metadata
+recording the deterministic re-anchoring resolution state; older payloads
+validate and store unchanged. Schema v1.7 added optional per-element
+`frame` / `shadow` deep-picker metadata for shadow-root and iframe targets.
+Schema v1.6 added the per-element `intent` / `severity` enums and the
+top-level `captureState` object. Schema v1.5 extended
 `elements[].edits` with text-formatting keys. Schema v1.4 added optional
 `screenshot` / `screenshotFile`. Schema v1.1 added optional `elements[].edits`.
 Breaking changes (new required fields, coordinate semantics, endpoint removal)

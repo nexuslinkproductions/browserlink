@@ -145,16 +145,31 @@
   }
   .result.ok { color: #35c759; }
   .result.err { color: #ff5252; }
+  .note {
+    margin: 0 0 12px;
+    font-size: 11px;
+    color: #9aa0a6;
+  }
+  .gap { margin-top: 14px; }
 </style>
 </head>
 <body>
   <h1>Browserlink - Browser Annotate &amp; Connect</h1>
   <p class="sub">Annotate any page &rarr; delivered to your hub</p>
+  <div id="pageState" class="hint" hidden></div>
 
   <div class="row switch-row">
     <label class="switch-label" for="toolToggle">Tool active</label>
     <input id="toolToggle" type="checkbox" role="switch" checked>
   </div>
+
+  <div class="row switch-row">
+    <label class="switch-label" for="alwaysOnToggle">Always on for this browser session</label>
+    <input id="alwaysOnToggle" type="checkbox" role="switch">
+  </div>
+  <div id="alwaysOnHint" class="hint">Off: the tool activates per page. On:
+    newly loaded eligible pages activate automatically for the rest of this
+    session; browser-internal pages never do.</div>
 
   <div class="row">
     <span id="hubStatus" class="status">Hub: checking&hellip;</span>
@@ -186,6 +201,41 @@
 
   <button id="copyBrief" type="button">Copy AI Brief</button>
   <div id="briefResult" class="result"></div>
+
+  <button id="copyShare" type="button" title="Copy a local read-only URL for the newest annotation">Copy share link</button>
+  <div id="shareResult" class="result"></div>
+
+  <div class="gap"></div>
+  <p class="note">Save and backup: browser-native downloads, saved to your
+    machine through the browser's normal download dialog. No upload, no
+    account, nothing leaves this computer.</p>
+
+  <label for="captureFormat">Save newest capture as</label>
+  <div class="row">
+    <select id="captureFormat">
+      <option value="png">PNG</option>
+      <option value="jpeg">JPEG</option>
+    </select>
+    <button id="saveCapture" type="button" class="mini">Save</button>
+  </div>
+  <div id="captureResult" class="result"></div>
+
+  <button id="downloadBundle" type="button" title="Download the newest annotation as a bundle (JSON + AI brief + PNG when present)">Download newest bundle</button>
+  <div id="bundleResult" class="result"></div>
+
+  <button id="downloadBackup" type="button" title="Download one snapshot of every stored annotation">Backup all annotations</button>
+  <div id="backupResult" class="result"></div>
+
+  <div class="gap"></div>
+  <p class="note">No account, no cloud: annotations, drafts, and downloads
+    stay on this machine. The tool uses only its existing permissions
+    (activeTab, storage, scripting, alarms, downloads), never runs on
+    browser-internal pages, and activates there only when you ask.</p>
+  <div class="row">
+    <button id="replayIntro" type="button" class="mini"
+            title="Remove the one-time intro flag and show the three-step intro on the active tab">Replay intro</button>
+  </div>
+  <div id="introResult" class="result"></div>
 
   <script src="popup.js"></script>
 </body>

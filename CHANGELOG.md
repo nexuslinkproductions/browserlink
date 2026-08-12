@@ -4,6 +4,96 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
+## [2.6.0] - 2026-08-12
+
+### Added
+
+- **Onboarding pack (three-step intro + session always-on)** - the first
+  time the tool activates, three coach marks appear in order - pick an
+  element, add an instruction, then send - each targeting the actual
+  control it names. Marks advance or dismiss by pointer (Next/Skip) or
+  keyboard (Enter, arrow keys, Escape), respect `prefers-reduced-motion`,
+  and keep keyboard focus inside the card. Completing or skipping stores a
+  one-time local flag (`browserlinkOnboarded`), so refresh, reinjection,
+  extension reload, and browser restart never replay the tour; the popup's
+  **Replay intro** button resets it explicitly. The popup gains **Always on
+  for this browser session**: off by default, newly loaded pages stay
+  inactive until activated per page; when on, newly loaded eligible pages
+  activate automatically for the rest of the session (session-scoped
+  `browserlinkAlwaysOn` flag, cleared at browser restart, per-tab exit
+  still respected). Restricted pages (chrome://, web store, ...) show an
+  honest unavailable state in the popup with no repeated injection
+  attempts, and the popup states its no-account, local-hub, existing
+  permission-scope copy. No new permissions were added; the service worker
+  exposes session storage to the content script via
+  `storage.session.setAccessLevel` so the session flag and per-tab view
+  state work as documented.
+
+- **Local save and backup** - the popup gains three browser-native download
+  actions (no upload, no account; the destination is chosen in the browser's
+  normal download dialog via `chrome.downloads`):
+  - **Save newest capture** - downloads the newest annotation's stored
+    screenshot as PNG (as stored) or JPEG (converted locally with
+    OffscreenCanvas); the chosen format matches the downloaded file bytes
+    and extension.
+  - **Download newest bundle** - `GET /annotations/<name>/bundle` (and the
+    `/annotations/latest/bundle` alias) streams a deterministic ZIP with a
+    manifest (`schema: browserlink.annotation.bundle.v1`) naming the
+    included files, the annotation JSON byte-for-byte, the AI brief Markdown
+    (same sections as `export.md`, with `@file:`/`@image:` references
+    relative to the bundle so the archive is portable and never discloses
+    absolute host paths), and the PNG when present. A missing PNG is
+    declared as `screenshot: null`, never stubbed.
+  - **Backup all annotations** - `GET /annotations/backup.zip` streams one
+    consistent snapshot of the whole corpus (`schema:
+    browserlink.corpus.backup.v1`, `count`, per-record screenshot flags);
+    an empty corpus still produces a valid explicit empty backup. PNGs are
+    stored before their JSON (atomic renames), so every archive is a
+    complete before-or-after snapshot, never a partial file set, even while
+    annotations are written concurrently.
+  - Archives are deterministic (name-sorted entries, fixed timestamps) and
+    contain only safe relative paths (never absolute filesystem paths or
+    traversal names). The extension gains the minimal `downloads` permission
+    to start downloads and observe completion or cancellation; failures
+    (hub offline, empty corpus, absent screenshot, cancelled download) are
+    reported honestly. Copy AI Brief is unchanged.
+- **Anchor resilience (mutation-resistant draft re-anchoring)** - when an
+  element's exact cssPath no longer resolves (DOM drift, SPA route change,
+  refresh after a mutation), draft replay falls back deterministically to
+  stable attributes, then normalized text/aria label, then prior rectangle
+  proximity, and marks the re-anchored target as moved (amber marker).
+  Ambiguous or below-threshold candidates stay unresolved: the instruction
+  remains in the draft as recoverable, sendable context rendered as a ghost
+  marker at the prior rect, and is never attached to a wrong element. SPA
+  pushState/replaceState/popstate changes trigger one bounded re-anchor pass
+  after the DOM settles, with no duplicate markers or listeners. Exact
+  cssPath replay stays the first path, legacy drafts restore unchanged, and
+  Send/Clear All keep their existing draft-clearing contract.
+- **Share link (local read-only annotation page)** - `GET
+  /annotations/<name>/share` renders one stored annotation as a readable,
+  read-only HTML page: page URL, title, viewport, label, notes, per-element
+  Intent/Priority chips, instruction and selector details, capture state,
+  stroke summary, and the stored screenshot (referenced via
+  `/annotations/<name>/share.png`, with an explicit no-screenshot state
+  when absent). Annotation-derived text is HTML-escaped and the page is
+  served with a restrictive CSP, so stored content cannot execute script;
+  the page has no edit/delete/reply/account/cloud controls and labels its
+  reachability as same-machine (hub binds 127.0.0.1 by default) unless the
+  hub was deliberately exposed for LAN use. `GET /annotations/latest/share`
+  aliases the newest annotation. The popup gains a **Copy share link**
+  button that copies the newest annotation's share URL with a success state
+  naming the annotation.
+- **Deep picker (shadow DOM + iframes)** - the element picker reaches
+  inside open shadow roots (any depth) and same-origin iframes, including
+  nested frames: hover highlight, numbered markers, inspector placement,
+  and element crops all translate into top-viewport coordinates, and
+  stored descriptors carry optional `frame`/`shadow` metadata (schema
+  v1.7, strict typing, backward compatible with earlier payloads).
+  Cross-origin iframes degrade explicitly: the frame itself becomes a
+  bounded best-effort target with an honest "cross-origin" label, and
+  browserlink never claims or attempts inner-DOM access for them. Closed
+  shadow roots remain opaque.
+
 ## [2.5.0] - 2026-08-12
 
 ### Added

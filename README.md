@@ -3,7 +3,7 @@
 **Annotate in your browser. Deliver to any AI harness.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v2.5.0-4a9eff.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v2.6.0-4a9eff.svg)](CHANGELOG.md)
 [![CI](https://github.com/nexuslinkproductions/browserlink/actions/workflows/ci.yml/badge.svg)](https://github.com/nexuslinkproductions/browserlink/actions)
 [![MCP](https://img.shields.io/badge/MCP-server-ffd166.svg)](docs/mcp.md)
 [![Chromium](https://img.shields.io/badge/Chromium-MV3-ff5252.svg)](extension/manifest.json)
@@ -43,6 +43,25 @@ Open any page → **Annotate** to draw, **Element** to pick elements (hover
 highlight, click to select, type instructions in the chat card) → **Send**.
 The annotation lands in the hub inbox (`~/.browserlink/annotations/`) and is
 delivered to your connected harness.
+
+### First run
+
+- **Three-step intro** - the first time the tool activates you see three
+  coach marks in order: pick an element, add an instruction, then send.
+  Each mark points at the real control; advance with Next/Enter, dismiss
+  with Skip/Escape. Completing or skipping stores a one-time local flag, so
+  the intro never replays after a refresh, extension reload, or browser
+  restart. The popup's **Replay intro** button resets it explicitly.
+- **Activation is per page by default** - a newly loaded page stays
+  inactive until you turn the tool on for it. The popup's **Always on for
+  this browser session** toggle switches to automatic activation on newly
+  loaded eligible pages for the rest of the session only (cleared at
+  browser restart, off by default, per-page exit still respected, and never
+  applied to browser-internal pages).
+- **Honest availability** - on pages where Chrome blocks extensions
+  (chrome://, the web store, and similar), the popup states that the tool
+  is unavailable instead of retrying or prompting. No account, no cloud:
+  everything stays on your machine.
 
 ## Invoke from any chat
 
@@ -107,6 +126,14 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
 - **Element picker** - DevTools-style hover highlight with `tag#id.class`
   chips; click to select; numbered markers; real element descriptors
   (tag, id, classes, text, href, cssPath, rect).
+- **Deep picker (shadow DOM + iframes)** - the picker reaches elements inside
+  open shadow roots (any depth) and same-origin iframes, including nested
+  frames: highlights, numbered markers, inspector placement, and element
+  crops are all translated into top-viewport coordinates, and descriptors
+  carry optional `frame`/`shadow` metadata. Cross-origin iframes degrade
+  explicitly: the frame itself becomes a bounded best-effort target with an
+  honest cross-origin label - browserlink never claims or attempts
+  inaccessible inner-DOM selection.
 - **Instruction chat** - a chat card per element: type your thoughts, edit on
   re-click, batch them all into one send.
 - **Intent and Priority** - optional per-element chips (fix/change/question/
@@ -123,11 +150,44 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
   URL and restored with best-effort cssPath re-anchoring (unresolved markers
   are counted, never dropped). No account, no cloud sync; a draft clears
   only after a confirmed Send or Clear All.
+- **Anchor resilience (mutation-resistant re-anchoring)** - when a saved
+  element's exact cssPath no longer resolves (DOM drift, SPA route change,
+  refresh after a mutation), draft replay re-anchors it deterministically:
+  exact cssPath first, then stable attributes, then normalized text/aria
+  label, then prior rectangle proximity, above a documented confidence
+  threshold. Ambiguous or below-threshold targets stay unresolved - never
+  attached to a wrong element, never dropped - and render as ghost markers
+  at their prior spot with their instruction intact. SPA history changes
+  (pushState/replaceState/popstate) trigger one bounded re-anchor pass, and
+  markers show their state: amber for moved, gray ghost for unresolved.
+  Recovery is honest and best-effort: moved and unresolved markers stay
+  sendable as truthful context.
 - **Copy AI Brief** - one click copies the newest annotation as an AI-ready
   Markdown brief: page URL/title/viewport, per-element cssPaths,
   instructions, edits, Intent/Priority, capture state, notes, stroke
   summary, and local `@file`/`@image` references (`GET
   /annotations/latest/export.md`).
+- **Share link (read-only page)** - one click copies a local share URL for
+  the newest annotation; opening it renders a readable, read-only HTML page
+  with the page URL, label, notes, intent/priority chips, element
+  instructions and selectors, and the stored screenshot (`GET
+  /annotations/<name>/share`). The hub binds 127.0.0.1 by default, so the
+  link opens on this machine; other devices on your LAN can open it only if
+  you deliberately expose the hub. It is never a public link and needs no
+  account.
+- **Local save and backup** - the popup saves the newest capture as PNG or
+  JPEG (JPEG is converted locally in the browser) and downloads the newest
+  annotation bundle: a deterministic ZIP of the annotation JSON, the AI
+  brief Markdown, and the PNG when present, with a manifest naming the
+  schema and files (`GET /annotations/<name>/bundle`). A full-corpus backup
+  downloads one consistent snapshot of every stored annotation and its PNG
+  (`GET /annotations/backup.zip`), valid even when the corpus is empty.
+  Archives contain only safe relative paths; annotations without screenshots
+  declare the absent image instead of failing. Downloads are browser-native
+  (`chrome.downloads`): you pick the destination in the normal download
+  dialog, and nothing is uploaded anywhere - no account, no cloud. Missing
+  screenshots, empty corpora, offline hubs, and cancelled downloads are all
+  reported honestly. Copy AI Brief is unchanged.
 - **Activation toggle** - a master switch in the popup (default ON, persisted
   per profile): deactivates the tool on the current page with one click, and
   re-activates it straight from the popup.

@@ -1,10 +1,10 @@
-/** Shared annotation schema (v1.6), single source of truth for hub + MCP. */
+/** Shared annotation schema (v1.8), single source of truth for hub + MCP. */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-export const VERSION = "2.5.0";
+export const VERSION = "2.6.0";
 
 export const SCREENSHOT_PREFIX = "data:image/png;base64,";
 export const MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024;
@@ -49,6 +49,44 @@ export const INTENT_VALUES = ["fix", "change", "question", "approve"] as const;
 export const SEVERITY_VALUES = ["blocking", "important", "suggestion"] as const;
 export type Intent = (typeof INTENT_VALUES)[number];
 export type Severity = (typeof SEVERITY_VALUES)[number];
+
+// Schema v1.7 (F1 deep pick): optional per-element frame and shadow metadata.
+// frame.path is the same-origin iframe index chain from the top document to
+// the element's document ([] = top document); frame.crossOrigin marks a
+// bounded best-effort frame-level target whose inner DOM is not accessible.
+// shadow.depth/hosts describe the open shadow-host boundary chain
+// (hosts[0] is the outermost host). Both fields are optional and strictly
+// validated: unknown nested keys, wrong types, and out-of-range values are
+// rejected with HTTP 400, while legacy elements without them stay valid.
+export const MAX_FRAME_DEPTH = 8;
+export const MAX_SHADOW_DEPTH = 8;
+export const MAX_HOSTS = 8;
+export const MAX_HOST_SELECTOR = 500;
+export type FrameMetadata = { path?: number[]; crossOrigin?: boolean };
+export type ShadowMetadata = { depth?: number; hosts?: string[] };
+
+// Schema v1.8 (F2 anchor resilience): optional per-element anchor metadata
+// describing how a stored element was re-anchored on a changed live page.
+// version is the anchor format version (1); resolution is a strict enum
+// (exact = original cssPath replay, fallback = deterministic signal chain,
+// unresolved = no candidate reached the confidence threshold); confidence is
+// the 0..1 score of the winning path; fallback lists the deterministic
+// signals used, in order (attrs, text, aria, rect). All fields are strictly
+// validated: unknown nested keys, wrong types, unknown enum values, and
+// out-of-range numbers are rejected with HTTP 400, while legacy elements
+// without anchor stay valid.
+export const ANCHOR_VERSION = 1;
+export const ANCHOR_RESOLUTIONS = ["exact", "fallback", "unresolved"] as const;
+export const ANCHOR_FALLBACK_SIGNALS = ["attrs", "text", "aria", "rect"] as const;
+export const MAX_ANCHOR_FALLBACK_SIGNALS = 4;
+export type AnchorResolution = (typeof ANCHOR_RESOLUTIONS)[number];
+export type AnchorFallbackSignal = (typeof ANCHOR_FALLBACK_SIGNALS)[number];
+export type AnchorMetadata = {
+  version?: number;
+  resolution?: AnchorResolution;
+  confidence?: number;
+  fallback?: AnchorFallbackSignal[];
+};
 
 // Schema v1.6: optional top-level capture state (Freeze State Capture).
 // Only these four fields are accepted; unknown keys are rejected with
@@ -365,6 +403,136 @@ export function validatePayload(payload: unknown): string | null {
           !(SEVERITY_VALUES as readonly string[]).includes(severity)
         ) {
           return `elements[${elementIndex}].severity must be one of blocking, important, suggestion`;
+        }
+      }
+      // Schema v1.7: optional frame metadata (deep pick). Must be an object;
+      // unknown nested keys, wrong types, negative/non-integer path entries,
+      // and overlong paths are rejected. Legacy elements without frame stay
+      // valid (backward compatible).
+      const frame = el.frame;
+      if (frame !== undefined) {
+        if (frame === null || typeof frame !== "object" || Array.isArray(frame)) {
+          return `elements[${elementIndex}].frame must be an object`;
+        }
+        const fo = frame as Record<string, unknown>;
+        for (const key of Object.keys(fo)) {
+          if (key !== "path" && key !== "crossOrigin") {
+            return `elements[${elementIndex}].frame has unknown key '${key}'`;
+          }
+        }
+        if (fo.path !== undefined) {
+          if (!Array.isArray(fo.path)) {
+            return `elements[${elementIndex}].frame.path must be a list`;
+          }
+          if (fo.path.length > MAX_FRAME_DEPTH) {
+            return `elements[${elementIndex}].frame.path must have at most ${MAX_FRAME_DEPTH} entries`;
+          }
+          for (let i = 0; i < fo.path.length; i++) {
+            const n = fo.path[i];
+            if (typeof n !== "number" || !Number.isInteger(n) || n < 0) {
+              return `elements[${elementIndex}].frame.path[${i}] must be a non-negative integer`;
+            }
+          }
+        }
+        if (fo.crossOrigin !== undefined && typeof fo.crossOrigin !== "boolean") {
+          return `elements[${elementIndex}].frame.crossOrigin must be a boolean`;
+        }
+      }
+      // Schema v1.7: optional shadow metadata (deep pick). Must be an object;
+      // unknown nested keys, wrong types, out-of-range depth, and non-string
+      // hosts are rejected. Legacy elements without shadow stay valid.
+      const shadow = el.shadow;
+      if (shadow !== undefined) {
+        if (shadow === null || typeof shadow !== "object" || Array.isArray(shadow)) {
+          return `elements[${elementIndex}].shadow must be an object`;
+        }
+        const so = shadow as Record<string, unknown>;
+        for (const key of Object.keys(so)) {
+          if (key !== "depth" && key !== "hosts") {
+            return `elements[${elementIndex}].shadow has unknown key '${key}'`;
+          }
+        }
+        if (so.depth !== undefined) {
+          if (
+            typeof so.depth !== "number" ||
+            !Number.isInteger(so.depth) ||
+            so.depth < 0 ||
+            so.depth > MAX_SHADOW_DEPTH
+          ) {
+            return `elements[${elementIndex}].shadow.depth must be an integer from 0 to ${MAX_SHADOW_DEPTH}`;
+          }
+        }
+        if (so.hosts !== undefined) {
+          if (!Array.isArray(so.hosts)) {
+            return `elements[${elementIndex}].shadow.hosts must be a list`;
+          }
+          if (so.hosts.length > MAX_HOSTS) {
+            return `elements[${elementIndex}].shadow.hosts must have at most ${MAX_HOSTS} entries`;
+          }
+          for (let i = 0; i < so.hosts.length; i++) {
+            if (
+              typeof so.hosts[i] !== "string" ||
+              so.hosts[i].length === 0 ||
+              so.hosts[i].length > MAX_HOST_SELECTOR
+            ) {
+              return `elements[${elementIndex}].shadow.hosts[${i}] must be a non-empty string of at most ${MAX_HOST_SELECTOR} characters`;
+            }
+          }
+        }
+      }
+      // Schema v1.8: optional anchor metadata (F2 anchor resilience). Must be
+      // an object with only the four known keys; version and resolution are
+      // required whenever anchor is present, confidence must be 0..1, and
+      // fallback must be a non-empty list of strict enum signals with at
+      // most MAX_ANCHOR_FALLBACK_SIGNALS entries. Unknown nested keys, wrong
+      // types, unknown enum values, and out-of-range numbers are rejected.
+      // Legacy elements without anchor stay valid (backward compatible).
+      const anchor = el.anchor;
+      if (anchor !== undefined) {
+        if (anchor === null || typeof anchor !== "object" || Array.isArray(anchor)) {
+          return `elements[${elementIndex}].anchor must be an object`;
+        }
+        const ao = anchor as Record<string, unknown>;
+        for (const key of Object.keys(ao)) {
+          if (
+            key !== "version" &&
+            key !== "resolution" &&
+            key !== "confidence" &&
+            key !== "fallback"
+          ) {
+            return `elements[${elementIndex}].anchor has unknown key '${key}'`;
+          }
+        }
+        if (ao.version !== ANCHOR_VERSION) {
+          return `elements[${elementIndex}].anchor.version must be ${ANCHOR_VERSION}`;
+        }
+        if (
+          typeof ao.resolution !== "string" ||
+          !(ANCHOR_RESOLUTIONS as readonly string[]).includes(ao.resolution)
+        ) {
+          return `elements[${elementIndex}].anchor.resolution must be one of exact, fallback, unresolved`;
+        }
+        if (ao.confidence !== undefined) {
+          if (!isNumber(ao.confidence) || ao.confidence < 0 || ao.confidence > 1) {
+            return `elements[${elementIndex}].anchor.confidence must be a number from 0 to 1`;
+          }
+        }
+        if (ao.fallback !== undefined) {
+          if (
+            !Array.isArray(ao.fallback) ||
+            ao.fallback.length === 0 ||
+            ao.fallback.length > MAX_ANCHOR_FALLBACK_SIGNALS
+          ) {
+            return `elements[${elementIndex}].anchor.fallback must be a non-empty list of at most ${MAX_ANCHOR_FALLBACK_SIGNALS} signals`;
+          }
+          for (let i = 0; i < ao.fallback.length; i++) {
+            if (
+              typeof ao.fallback[i] !== "string" ||
+              !(ANCHOR_FALLBACK_SIGNALS as readonly string[]).includes(ao.fallback[i])
+            ) {
+              return `elements[${elementIndex}].anchor.fallback[${i}] must be one of attrs, text, aria, rect`;
+            }
+          }
         }
       }
     }

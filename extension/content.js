@@ -38,7 +38,8 @@
  *               setPointerCapture draws strokes. Coordinates are stored
  *               NORMALIZED (x/innerWidth, y/innerHeight) so resizes just
  *               re-render from data. pointercancel handled. UNCHANGED (v2).
- *   Element  -> DevTools-style picker (v2.1): canvas pointer-events: none so
+ *   Element  -> DevTools-style picker (v2.1, deep pick v1.7): canvas
+ *               pointer-events: none so
  *               the page receives the mouse. A rAF-throttled mousemove runs
  *               document.elementFromPoint(x, y), resolves the nearest
  *               meaningful element (has id/class/role/name/href; walk up max
@@ -58,6 +59,27 @@
  *               all selections. While the picker is active, page clicks are
  *               swallowed (preventDefault + stopPropagation) so links/buttons
  *               don't fire.
+ *   Deep pick (F1, schema v1.7): the picker opens OPEN shadow roots
+ *               (elementFromPoint pierces them; the meaningful walk crosses
+ *               each shadow boundary via its host) and SAME-ORIGIN iframes
+ *               (recursive elementFromPoint descent with frame-index paths;
+ *               registered frames get window/document listeners because the
+ *               top document receives no mouse events over an iframe; every
+ *               child-frame rect is translated into top viewport coordinates
+ *               by summing frame-element rects, so highlights, outlines,
+ *               inspector placement, and element crops are correct in nested
+ *               frames, under iframe scroll offsets, CSS zoom, and DPR).
+ *               Descriptors gain optional `frame` {path, crossOrigin} and
+ *               `shadow` {depth, hosts} metadata. CROSS-ORIGIN iframes are
+ *               never entered: a transparent shield over each inaccessible
+ *               frame (top document, element mode only) captures the events
+ *               the top document otherwise never sees over an iframe, so the
+ *               picker resolves the frame element itself as a bounded
+ *               best-effort target, labels it honestly ("cross-origin" chip
+ *               + badge), and stores frame.crossOrigin: true without
+ *               claiming inner-DOM access.
+ *               Our own UI stays unreachable (closed shadow root + host
+ *               exclusion); extension UI nodes never appear in descriptors.
  *
  * Send -> chrome.runtime.sendMessage({type:"annotate", payload}) with the
  * spec payload {source, url, title, viewport, label, strokes, elements};
@@ -67,9 +89,33 @@
  * Drafts (F3) persist across refresh in chrome.storage.local, keyed by the
  * canonical URL (origin + pathname + search, hash excluded): normalized
  * strokes, queued notes, and element descriptors (instruction + optional
- * intent/severity) restore on reinject with best-effort cssPath
- * re-anchoring. The draft clears only after a confirmed successful Send or
- * Clear All; live CSS/text edits are never stored or replayed.
+ * intent/severity) restore on reinject. Anchor resilience (F2, schema v1.8)
+ * makes restore deterministic: exact cssPath replay first, then stable
+ * attributes, normalized text/aria label, then prior-rect proximity, each
+ * tier gated by a documented confidence floor. Restored targets are stamped
+ * with anchor metadata (resolution exact/fallback/unresolved + confidence +
+ * fallback signals); entries that cannot be re-anchored stay in the draft as
+ * unresolved items with their instruction intact (ghost marker at the prior
+ * rect) - never attached to a wrong element, never silently dropped. SPA
+ * history events (pushState/replaceState/popstate/hashchange) trigger one
+ * bounded, debounced re-anchor pass after DOM stabilization. The draft
+ * clears only after a confirmed successful Send or Clear All; live CSS/text
+ * edits are never stored or replayed.
+ *
+ * Onboarding (F6): the first activation shows exactly three coach marks in
+ * order - pick an element (Element picker button), add an instruction (the
+ * visible instruction field), then send (toolbar Send). Each mark targets
+ * the actual control it names and can be advanced or dismissed by pointer
+ * (Next/Skip) or keyboard (Enter advances, Escape dismisses, Tab moves
+ * within the card). Completing or skipping stores a one-time local flag
+ * (chrome.storage.local "browserlinkOnboarded") so refresh, reinjection,
+ * extension reload, and browser restart never replay the tour unless the
+ * popup explicitly resets it. Activation: a freshly loaded page with no
+ * per-tab state stays dormant unless the popup "Always on for this browser
+ * session" toggle (chrome.storage.session "browserlinkAlwaysOn") is on;
+ * per-tab state (user exit or manual activation) always wins, and pages
+ * where Chrome blocks content scripts (chrome://, web store, ...) never
+ * see the tool or repeated injection attempts.
  *
  * The page DOM is NEVER touched beyond appending the shadow host.
  */
@@ -92,6 +138,10 @@
   const SEVERITIES = ['blocking', 'important', 'suggestion'];
   const MAX_CSS_PATH = 8;
   const MAX_PARENT_WALK = 5;
+  // Deep pick (F1, schema v1.7): bounded frame/shadow descent so picker and
+  // restore loops always terminate on hostile or cyclic page structures.
+  const MAX_FRAME_DEPTH = 8;
+  const MAX_SHADOW_DEPTH = 8;
   const HL_COLOR = '#4a9eff';
   const SEL_COLOR = '#ff5252';
   const CHIP_MAX = 40;
@@ -141,6 +191,7 @@
   // Selection awaiting Add/Cancel: {descriptor, el, isEdit, editIndex, outlineEl}
   let pending = null;
   let hoveredEl = null;      // meaningful element currently under the cursor
+  let hoveredCrossOrigin = false; // cursor is over an inaccessible (cross-origin) frame
   let mouse = null;          // last clientX/clientY
   let mouseDirty = false;
   let hoverLoopRaf = 0;
@@ -232,6 +283,297 @@
   let toolbarMorphTimeline = null;
   let toolbarMorphCleanup = null;
   let messagesBound = false;   // chrome.runtime.onMessage registered once
+
+  /* ---------------- onboarding tour + session always-on (F6) ----------------
+   * First-run coach marks: exactly three marks in order - pick an element
+   * (Element picker button), add an instruction (the visible instruction
+   * field), then send (toolbar Send). Completing or skipping stores a
+   * one-time local flag so the tour never replays across refresh,
+   * reinjection, extension reload, or browser restart; the popup "Replay
+   * intro" removes the flag and asks the active tab to show the tour again.
+   * The tour card and spotlight live inside the closed shadow root, never
+   * touch page DOM, and attach at most one card and one listener set per
+   * page context. Session always-on: "browserlinkAlwaysOn" in
+   * chrome.storage.session decides whether a freshly loaded eligible page
+   * (no per-tab state) activates automatically; it is cleared when the
+   * browser restarts. Per-tab state always wins over the flag, and pages
+   * where Chrome blocks content scripts never run here at all.
+   */
+  const ONBOARDED_KEY = 'browserlinkOnboarded'; // chrome.storage.local
+  const ALWAYS_ON_KEY = 'browserlinkAlwaysOn';  // chrome.storage.session
+  const TOUR_COPY = [
+    {
+      title: 'Pick an element',
+      body: 'Click the Element button (▣), then hover and click the element on this page you want to annotate.',
+    },
+    {
+      title: 'Add an instruction',
+      body: 'Type what should change about the element (or add a page note), then press Add. Your instruction ships with the element.',
+    },
+    {
+      title: 'Send',
+      body: 'Send delivers the whole annotation to your local hub and harness session. No account, no cloud - nothing leaves your machine.',
+    },
+  ];
+  let tourCard = null;          // the coach-mark card (inside the shadow root)
+  let tourStep = -1;            // -1 idle; 0..2 active step index
+  let tourShownCount = 0;       // shows per page context (one-instance diag)
+  let tourSuppressed = false;   // flag read said "already onboarded"
+  let onboardedFlag = null;     // null unknown; true/false after a read
+  let onboardingAlwaysOn = false; // session flag as seen at init/reinject
+  let tourFocusBefore = null;   // element focused before the tour took focus
+  let tourOpenedNoteCard = false; // tour opened the note card for step 2
+  let tourKeyHandler = null;
+  let tourRepositionHandler = null;
+
+  // Resolve the control each step targets: the ACTUAL current control.
+  function tourTargetForStep(step) {
+    if (!toolbar) return null;
+    if (step === 0) return toolbar.querySelector('[data-act="element"]');
+    if (step === 1) {
+      // Instruction surface: the element inspector field when an element is
+      // selected, otherwise the annotation note card input.
+      if (inspInput && inspPanel && !inspPanel.hidden) return inspInput;
+      if (chatInput && chatCard && !chatCard.hidden) return chatInput;
+      return null;
+    }
+    if (step === 2) return toolbar.querySelector('.comet-send');
+    return null;
+  }
+
+  // Make the step-2 instruction control visible without touching tool state
+  // beyond opening the note card (restored on dismissal).
+  function tourPrepareStep(step) {
+    if (step !== 1) return;
+    if (inspInput && inspPanel && !inspPanel.hidden) return; // inspector open
+    if (chatCard && !chatCard.hidden) return;                // note card open
+    if (!chatCard || !chatInput) return;
+    chatHead.textContent = 'Annotation note';
+    chatInput.placeholder = 'Your thoughts/instructions for this annotation…';
+    chatInput.value = state.annotNotes.join('\n');
+    chatCard.classList.add('comet-chat-note');
+    chatCard.hidden = false;
+    tourOpenedNoteCard = true;
+  }
+
+  // Restore any UI the tour opened (note card) when it leaves.
+  function tourRestorePreparedUI() {
+    if (tourOpenedNoteCard) {
+      tourOpenedNoteCard = false;
+      hideAnnotNoteCard();
+    }
+  }
+
+  function tourPosition() {
+    if (!tourCard || !tourCard.parentNode) return;
+    const target = tourTargetForStep(tourStep);
+    const ring = tourCard.querySelector('.comet-tour-ring');
+    const cardEl = tourCard.querySelector('.comet-tour-card');
+    if (ring && target) {
+      let r = null;
+      try { r = target.getBoundingClientRect(); } catch (_) { r = null; }
+      if (r && (r.width > 0 || r.height > 0)) {
+        const pad = 6;
+        ring.style.left = Math.round(r.left - pad) + 'px';
+        ring.style.top = Math.round(r.top - pad) + 'px';
+        ring.style.width = Math.round(r.width + pad * 2) + 'px';
+        ring.style.height = Math.round(r.height + pad * 2) + 'px';
+        ring.hidden = false;
+      } else {
+        ring.hidden = true;
+      }
+    } else if (ring) {
+      ring.hidden = true;
+    }
+    // Card near the target, clamped to the viewport.
+    if (cardEl && target) {
+      let r = null;
+      try { r = target.getBoundingClientRect(); } catch (_) { r = null; }
+      if (r) {
+        const cardW = Math.min(300, Math.max(220, window.innerWidth - 24));
+        const cardH = cardEl.offsetHeight || 150;
+        let left = Math.min(Math.max(12, r.left + r.width / 2 - cardW / 2), window.innerWidth - cardW - 12);
+        let top = r.bottom + 12;
+        if (top + cardH > window.innerHeight - 12) top = Math.max(12, r.top - cardH - 12);
+        cardEl.style.left = Math.round(left) + 'px';
+        cardEl.style.top = Math.round(top) + 'px';
+        cardEl.style.width = cardW + 'px';
+      }
+    }
+  }
+
+  function tourRender() {
+    if (!tourCard) return;
+    const cardEl = tourCard.querySelector('.comet-tour-card');
+    if (!cardEl) return;
+    const step = Math.max(0, Math.min(tourStep, TOUR_COPY.length - 1));
+    const copy = TOUR_COPY[step];
+    const titleEl = cardEl.querySelector('.comet-tour-title');
+    const bodyEl = cardEl.querySelector('.comet-tour-body');
+    const stepEl = cardEl.querySelector('.comet-tour-step');
+    const nextBtn = cardEl.querySelector('.comet-tour-next');
+    if (titleEl) titleEl.textContent = copy.title;
+    if (bodyEl) bodyEl.textContent = copy.body;
+    if (stepEl) stepEl.textContent = 'Step ' + (step + 1) + ' of ' + TOUR_COPY.length;
+    if (nextBtn) nextBtn.textContent = step === TOUR_COPY.length - 1 ? 'Done' : 'Next';
+    tourPosition();
+  }
+
+  function tourComplete(reason) {
+    if (!tourCard) return;
+    diagLog(reason === 'skip' ? 'tour:skip' : 'tour:done', 'step=' + (tourStep + 1) + '/' + TOUR_COPY.length);
+    tourTeardown();
+    // One-time local flag: survives refresh, reinjection, extension reload,
+    // and browser restart. Best-effort: a storage failure must not crash.
+    try {
+      chrome.storage.local.set({ [ONBOARDED_KEY]: true }).catch(() => {});
+    } catch (_) { /* storage unavailable */ }
+    onboardedFlag = true;
+  }
+
+  function tourTeardown() {
+    if (tourKeyHandler) {
+      window.removeEventListener('keydown', tourKeyHandler, true);
+      tourKeyHandler = null;
+    }
+    if (tourRepositionHandler) {
+      window.removeEventListener('scroll', tourRepositionHandler, true);
+      window.removeEventListener('resize', tourRepositionHandler);
+      tourRepositionHandler = null;
+    }
+    tourRestorePreparedUI();
+    if (tourFocusBefore && typeof tourFocusBefore.focus === 'function') {
+      try { tourFocusBefore.focus(); } catch (_) { /* ok */ }
+    }
+    tourFocusBefore = null;
+    if (tourCard && tourCard.parentNode) {
+      try { tourCard.parentNode.removeChild(tourCard); } catch (_) { /* ok */ }
+    }
+    tourCard = null;
+    tourStep = -1;
+  }
+
+  function tourAdvance() {
+    if (!tourCard) return;
+    if (tourStep >= TOUR_COPY.length - 1) {
+      tourComplete('done');
+      return;
+    }
+    tourStep += 1;
+    tourPrepareStep(tourStep);
+    tourRender();
+    diagLog('tour:step', 'step=' + (tourStep + 1) + '/' + TOUR_COPY.length);
+    const cardEl = tourCard.querySelector('.comet-tour-card');
+    if (cardEl && typeof cardEl.focus === 'function') cardEl.focus();
+  }
+
+  function showTour(fromReset) {
+    if (tourCard) return;                     // one card per page context
+    if (!fromReset && tourSuppressed) return; // one-time flag already set
+    if (!fromReset && tourShownCount > 0) return; // already shown this context
+    if (!host || !host.parentNode) return;    // tool must be active
+    if (!shadow) return;
+    tourShownCount += 1;
+    tourCard = document.createElement('div');
+    tourCard.className = 'comet-tour';
+    tourCard.setAttribute('role', 'region');
+    tourCard.setAttribute('aria-label', 'Browserlink quick intro');
+    const ring = document.createElement('div');
+    ring.className = 'comet-tour-ring';
+    ring.setAttribute('aria-hidden', 'true');
+    ring.hidden = true;
+    const cardEl = document.createElement('div');
+    cardEl.className = 'comet-tour-card';
+    cardEl.setAttribute('role', 'dialog');
+    cardEl.setAttribute('aria-label', 'Browserlink quick intro');
+    cardEl.tabIndex = -1;
+    cardEl.innerHTML =
+      '<div class="comet-tour-step"></div>' +
+      '<div class="comet-tour-title"></div>' +
+      '<div class="comet-tour-body"></div>' +
+      '<div class="comet-tour-actions">' +
+      '  <button type="button" class="comet-btn comet-tour-skip" tabindex="0">Skip</button>' +
+      '  <button type="button" class="comet-btn comet-tour-next" tabindex="0">Next</button>' +
+      '</div>' +
+      '<div class="comet-tour-trust">No account · local hub · nothing leaves this machine</div>';
+    tourCard.appendChild(ring);
+    tourCard.appendChild(cardEl);
+    shadow.appendChild(tourCard);
+
+    const skipBtn = cardEl.querySelector('.comet-tour-skip');
+    const nextBtn = cardEl.querySelector('.comet-tour-next');
+    if (skipBtn) skipBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      tourComplete('skip');
+    });
+    if (nextBtn) nextBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      tourAdvance();
+    });
+
+    // Keyboard: Enter/Space advance when focus is inside the card, Escape
+    // dismisses from anywhere. Capture phase, but only for tour-owned keys.
+    tourKeyHandler = (e) => {
+      if (!tourCard || !tourCard.parentNode) return;
+      const fromCard = e.composedPath && e.composedPath().indexOf(tourCard) !== -1;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        tourComplete('skip');
+        return;
+      }
+      if ((e.key === 'Enter' || e.key === ' ') && fromCard) {
+        e.preventDefault();
+        e.stopPropagation();
+        tourAdvance();
+        return;
+      }
+      if ((e.key === 'ArrowRight' || e.key === 'ArrowDown') && fromCard) {
+        e.preventDefault();
+        e.stopPropagation();
+        tourAdvance();
+        return;
+      }
+      if (e.key === 'ArrowLeft' && fromCard) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (tourStep > 0) {
+          tourStep -= 1;
+          tourRender();
+          diagLog('tour:step', 'step=' + (tourStep + 1) + '/' + TOUR_COPY.length);
+        }
+      }
+    };
+    window.addEventListener('keydown', tourKeyHandler, true);
+
+    tourRepositionHandler = () => tourPosition();
+    window.addEventListener('scroll', tourRepositionHandler, true);
+    window.addEventListener('resize', tourRepositionHandler);
+
+    tourFocusBefore = document.activeElement;
+    tourStep = 0;
+    tourPrepareStep(0);
+    tourRender();
+    diagLog('tour:show', 'step=1/' + TOUR_COPY.length + (fromReset ? ' reset' : ''));
+    try { cardEl.focus(); } catch (_) { /* ok */ }
+  }
+
+  // Called after the tool becomes active (init or reinject): show the tour
+  // on first activation unless the one-time local flag is set.
+  function maybeShowTour() {
+    if (tourSuppressed || tourShownCount > 0) return;
+    try {
+      chrome.storage.local.get(ONBOARDED_KEY).then((got) => {
+        const done = !!(got && got[ONBOARDED_KEY]);
+        onboardedFlag = done;
+        if (done) {
+          tourSuppressed = true;
+          return;
+        }
+        showTour(false);
+      }).catch(() => { showTour(false); });
+    } catch (_) { showTour(false); }
+  }
 
   /* ---------------- diagnostics (window.__browserlinkDiag) ----------------
    * Agnostic live diagnostics: a ring buffer of events, a lazy JSON snapshot,
@@ -361,6 +703,17 @@
       annotNote: state.annotNote || '',
       annotNotes: state.annotNotes.length,
       strokes: state.strokes.length,
+      // Deep pick (F1): frame registry diagnostics. One listener set per
+      // same-origin frame; cross-origin frames are never entered - each has
+      // a shield presenting the bounded best-effort target in element mode.
+      deep: {
+        sameOriginFrames: frameCounters.sameOrigin,
+        frameListeners: frameCounters.sameOrigin,
+        crossOriginFrames: frameCounters.crossOrigin,
+        shields: shields.length,
+        selectedInFrames: state.elements.filter((en) => en.descriptor && en.descriptor.frame).length,
+        selectedWithShadow: state.elements.filter((en) => en.descriptor && en.descriptor.shadow).length,
+      },
       captureRect: diagLastCaptureRect,
       // Freeze State Capture: frozen flag + last observed hovered selector.
       freeze: {
@@ -374,15 +727,84 @@
         key: draftStats.key,
         ageMs: draftStats.ageMs,
         restored: draftStats.restored,
+        moved: draftStats.moved || 0,
         restoredStrokes: draftStats.restoredStrokes,
         restoredNotes: draftStats.restoredNotes,
+        ambiguous: draftStats.ambiguous || 0,
         unresolved: draftStats.unresolved,
-      } : { key: null, ageMs: 0, restored: 0, restoredStrokes: 0, restoredNotes: 0, unresolved: 0 },
+      } : { key: null, ageMs: 0, restored: 0, moved: 0, restoredStrokes: 0, restoredNotes: 0, ambiguous: 0, unresolved: 0 },
+      // Anchor resilience (F2): per-resolution counts over in-memory
+      // elements plus bounded-pass bookkeeping. Every entry carries a
+      // resolution once a restore or re-anchor pass has run; fresh picks
+      // have no anchor field yet (picked at their current location).
+      // ambiguous is a strict subset of unresolved: duplicate signals tied,
+      // so no candidate was trusted.
+      anchor: {
+        exact: state.elements.filter((en) => en.descriptor && en.descriptor.anchor
+          && en.descriptor.anchor.resolution === 'exact').length,
+        fallback: state.elements.filter((en) => en.descriptor && en.descriptor.anchor
+          && en.descriptor.anchor.resolution === 'fallback').length,
+        unresolved: state.elements.filter((en) => en.descriptor && en.descriptor.anchor
+          && en.descriptor.anchor.resolution === 'unresolved').length,
+        ambiguous: lastAnchorPass ? lastAnchorPass.ambiguous : 0,
+        passes: reanchorPassCount,
+        lastPass: lastAnchorPass ? {
+          at: lastAnchorPass.at,
+          reason: lastAnchorPass.reason,
+          exact: lastAnchorPass.exact,
+          fallback: lastAnchorPass.fallback,
+          ambiguous: lastAnchorPass.ambiguous,
+          unresolved: lastAnchorPass.unresolved,
+        } : null,
+        perElement: state.elements.map((en) => {
+          const a = en.descriptor && en.descriptor.anchor ? en.descriptor.anchor : null;
+          return {
+            index: en.descriptor ? en.descriptor.index : null,
+            resolution: a ? a.resolution : null,
+            confidence: (a && typeof a.confidence === 'number') ? a.confidence : null,
+          };
+        }),
+      },
       canvasCtx: !!(canvas && ctx),
       messagesBound: messagesBound,
+      // Onboarding (F6): tour + session always-on state for one-instance
+      // and persistence diagnostics. tourShownCount is per page context.
+      // target/ring/card/controls expose live geometry so behavioral
+      // verification can assert each mark points at its real control.
+      onboarding: {
+        flag: onboardedFlag,
+        step: tourStep,
+        shown: tourShownCount,
+        active: !!(tourCard && tourCard.parentNode),
+        alwaysOn: onboardingAlwaysOn,
+        title: (tourStep >= 0 && TOUR_COPY[tourStep]) ? TOUR_COPY[tourStep].title : null,
+        openedNoteCard: tourOpenedNoteCard,
+        target: tourDiagRect(tourTargetForStep(tourStep)),
+        ring: tourDiagRect(tourCard ? tourCard.querySelector('.comet-tour-ring') : null),
+        card: tourDiagRect(tourCard ? tourCard.querySelector('.comet-tour-card') : null),
+        controls: tourCard ? {
+          next: tourDiagRect(tourCard.querySelector('.comet-tour-next')),
+          skip: tourDiagRect(tourCard.querySelector('.comet-tour-skip')),
+        } : null,
+      },
       health: diagHealth(false),
       log: diagRing.slice(),
     };
+  }
+
+  // Safe rect snapshot for the onboarding diagnostics block (null when the
+  // element is missing or hidden). Hidden elements report null so a tour
+  // mark over an invisible control is never claimed as visible.
+  function tourDiagRect(el) {
+    if (!el) return null;
+    try {
+      const r = el.getBoundingClientRect();
+      if (!r || (r.width === 0 && r.height === 0)) return null;
+      return {
+        x: Math.round(r.left), y: Math.round(r.top),
+        w: Math.round(r.width), h: Math.round(r.height),
+      };
+    } catch (_) { return null; }
   }
 
   // Console print: JSON snapshot plus a compact log tail.
@@ -606,6 +1028,38 @@
         // Schema v1.6: optional per-element intent/severity survive the draft.
         if (INTENTS.indexOf(d.intent) !== -1) out.intent = d.intent;
         if (SEVERITIES.indexOf(d.severity) !== -1) out.severity = d.severity;
+        // Schema v1.7 (F1): optional frame/shadow metadata survive the draft.
+        if (d.frame && (d.frame.crossOrigin === true || (Array.isArray(d.frame.path) && d.frame.path.length))) {
+          out.frame = {
+            path: Array.isArray(d.frame.path) ? d.frame.path.slice(0, MAX_FRAME_DEPTH) : [],
+            crossOrigin: d.frame.crossOrigin === true,
+          };
+        }
+        if (d.shadow && d.shadow.depth && Array.isArray(d.shadow.hosts) && d.shadow.hosts.length) {
+          out.shadow = {
+            depth: Math.min(Number(d.shadow.depth) || d.shadow.hosts.length, MAX_SHADOW_DEPTH),
+            hosts: d.shadow.hosts.slice(0, MAX_SHADOW_DEPTH),
+          };
+        }
+        // Schema v1.8 (F2): optional anchor metadata survives the draft so
+        // stored resolution state stays introspectable; restore recomputes
+        // the live resolution from the DOM regardless.
+        if (d.anchor && typeof d.anchor === 'object' && !Array.isArray(d.anchor)) {
+          const a = d.anchor;
+          if (a.version === ANCHOR_VERSION
+            && (a.resolution === 'exact' || a.resolution === 'fallback' || a.resolution === 'unresolved')) {
+            const anchorOut = { version: ANCHOR_VERSION, resolution: a.resolution };
+            if (typeof a.confidence === 'number' && Number.isFinite(a.confidence)) {
+              anchorOut.confidence = Math.max(0, Math.min(1, a.confidence));
+            }
+            if (Array.isArray(a.fallback) && a.fallback.length) {
+              anchorOut.fallback = a.fallback
+                .filter((s) => s === 'attrs' || s === 'text' || s === 'aria' || s === 'rect')
+                .slice(0, 4);
+            }
+            out.anchor = anchorOut;
+          }
+        }
         return out;
       }),
     };
@@ -667,11 +1121,14 @@
   }
 
   // Restore the URL-scoped draft after UI construction. Strokes replay via
-  // redraw; element markers re-anchor best-effort via document.querySelector
-  // on the stored cssPath inside a guarded try/catch (never throws, never
-  // mutates the page). Descriptors that cannot be re-anchored are retained
-  // in storage (the draft is untouched here) and reported via an unresolved
-  // count; the next user mutation writes a fresh draft.
+  // redraw; element markers re-anchor through the deterministic F2 signal
+  // chain (exact cssPath replay first, then stable attrs, normalized
+  // text/aria, prior rect proximity) inside a guarded try/catch (never
+  // throws, never mutates the page). Entries that cannot be re-anchored are
+  // NOT dropped: they stay in the draft list as unresolved items with their
+  // instruction intact, keep their marker as a ghost at the prior rect, and
+  // are reported via an unresolved count; the next user mutation writes a
+  // fresh draft.
   async function restoreDraftIfAny() {
     if (draftRestoredForLoad) return;
     draftRestoredForLoad = true;
@@ -714,22 +1171,25 @@
       state.annotNote = restoredNotes[restoredNotes.length - 1];
     }
     let restored = 0;
+    let moved = 0;
+    let ambiguous = 0;
     let unresolved = 0;
     let maxIndex = 0;
     for (const desc of elements) {
       if (!desc || typeof desc !== 'object') continue;
       let el = null;
-      if (typeof desc.cssPath === 'string' && desc.cssPath) {
-        try {
-          const found = document.querySelector(desc.cssPath);
-          if (found && found.nodeType === 1 && found.getRootNode() === document) el = found;
-        } catch (_) { el = null; }
-      }
-      if (!el) { unresolved += 1; continue; }
+      let res = null;
+      try {
+        // Anchor resilience (F2): full deterministic chain, exact replay
+        // first; legacy flat descriptors (and descriptors without cssPath)
+        // resolve through the same fallback signals.
+        res = reanchorElement(desc);
+        if (res.el) el = res.el;
+      } catch (_) { el = null; res = null; }
       const d2 = {
         index: (typeof desc.index === 'number' && Number.isFinite(desc.index)) ? desc.index : maxIndex + 1,
-        tag: String(desc.tag || el.tagName.toLowerCase()),
-        id: String(desc.id || el.id || ''),
+        tag: String(desc.tag || (el ? el.tagName.toLowerCase() : '')),
+        id: String(desc.id || (el ? el.id : '') || ''),
         className: String(desc.className || ''),
         text: String(desc.text || '').slice(0, MAX_TEXT),
         href: String(desc.href || ''),
@@ -740,9 +1200,39 @@
       };
       if (INTENTS.indexOf(desc.intent) !== -1) d2.intent = desc.intent;
       if (SEVERITIES.indexOf(desc.severity) !== -1) d2.severity = desc.severity;
+      // Schema v1.7 (F1): restore optional frame/shadow metadata so the
+      // descriptor stays truthful after refresh (bounded, sanitized).
+      if (desc.frame && typeof desc.frame === 'object' && !Array.isArray(desc.frame)) {
+        const f = desc.frame;
+        const fp = Array.isArray(f.path)
+          ? f.path.filter((n) => Number.isInteger(n) && n >= 0).slice(0, MAX_FRAME_DEPTH)
+          : [];
+        if (f.crossOrigin === true || fp.length) {
+          d2.frame = { path: fp, crossOrigin: f.crossOrigin === true };
+        }
+      }
+      if (desc.shadow && typeof desc.shadow === 'object' && !Array.isArray(desc.shadow)) {
+        const s = desc.shadow;
+        const hosts = Array.isArray(s.hosts)
+          ? s.hosts.filter((h) => typeof h === 'string' && h).slice(0, MAX_SHADOW_DEPTH)
+          : [];
+        if (hosts.length) d2.shadow = { depth: hosts.length, hosts };
+      }
       const outlineEl = createOutline(d2.index);
       state.elements.push({ descriptor: d2, el, outlineEl });
-      restored += 1;
+      // Anchor resilience (F2): stamp the truthful resolution state, mark
+      // the marker (moved/unresolved), and count. A missing result is an
+      // unresolved entry; its instruction is never attached and never
+      // dropped - it renders as a ghost at the prior rect.
+      if (!res) res = { el: null, resolution: 'unresolved', confidence: 0, fallback: [], reason: 'none' };
+      stampAnchor(d2, res);
+      markOutlineAnchor(outlineEl, res.resolution);
+      if (res.resolution === 'exact') restored += 1;
+      else if (res.resolution === 'fallback') { restored += 1; moved += 1; }
+      else {
+        unresolved += 1;
+        if (res.reason === 'ambiguous') ambiguous += 1;
+      }
       if (d2.index > maxIndex) maxIndex = d2.index;
     }
     if (maxIndex >= state.nextIndex) state.nextIndex = maxIndex + 1;
@@ -757,18 +1247,27 @@
       savedAt: (typeof d.savedAt === 'string') ? d.savedAt : null,
       ageMs: (typeof d.savedAt === 'string') ? Math.max(0, Date.now() - Date.parse(d.savedAt)) : 0,
       restored,
+      moved,
       restoredStrokes,
       restoredNotes: restoredNotes.length,
+      ambiguous,
       unresolved,
     };
     const bits = [];
     if (restoredStrokes) bits.push(restoredStrokes + (restoredStrokes === 1 ? ' stroke' : ' strokes'));
     if (restoredNotes.length) bits.push(restoredNotes.length + (restoredNotes.length === 1 ? ' note' : ' notes'));
-    if (restored) bits.push(restored + (restored === 1 ? ' element' : ' elements'));
-    if (unresolved) bits.push(unresolved + ' unresolved');
+    if (restored) {
+      bits.push(restored + (restored === 1 ? ' element' : ' elements')
+        + (moved ? ' (' + moved + ' moved)' : ''));
+    }
+    if (unresolved) {
+      bits.push(unresolved + ' unresolved'
+        + (ambiguous ? ' (' + ambiguous + ' ambiguous)' : ''));
+    }
     if (bits.length) setStatus('Draft restored: ' + bits.join(', '), 'ok');
     diagLog('draft:restored', 'strokes=' + restoredStrokes + ' notes=' + restoredNotes.length
-      + ' elements=' + restored + ' unresolved=' + unresolved);
+      + ' elements=' + restored + ' moved=' + moved + ' ambiguous=' + ambiguous
+      + ' unresolved=' + unresolved);
   }
 
   /* ---------------- toolbar position / collapse / edge dock ---------------- */
@@ -1438,7 +1937,7 @@
     const ih = inspPanel.offsetHeight || 0;
     const pad = POS_PAD + 8; // breathing room around the element
     let r = null;
-    if (el) { try { r = el.getBoundingClientRect(); } catch (_) { r = null; } }
+    if (el) { try { r = viewportRectOf(el); } catch (_) { r = null; } }
     let left = Math.round((vw - iw) / 2);
     let top = Math.max(POS_PAD, Math.round((vh - ih) / 2));
     if (r && r.width > 1 && r.height > 1) {
@@ -1927,7 +2426,7 @@
     ctx.lineWidth = 3;
     for (const en of state.elements) {
       let r = null;
-      try { r = en.el.getBoundingClientRect(); } catch (_) { r = null; }
+      try { r = viewportRectOf(en.el); } catch (_) { r = null; }
       if (!r || r.width < 1 || r.height < 1) continue;
       ctx.strokeRect(r.left - 3, r.top - 3, r.width + 6, r.height + 6);
     }
@@ -2013,28 +2512,1005 @@
   // Nearest meaningful element under the cursor: skip elements without
   // id/class/role/name/href (walk up max MAX_PARENT_WALK parents), never
   // html/body, never the extension's own shadow UI. Our UI lives in a CLOSED
-  // shadow root, so host.contains() cannot see inside it (closed shadow
-  // boundaries are opaque to light-tree traversal); getRootNode() returns the
-  // ShadowRoot for our elements and document for page elements, which is the
-  // reliable exclusion. If nothing meaningful is found in the walk, fall back
+  // shadow root, so elementFromPoint never returns anything inside it (closed
+  // boundaries are opaque); the host element itself and any light-tree
+  // children are excluded here. OPEN page shadow roots are traversable:
+  // elementFromPoint pierces them, and the walk crosses each boundary via
+  // the host element, so elements inside one or more open roots resolve like
+  // flat-DOM elements. If nothing meaningful is found in the walk, fall back
   // to the raw hit element (DevTools-style) so hover always works over plain
   // page content.
   function resolveMeaningful(hit) {
     if (!hit || hit.nodeType !== 1) return null;
-    if (hit.getRootNode() !== document) return null; // inside our closed shadow root
-    if (host && host.contains(hit)) return null;     // host itself / light-tree children
+    if (host && (hit === host || host.contains(hit))) return null; // our UI host / light children
     let el = hit;
     for (let i = 0; i <= MAX_PARENT_WALK; i++) {
       if (!el || el.nodeType !== 1) break;           // walked off the tree
-      if (el === document.documentElement || el === document.body) break; // never html/body
+      const root = el.getRootNode();
+      const doc = (root && root.nodeType === 9) ? root : el.ownerDocument;
+      if (doc && (el === doc.documentElement || el === doc.body)) break; // never html/body
+      // F1 deep pick: an element reached inside an OPEN shadow root is a
+      // precise pick target by itself. elementFromPoint pierced the root to
+      // return it, so do not skip it in favor of the host element; the host
+      // chain is recorded separately as descriptor shadow metadata.
+      if (root && root.nodeType === 11) return el;
       if (hasMeaning(el)) return el;
-      el = el.parentElement;
+      // Cross an open shadow boundary: the host is a normal element in the
+      // outer tree, so the walk continues through it. Closed roots are
+      // opaque here (no host is reachable), which only happens for elements
+      // elementFromPoint cannot see in the first place.
+      el = el.parentElement
+        || ((root && root.nodeType === 11 && root.host) ? root.host : null);
     }
     // No meaningful element within MAX_PARENT_WALK: fall back to the deepest
     // page element under the cursor (never html/body, never our own UI), so
     // hover always works over plain page content.
     if (hit === document.documentElement || hit === document.body) return null;
+    if (hit.ownerDocument && hit.ownerDocument.documentElement
+      && (hit === hit.ownerDocument.documentElement || hit === hit.ownerDocument.body)) {
+      return null;
+    }
     return hit;
+  }
+
+  /* ---------------- deep pick: open shadow roots + same-origin frames ---------------- */
+  // F1 (schema v1.7). elementFromPoint already pierces open shadow roots, so
+  // shadow support is: (a) let the meaningful walk cross shadow boundaries,
+  // (b) record the host chain as optional descriptor metadata. Iframe support
+  // needs more machinery: the top document receives NO mouse events while the
+  // cursor is over an iframe, so every same-origin frame is registered with
+  // its own window/document listeners that forward translated events to the
+  // top-frame picker. Cross-origin frames are never entered.
+
+  // Probe a frame element: {doc} when its document is same-origin accessible,
+  // {crossOrigin:true} when access is denied, null when not a frame element.
+  function probeFrameDoc(frameEl) {
+    if (!frameEl || (frameEl.tagName !== 'IFRAME' && frameEl.tagName !== 'FRAME')) return null;
+    try {
+      const d = frameEl.contentDocument;
+      return d ? { doc: d } : { crossOrigin: false };
+    } catch (_) {
+      return { crossOrigin: true };
+    }
+  }
+
+  // Index of a frame element among all iframe/frame elements in its own
+  // document (document order). Detached elements fall back to 0.
+  function frameIndexIn(frameEl) {
+    let frames = null;
+    try { frames = frameEl.ownerDocument.querySelectorAll('iframe, frame'); } catch (_) { frames = null; }
+    if (!frames) return 0;
+    for (let i = 0; i < frames.length; i++) {
+      if (frames[i] === frameEl) return i;
+    }
+    return 0;
+  }
+
+  // Iframe index chain from the top document to a given document.
+  function framePathOf(doc) {
+    const path = [];
+    let d = doc;
+    let guard = 0;
+    while (d && d !== document && guard++ < MAX_FRAME_DEPTH) {
+      const win = d.defaultView;
+      const fe = win && win.frameElement;
+      if (!fe) break;
+      path.unshift(frameIndexIn(fe));
+      d = fe.ownerDocument;
+    }
+    return path;
+  }
+
+  // Frame elements from the top document down to a given document.
+  function chainFrameElsOf(doc) {
+    const els = [];
+    let d = doc;
+    let guard = 0;
+    while (d && d !== document && guard++ < MAX_FRAME_DEPTH) {
+      const fe = d.defaultView && d.defaultView.frameElement;
+      if (!fe) break;
+      els.unshift(fe);
+      d = fe.ownerDocument;
+    }
+    return els;
+  }
+
+  // Translate a child-document rect into TOP viewport coordinates by summing
+  // the getBoundingClientRect offset of every frame element in the chain.
+  // Each frame rect is expressed in its own parent viewport, so the sum is
+  // the exact top-viewport translation; this inherently accounts for iframe
+  // scroll offsets, CSS zoom on the frame element, and nested same-origin
+  // frames. Elements in the top document translate by (0, 0) and behave
+  // exactly like the pre-F1 code path.
+  function frameOffsetOf(el) {
+    let off = { x: 0, y: 0 };
+    let doc = el.ownerDocument;
+    let guard = 0;
+    while (doc && doc !== document && guard++ < MAX_FRAME_DEPTH) {
+      const fe = doc.defaultView && doc.defaultView.frameElement;
+      if (!fe) break;
+      let r = null;
+      try { r = fe.getBoundingClientRect(); } catch (_) { r = null; }
+      if (r) { off.x += r.left; off.y += r.top; }
+      doc = fe.ownerDocument;
+    }
+    return off;
+  }
+
+  // getBoundingClientRect translated to the TOP viewport (the coordinate
+  // space of the overlay, crops, and normalized rects).
+  function viewportRectOf(el) {
+    const r = el.getBoundingClientRect();
+    const off = frameOffsetOf(el);
+    return {
+      left: r.left + off.x,
+      top: r.top + off.y,
+      right: r.right + off.x,
+      bottom: r.bottom + off.y,
+      width: r.width,
+      height: r.height,
+    };
+  }
+
+  // Shadow-host boundary chain: walk up through OPEN shadow roots, recording
+  // each host. hosts[0] is the outermost host (in the document or a frame's
+  // document); hosts[last] directly contains the element. Closed roots and
+  // detached fragments stop the walk (the boundary is opaque).
+  function shadowMetaOf(el) {
+    const hosts = [];
+    let cur = el;
+    let guard = 0;
+    while (cur && cur.nodeType === 1 && guard++ < MAX_SHADOW_DEPTH) {
+      const root = cur.getRootNode();
+      if (root === document || root === cur.ownerDocument) break;
+      if (root.nodeType !== 11) break; // not a DocumentFragment root
+      const host = root.host;
+      if (!host) break;
+      // Serialize the HOST as a cssPath string (resolvable inside the
+      // containing document/root), never as a live element: descriptors are
+      // JSON and must survive storage, drafts, and sends.
+      let p = null;
+      try { p = cssPath(host); } catch (_) { p = null; }
+      if (!p) break;
+      hosts.unshift(p);
+      cur = host;
+    }
+    return { depth: hosts.length, hosts };
+  }
+
+  // Resolve the element under a point in a document, descending into
+  // same-origin iframes under the cursor (recursively, bounded). Returns
+  // {hit, doc, path, crossOrigin}: hit is the deepest element
+  // elementFromPoint returned in doc; path is the frame-index chain from the
+  // top document to doc; crossOrigin is true when hit is a frame element
+  // whose inner document is NOT accessible, in which case the frame element
+  // itself is the bounded best-effort target (no inner-DOM claim).
+  function resolveAtPoint(x, y, doc, path) {
+    let d = doc || document;
+    let p = path || [];
+    for (let guard = 0; guard < MAX_FRAME_DEPTH; guard++) {
+      let hit = null;
+      try { hit = d.elementFromPoint(x, y); } catch (_) { hit = null; }
+      if (!hit || hit.nodeType !== 1) {
+        return { hit: null, doc: d, path: p, crossOrigin: false };
+      }
+      // Shadow-root descent (F1, schema v1.7): document.elementFromPoint
+      // does not pierce open shadow roots, it returns the shadow HOST.
+      // Descend manually, bounded by MAX_SHADOW_DEPTH: ShadowRoot has its
+      // own elementFromPoint, but its coordinate space is the host's
+      // border box, so translate the point first. Open roots only.
+      for (let sguard = 0; sguard < MAX_SHADOW_DEPTH && hit && hit.nodeType === 1 && hit.shadowRoot; sguard++) {
+        let hr = null;
+        try { hr = hit.getBoundingClientRect(); } catch (_) { hr = null; }
+        if (!hr || hr.width < 1 || hr.height < 1) break;
+        const lx = x - hr.left;
+        const ly = y - hr.top;
+        if (lx < 0 || ly < 0 || lx > hr.width || ly > hr.height) break;
+        let inner = null;
+        try { inner = hit.shadowRoot.elementFromPoint(lx, ly); } catch (_) { inner = null; }
+        if (!inner || inner.nodeType !== 1 || inner === hit) break;
+        hit = inner;
+      }
+      const probe = probeFrameDoc(hit);
+      if (!probe) {
+        return { hit, doc: d, path: p, crossOrigin: false }; // not a frame
+      }
+      if (probe.crossOrigin) {
+        // Cross-origin frame: bounded frame-level target, honestly marked.
+        // The path is INCLUSIVE (parent frames + this frame's own index) so
+        // the stored descriptor identifies the target on its own.
+        return { hit, doc: d, path: p.concat([frameIndexIn(hit)]), crossOrigin: true };
+      }
+      const childDoc = probe.doc;
+      if (!childDoc || childDoc.defaultView === window || childDoc.defaultView === d.defaultView) {
+        return { hit, doc: d, path: p, crossOrigin: false }; // frame without a doc yet
+      }
+      let r = null;
+      try { r = hit.getBoundingClientRect(); } catch (_) { r = null; }
+      if (!r || r.width < 1 || r.height < 1) {
+        return { hit, doc: d, path: p, crossOrigin: false };
+      }
+      const lx = x - r.left;
+      const ly = y - r.top;
+      if (lx < 0 || ly < 0 || lx > r.width || ly > r.height) {
+        return { hit, doc: d, path: p, crossOrigin: false };
+      }
+      const nextPath = p.concat([frameIndexIn(hit)]);
+      ensureFrameRegistered(hit, nextPath);
+      d = childDoc;
+      p = nextPath;
+      x = lx;
+      y = ly;
+    }
+    return { hit: null, doc: d, path: p, crossOrigin: false };
+  }
+
+  // Re-resolve a stored descriptor to a live element across same-origin
+  // frames and open shadow roots. Returns the element or null. Used by draft
+  // restore and by harness assertions; never throws.
+  function resolveByDescriptor(desc) {
+    if (!desc || typeof desc !== 'object') return null;
+    // Anchor resilience (F2): a cross-origin descriptor's target IS the
+    // frame element itself (F1 semantics: the frame element lives in the
+    // document at frame.path[:-1], and frame.path[last] is its index there).
+    // Replay it by index instead of descending into an inaccessible inner
+    // document, and verify the stored cssPath still names the same frame.
+    if (desc.frame && desc.frame.crossOrigin === true
+      && Array.isArray(desc.frame.path) && desc.frame.path.length) {
+      const chain = desc.frame.path;
+      let cdoc = document;
+      for (let i = 0; i < chain.length - 1; i++) {
+        let frames = null;
+        try { frames = cdoc.querySelectorAll('iframe, frame'); } catch (_) { frames = null; }
+        if (!frames || !frames[chain[i]]) return null;
+        const probe = probeFrameDoc(frames[chain[i]]);
+        if (!probe || !probe.doc) return null;
+        cdoc = probe.doc;
+      }
+      let frames = null;
+      try { frames = cdoc.querySelectorAll('iframe, frame'); } catch (_) { frames = null; }
+      const frameEl = frames && frames[chain[chain.length - 1]];
+      if (!frameEl || frameEl.nodeType !== 1) return null;
+      if (frameEl.ownerDocument !== cdoc && frameEl.getRootNode() !== cdoc) return null;
+      if (typeof desc.cssPath === 'string' && desc.cssPath) {
+        let probe = null;
+        try { probe = cdoc.querySelector(desc.cssPath); } catch (_) { probe = null; }
+        if (probe !== frameEl) return null; // frame layout changed: degrade
+      }
+      return frameEl;
+    }
+    let doc = document;
+    const fp = desc.frame && Array.isArray(desc.frame.path) ? desc.frame.path : [];
+    for (const idx of fp) {
+      let frames = null;
+      try { frames = doc.querySelectorAll('iframe, frame'); } catch (_) { frames = null; }
+      if (!frames || !frames[idx]) return null;
+      const probe = probeFrameDoc(frames[idx]);
+      if (!probe || !probe.doc) return null;
+      doc = probe.doc;
+    }
+    let root = doc;
+    const hosts = desc.shadow && Array.isArray(desc.shadow.hosts) ? desc.shadow.hosts : [];
+    for (const hostSel of hosts) {
+      let host = null;
+      try { host = root.querySelector(hostSel); } catch (_) { host = null; }
+      if (!host || !host.shadowRoot) return null;
+      root = host.shadowRoot;
+    }
+    if (typeof desc.cssPath !== 'string' || !desc.cssPath) return null;
+    let el = null;
+    try { el = root.querySelector(desc.cssPath); } catch (_) { el = null; }
+    if (!el || el.nodeType !== 1) return null;
+    if (el.getRootNode() !== root) return null; // selector escaped the expected root
+    return el;
+  }
+
+  // Stable identity key for a descriptor: frame path + cross-origin flag +
+  // shadow host chain + intra-root cssPath. Used for re-click/edit matching
+  // so an element keeps its identity across frames and shadow boundaries.
+  function descriptorKey(d) {
+    const fp = (d && d.frame && Array.isArray(d.frame.path)) ? d.frame.path.join(',') : '';
+    const cs = (d && d.frame && d.frame.crossOrigin === true) ? 'x' : '';
+    const hosts = (d && d.shadow && Array.isArray(d.shadow.hosts)) ? d.shadow.hosts.join('|') : '';
+    return fp + ';' + cs + ';' + hosts + ';' + (d.cssPath || '');
+  }
+
+  /* ---------------- Anchor resilience (F2) ----------------
+   * Mutation-resistant fallback re-anchoring (schema v1.8). When an
+   * element's exact cssPath no longer resolves (DOM drift, SPA route
+   * change, refresh after mutation), replay re-anchors deterministically
+   * through a fixed signal chain:
+   *   1. exact cssPath replay (frame path -> shadow hosts -> cssPath)
+   *   2. stable attributes: stored id (when present) must match exactly AND
+   *      stored class tokens (when present) must overlap >= 0.8
+   *   3. normalized text/aria: whitespace-collapsed, case-insensitive match
+   *      of the stored text or aria-label
+   *   4. prior rect proximity: a unique candidate within 0.18 of the
+   *      viewport diagonal from the stored normalized rect center
+   * A tier wins only when it finds exactly one usable (connected AND
+   * visible) candidate; empty tiers, duplicate candidates, and hidden or
+   * detached elements all fall through to the next tier. When no tier wins,
+   * the element stays UNRESOLVED: its instruction is never attached to a
+   * wrong element and never dropped. Every outcome is stamped as anchor
+   * metadata on the descriptor (version 1, strict resolution enum,
+   * confidence, fallback signal list) and surfaces in diagnostics.
+   */
+  const ANCHOR_VERSION = 1;
+  const ANCHOR_ATTRS_MIN_OVERLAP = 0.8;   // class-token overlap floor (tier 2)
+  const ANCHOR_RECT_MAX_DIST = 0.18;      // normalized center distance cap (tier 4)
+  // Confidence per winning path (schema v1.8: 0..1).
+  const ANCHOR_CONFIDENCE = { exact: 1, attrs: 0.95, text: 0.85, aria: 0.85, rect: 0.7 };
+  // Documented confidence floor: a winning path below this is never
+  // attached to - the entry stays unresolved instead of risking a wrong
+  // element. All fixed tier confidences sit at or above the floor.
+  const ANCHOR_CONFIDENCE_MIN = 0.7;
+  const ANCHOR_RESOLUTIONS = ['exact', 'fallback', 'unresolved'];
+  const ANCHOR_FALLBACK_SIGNALS = ['attrs', 'text', 'aria', 'rect'];
+  const REANCHOR_DEBOUNCE_MS = 350; // DOM stabilization wait after SPA events
+  const REANCHOR_CANDIDATE_CAP = 256; // bounded candidate scan per element
+  let reanchorTimer = 0;
+  let reanchorPassCount = 0;
+  // Last bounded pass bookkeeping for diagnostics: null until the first
+  // pass; after Clear All or a confirmed Send the in-memory list empties
+  // and the next trigger recomputes from scratch.
+  let lastAnchorPass = null;
+
+  function normalizeAnchorText(s) {
+    return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  // A re-anchored target must be usable: connected and visible. Hidden or
+  // detached candidates never win, so hidden targets degrade deterministically
+  // to unresolved instead of claiming an invisible element.
+  function isUsableAnchorTarget(el) {
+    if (!el || el.nodeType !== 1 || !el.isConnected) return false;
+    let r = null;
+    try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+    return !!(r && r.width >= 1 && r.height >= 1);
+  }
+
+  // The root (document or shadow root) named by the descriptor's frame path
+  // and shadow host chain; null when any boundary is unreachable.
+  function anchorRootOf(desc) {
+    let doc = document;
+    const fp = desc && desc.frame && Array.isArray(desc.frame.path) ? desc.frame.path : [];
+    for (const idx of fp) {
+      let frames = null;
+      try { frames = doc.querySelectorAll('iframe, frame'); } catch (_) { frames = null; }
+      if (!frames || !frames[idx]) return null;
+      const probe = probeFrameDoc(frames[idx]);
+      if (!probe || !probe.doc) return null;
+      doc = probe.doc;
+    }
+    let root = doc;
+    const hosts = desc && desc.shadow && Array.isArray(desc.shadow.hosts) ? desc.shadow.hosts : [];
+    for (const hostSel of hosts) {
+      let host = null;
+      try { host = root.querySelector(hostSel); } catch (_) { host = null; }
+      if (!host || !host.shadowRoot) return null;
+      root = host.shadowRoot;
+    }
+    return root;
+  }
+
+  function anchorClassTokens(cls) {
+    return String(cls || '').split(/\s+/).filter(Boolean);
+  }
+
+  function anchorClassOverlap(a, b) {
+    const ta = anchorClassTokens(a);
+    const tb = anchorClassTokens(b);
+    if (!ta.length || !tb.length) return 0;
+    let shared = 0;
+    for (const t of ta) {
+      if (tb.indexOf(t) !== -1) shared += 1;
+    }
+    return shared / Math.max(ta.length, tb.length);
+  }
+
+  // Stored rect center (normalized to the TOP annotation viewport) vs the
+  // candidate's live center (translated to the top viewport too, so frame
+  // targets compare against the same coordinate space the capture used),
+  // as a fraction of the viewport diagonal; 0 = same spot, 1 = opposite
+  // corner.
+  function anchorRectDistance(desc, el) {
+    const stored = desc && desc.rect && typeof desc.rect === 'object' ? desc.rect : null;
+    if (!stored || !isFinite(stored.x) || !isFinite(stored.y)) return Infinity;
+    let r = null;
+    try { r = viewportRectOf(el); } catch (_) { r = null; }
+    if (!r || r.width < 1 || r.height < 1) return Infinity;
+    const vw = Math.max(1, window.innerWidth);
+    const vh = Math.max(1, window.innerHeight);
+    const cx = (r.left + r.width / 2) / vw;
+    const cy = (r.top + r.height / 2) / vh;
+    return Math.hypot(cx - stored.x, cy - stored.y) / Math.sqrt(2);
+  }
+
+  // Identity guard for exact replay: the element at the stored cssPath is
+  // only 'exact' when its stable signals still match the stored descriptor.
+  // A path that now resolves to a different element (reordered siblings,
+  // re-rendered lists, SPA view swaps) is treated as drifted and falls
+  // through to the deterministic fallback chain instead of attaching the
+  // wrong element as if nothing changed.
+  function exactMatchesStored(desc, el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (desc.tag && el.tagName.toLowerCase() !== String(desc.tag).toLowerCase()) return false;
+    if (desc.id && el.id !== desc.id) return false;
+    if (desc.text) {
+      let t = '';
+      try { t = el.textContent || ''; } catch (_) { t = ''; }
+      if (normalizeAnchorText(t) !== normalizeAnchorText(desc.text)) return false;
+    }
+    if (desc.ariaLabel) {
+      let a = '';
+      try { a = el.getAttribute('aria-label') || ''; } catch (_) { a = ''; }
+      if (normalizeAnchorText(a) !== normalizeAnchorText(desc.ariaLabel)) return false;
+    }
+    return true;
+  }
+
+  // Deterministic fallback re-anchoring for one stored descriptor. Returns
+  // { el, resolution, confidence, fallback, reason }; el is null exactly
+  // when the result is unresolved. reason is diagnostics-only (never
+  // stored): 'none' (no candidates), 'hidden' (elements exist but none is
+  // visible/connected), 'ambiguous' (duplicate signals tied), 'root'
+  // (frame/shadow boundary unreachable), 'below' (confidence floor). Never
+  // throws and never mutates the page.
+  function reanchorElement(desc) {
+    const none = (reason) => ({ el: null, resolution: 'unresolved', confidence: 0, fallback: [], reason: reason || 'none' });
+    if (!desc || typeof desc !== 'object') return none('none');
+    // Tier 1: exact cssPath replay (fastest path; frame+shadow aware). The
+    // identity guard rejects a path that now resolves to a DIFFERENT
+    // element, so reordered/re-rendered lists fall through to fallback.
+    let exact = null;
+    try { exact = resolveByDescriptor(desc); } catch (_) { exact = null; }
+    if (exact && exactMatchesStored(desc, exact) && isUsableAnchorTarget(exact)) {
+      return { el: exact, resolution: 'exact', confidence: ANCHOR_CONFIDENCE.exact, fallback: [], reason: 'exact' };
+    }
+    const root = anchorRootOf(desc);
+    if (!root) {
+      // Deterministic boundary degradation: a frame target whose frame
+      // chain vanished, or a shadow target whose host chain broke, cannot
+      // be re-anchored - never guess across an opaque boundary.
+      if (desc.frame && desc.frame.crossOrigin === true) return none('frame');
+      if (desc.frame && Array.isArray(desc.frame.path) && desc.frame.path.length) return none('frame');
+      if (desc.shadow && desc.shadow.depth) return none('shadow');
+      return none('root');
+    }
+    const tag = String(desc.tag || '').toLowerCase();
+    const candidates = [];
+    let rawCount = 0;
+    if (tag && /^[a-z][a-z0-9-]*$/.test(tag)) {
+      try {
+        const list = root.querySelectorAll(tag);
+        for (let i = 0; i < list.length && candidates.length < REANCHOR_CANDIDATE_CAP; i++) {
+          rawCount += 1;
+          const el = list[i];
+          if (!isUsableAnchorTarget(el)) continue;
+          // Never consider an element whose live id contradicts the stored
+          // id: ids are the strongest identity signal and not editable by
+          // the inspector, so a live id mismatch means a different element.
+          if (desc.id && el.id && el.id !== desc.id) continue;
+          candidates.push(el);
+        }
+      } catch (_) { /* invalid tag: no candidates */ }
+    }
+    if (!rawCount) return none('none');
+    if (!candidates.length) return none('hidden');
+    let ambiguousSeen = false;
+    // Tier 2: stable attributes. The stored id (when present) must match
+    // exactly AND the stored class tokens (when present) must overlap >= 0.8.
+    // Fields absent from the stored descriptor impose no constraint.
+    const attrsHits = [];
+    for (const el of candidates) {
+      if (desc.id && el.id !== desc.id) continue;
+      if (desc.className) {
+        let live = '';
+        try { live = el.getAttribute('class') || ''; } catch (_) { live = ''; }
+        if (anchorClassOverlap(desc.className, live) < ANCHOR_ATTRS_MIN_OVERLAP) continue;
+      }
+      attrsHits.push(el);
+    }
+    if (attrsHits.length > 1) ambiguousSeen = true;
+    if (attrsHits.length === 1) {
+      const confidence = ANCHOR_CONFIDENCE.attrs;
+      if (confidence >= ANCHOR_CONFIDENCE_MIN) {
+        return { el: attrsHits[0], resolution: 'fallback', confidence, fallback: ['attrs'], reason: 'attrs' };
+      }
+    }
+    // Tier 3: normalized text/aria. A unique normalized text match wins;
+    // otherwise a unique normalized aria-label match wins.
+    const wantText = desc.text ? normalizeAnchorText(desc.text) : '';
+    const wantAria = desc.ariaLabel ? normalizeAnchorText(desc.ariaLabel) : '';
+    const textHits = [];
+    const ariaHits = [];
+    for (const el of candidates) {
+      if (wantText) {
+        let t = '';
+        try { t = el.textContent || ''; } catch (_) { t = ''; }
+        if (normalizeAnchorText(t) === wantText) textHits.push(el);
+      }
+      if (wantAria) {
+        let a = '';
+        try { a = el.getAttribute('aria-label') || ''; } catch (_) { a = ''; }
+        if (normalizeAnchorText(a) === wantAria) ariaHits.push(el);
+      }
+    }
+    if (textHits.length > 1) ambiguousSeen = true;
+    if (textHits.length === 1) {
+      const confidence = ANCHOR_CONFIDENCE.text;
+      if (confidence >= ANCHOR_CONFIDENCE_MIN) {
+        return { el: textHits[0], resolution: 'fallback', confidence, fallback: ['text'], reason: 'text' };
+      }
+    }
+    if (ariaHits.length > 1) ambiguousSeen = true;
+    if (ariaHits.length === 1) {
+      const confidence = ANCHOR_CONFIDENCE.aria;
+      if (confidence >= ANCHOR_CONFIDENCE_MIN) {
+        return { el: ariaHits[0], resolution: 'fallback', confidence, fallback: ['aria'], reason: 'aria' };
+      }
+    }
+    // Tier 4: prior rect proximity. A unique candidate within the threshold
+    // wins; ties (two candidates close to the prior spot) stay ambiguous and
+    // fall through to unresolved.
+    const near = [];
+    for (const el of candidates) {
+      const d = anchorRectDistance(desc, el);
+      if (d <= ANCHOR_RECT_MAX_DIST) near.push({ el, d });
+    }
+    if (near.length > 1) ambiguousSeen = true;
+    if (near.length === 1) {
+      const confidence = ANCHOR_CONFIDENCE.rect;
+      if (confidence >= ANCHOR_CONFIDENCE_MIN) {
+        return { el: near[0].el, resolution: 'fallback', confidence, fallback: ['rect'], reason: 'rect' };
+      }
+    }
+    return ambiguousSeen ? none('ambiguous') : none('none');
+  }
+
+  // Normalized rect of a live element, matching describeElement's shape.
+  function normalizedRectOf(el) {
+    let r = null;
+    try { r = viewportRectOf(el); } catch (_) { r = null; }
+    if (!r || r.width < 1 || r.height < 1) return null;
+    const n = (v) => Math.round(clamp01(v) * 1e6) / 1e6;
+    return {
+      x: n(r.left / Math.max(1, window.innerWidth)),
+      y: n(r.top / Math.max(1, window.innerHeight)),
+      w: n(r.width / Math.max(1, window.innerWidth)),
+      h: n(r.height / Math.max(1, window.innerHeight)),
+    };
+  }
+
+  // Stamp schema v1.8 anchor metadata onto a descriptor (truthful, bounded).
+  function stampAnchor(d, res) {
+    if (!d || !res) return;
+    d.anchor = {
+      version: ANCHOR_VERSION,
+      resolution: res.resolution,
+      confidence: Math.round(res.confidence * 1000) / 1000,
+    };
+    if (res.fallback && res.fallback.length) d.anchor.fallback = res.fallback.slice();
+  }
+
+  function markOutlineAnchor(outlineEl, resolution) {
+    if (!outlineEl) return;
+    outlineEl.classList.toggle('is-moved', resolution === 'fallback');
+    outlineEl.classList.toggle('is-unresolved', resolution === 'unresolved');
+    // Small state chip (moved/unresolved) keeps the marker self-explanatory
+    // without opening diagnostics; exact entries carry no chip.
+    let chip = outlineEl.querySelector('.comet-el-state');
+    if (resolution === 'fallback' || resolution === 'unresolved') {
+      if (!chip) {
+        chip = document.createElement('span');
+        chip.className = 'comet-el-state';
+        outlineEl.appendChild(chip);
+      }
+      chip.textContent = resolution === 'fallback' ? 'moved' : 'unresolved';
+      chip.classList.toggle('is-moved', resolution === 'fallback');
+      chip.classList.toggle('is-unresolved', resolution === 'unresolved');
+    } else if (chip) {
+      chip.remove();
+    }
+  }
+
+  // Apply one anchor resolution to an in-memory element entry: swaps the
+  // live element, refreshes the stored rect (moved/exact) or keeps the
+  // prior rect as the unresolved ghost position, stamps anchor metadata,
+  // and updates the marker classes. Never creates or removes markers - one
+  // marker per entry, always, so replay can never duplicate.
+  function applyAnchorResolution(en, res) {
+    const d = en.descriptor;
+    if (!d || !res) return;
+    if (res.el) {
+      en.el = res.el;
+      const nr = normalizedRectOf(res.el);
+      if (nr) d.rect = nr;
+    } else {
+      en.el = null;
+    }
+    stampAnchor(d, res);
+    markOutlineAnchor(en.outlineEl, res.resolution);
+  }
+
+  // One bounded re-anchor pass over every in-memory element. Triggered by
+  // SPA history events (debounced + double-rAF DOM stabilization) and by
+  // harness assertions. Each pass runs at most once per trigger; it never
+  // loops, never duplicates markers or listeners, and never drops an
+  // instruction: entries that stay unresolved keep their descriptor and
+  // render as an unresolved ghost at the prior rect.
+  function reanchorAllElements(reason) {
+    const counts = { exact: 0, fallback: 0, ambiguous: 0, unresolved: 0, reason: reason || 'manual' };
+    if (!state.elements.length) return counts;
+    // SPA navigation can swap iframes; refresh the registry once per pass
+    // (idempotent, bounded by the existing WeakSet/Map guards).
+    try { refreshFrameRegistry(); } catch (_) { /* ok */ }
+    for (const en of state.elements) {
+      if (!en || !en.descriptor) continue;
+      const res = reanchorElement(en.descriptor);
+      counts[res.resolution] += 1;
+      // Ambiguous outcomes are a strict subset of unresolved: duplicate
+      // signals tied, so no candidate was trusted. Reported separately in
+      // diagnostics so replay behavior is fully inspectable.
+      if (res.resolution === 'unresolved' && res.reason === 'ambiguous') counts.ambiguous += 1;
+      applyAnchorResolution(en, res);
+    }
+    reanchorPassCount += 1;
+    lastAnchorPass = {
+      at: new Date().toISOString(),
+      reason: counts.reason,
+      exact: counts.exact,
+      fallback: counts.fallback,
+      ambiguous: counts.ambiguous,
+      unresolved: counts.unresolved,
+    };
+    positionSelections();
+    updateSelectionUI();
+    if (counts.unresolved) {
+      setStatus(counts.unresolved + ' element' + (counts.unresolved === 1 ? '' : 's') + ' unresolved', 'warn');
+    } else if (counts.fallback) {
+      setStatus(counts.fallback + ' element' + (counts.fallback === 1 ? '' : 's') + ' re-anchored (moved)', 'ok');
+    }
+    diagLog('anchor:pass', 'reason=' + counts.reason + ' exact=' + counts.exact
+      + ' fallback=' + counts.fallback + ' ambiguous=' + counts.ambiguous
+      + ' unresolved=' + counts.unresolved);
+    // The refreshed descriptors (live rects, anchor state) persist under the
+    // CURRENT canonical key; re-anchoring never deletes stored drafts.
+    persistDraft();
+    return counts;
+  }
+
+  // Debounced SPA re-anchor: history events (pushState/replaceState/popstate/
+  // hashchange) collapse into ONE bounded pass after the DOM settles.
+  function scheduleReanchor(reason) {
+    if (!state.elements.length) return;
+    if (reanchorTimer) clearTimeout(reanchorTimer);
+    reanchorTimer = setTimeout(() => {
+      reanchorTimer = 0;
+      // DOM stabilization: two frames after the debounce so SPA render
+      // batches (framework updates, image loads) settle before replay.
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        reanchorAllElements(reason);
+      }));
+    }, REANCHOR_DEBOUNCE_MS);
+  }
+
+  function onHistoryChange() {
+    scheduleReanchor('history');
+  }
+
+  /* ---------------- deep pick: same-origin frame registry ---------------- */
+  // One listener set per frame element, attached exactly once (WeakSet
+  // guard). Entries live in frameEntries (frame element -> entry) for
+  // diagnostics. Counters feed the diag dump (G4 listener diagnostics).
+  const frameListeners = new WeakSet();
+  const frameEntries = new Map();
+  const frameCounters = { sameOrigin: 0, crossOrigin: 0 };
+
+  // Translate a child-window event into TOP viewport coordinates (computed
+  // live, so parent scrolls and frame moves between events stay correct).
+  function translateFramePoint(entry, x, y) {
+    let ox = 0;
+    let oy = 0;
+    for (const fe of entry.frameEls) {
+      let r = null;
+      try { r = fe.getBoundingClientRect(); } catch (_) { r = null; }
+      if (r) { ox += r.left; oy += r.top; }
+    }
+    return { x: x + ox, y: y + oy };
+  }
+
+  // Child-frame listeners: the picker would otherwise be blind inside the
+  // frame (no mouse events reach the top document over an iframe). All
+  // handlers are no-ops unless element mode is active, and the picker
+  // swallows page reactions exactly like the top-document handlers.
+  function attachFrameListeners(entry) {
+    const d = entry.doc;
+    const w = entry.win;
+    const onMove = (e) => {
+      if (!state.elementMode) return;
+      const t = translateFramePoint(entry, e.clientX, e.clientY);
+      mouse = { x: t.x, y: t.y };
+      mouseDirty = true;
+      if (isReducedMotion()) hoverTick();
+    };
+    const onDown = (e) => {
+      if (!state.elementMode) return;
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    const onClick = (e) => {
+      if (!state.elementMode) return;
+      e.preventDefault();
+      e.stopPropagation();
+      let r = null;
+      try { r = resolveAtPoint(e.clientX, e.clientY, d, entry.path); } catch (_) { r = null; }
+      handlePickResult(r, e);
+    };
+    // Frame keydowns never reach the top document once the iframe holds
+    // focus: forward the picker's two global keys (Escape cancels the
+    // pending element, Enter commits it). All other keys reach the page.
+    const onKey = (e) => {
+      if (!state.elementMode) return;
+      if (e.key === 'Escape' && pending) {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelChat();
+      } else if (e.key === 'Enter' && !e.shiftKey && pending) {
+        e.preventDefault();
+        e.stopPropagation();
+        addChat();
+      }
+    };
+    // Scrolls INSIDE the frame do not bubble to the top document: re-anchor
+    // cross-origin shields whose position depends on the frame's scroll.
+    const onScroll = () => { if (state.elementMode) scheduleShieldSync(); };
+    w.addEventListener('mousemove', onMove);
+    w.addEventListener('mousedown', onDown, true);
+    w.addEventListener('click', onClick, true);
+    w.addEventListener('keydown', onKey, true);
+    d.addEventListener('scroll', onScroll, true);
+    entry.handlers = { onMove, onDown, onClick, onKey, onScroll };
+    frameCounters.sameOrigin += 1;
+  }
+
+  // Remove one frame's listener set (navigation refresh, registry prune,
+  // teardown). Idempotent; safe when the frame window already died.
+  function detachFrameListeners(frameEl) {
+    const entry = frameEntries.get(frameEl);
+    if (!entry || !entry.handlers) return;
+    const h = entry.handlers;
+    try {
+      entry.win.removeEventListener('mousemove', h.onMove);
+      entry.win.removeEventListener('mousedown', h.onDown, true);
+      entry.win.removeEventListener('click', h.onClick, true);
+      entry.win.removeEventListener('keydown', h.onKey, true);
+    } catch (_) { /* window may be gone */ }
+    try {
+      entry.doc.removeEventListener('scroll', h.onScroll, true);
+    } catch (_) { /* doc may be gone */ }
+    frameEntries.delete(frameEl);
+    frameListeners.delete(frameEl);
+    if (frameCounters.sameOrigin > 0) frameCounters.sameOrigin -= 1;
+  }
+
+  // Teardown: remove every frame listener set and reset the counters.
+  function detachAllFrameListeners() {
+    for (const fe of Array.from(frameEntries.keys())) {
+      detachFrameListeners(fe);
+      frameEntries.delete(fe);
+    }
+    frameCounters.sameOrigin = 0;
+    frameCounters.crossOrigin = 0;
+  }
+
+  // Register one frame element (idempotent). Cross-origin frames are counted
+  // but never entered: they get a shield that presents the bounded
+  // best-effort frame target when element mode is active.
+  function ensureFrameRegistered(frameEl, path) {
+    if (!frameEl) return;
+    const probe = probeFrameDoc(frameEl);
+    if (!probe) return;
+    if (probe.crossOrigin) {
+      const existing = frameEntries.get(frameEl);
+      if (!existing || !existing.crossOrigin) {
+        // `path` is the INCLUSIVE index chain (parent frames + this frame).
+        frameEntries.set(frameEl, { crossOrigin: true, frameEl, path: path || [] });
+        frameCounters.crossOrigin += 1;
+      }
+      if (state.elementMode) createShieldFor(frameEntries.get(frameEl));
+      return;
+    }
+    if (!probe.doc) return;
+    if (frameListeners.has(frameEl)) {
+      // Same frame element, but the document may have changed under it
+      // (iframe navigation): listeners on the window survive navigation,
+      // yet hit-testing against the detached document would silently stop
+      // picking, so re-register against the CURRENT document.
+      const entry = frameEntries.get(frameEl);
+      if (entry && entry.doc === probe.doc) return;
+      detachFrameListeners(frameEl);
+    }
+    frameListeners.add(frameEl);
+    const entry = {
+      frameEl,
+      win: frameEl.contentWindow || probe.doc.defaultView,
+      doc: probe.doc,
+      frameEls: chainFrameElsOf(probe.doc),
+      path: path || framePathOf(probe.doc),
+    };
+    frameEntries.set(frameEl, entry);
+    attachFrameListeners(entry);
+  }
+
+  // Register every same-origin frame reachable from the top document
+  // (bounded depth). Called at init, on element-mode entry, and on a
+  // periodic timer; idempotent. Prunes entries whose frame left the tree
+  // and refreshes cross-origin shields.
+  function refreshFrameRegistry() {
+    const seen = new Set();
+    const visit = (doc, path) => {
+      let frames = null;
+      try { frames = doc.querySelectorAll('iframe, frame'); } catch (_) { frames = null; }
+      if (!frames) return;
+      for (const fe of frames) {
+        if (path.length >= MAX_FRAME_DEPTH) continue;
+        const probe = probeFrameDoc(fe);
+        if (probe && probe.doc && probe.doc.defaultView !== window) {
+          ensureFrameRegistered(fe, path.concat([frameIndexIn(fe)]));
+          seen.add(fe);
+          visit(probe.doc, path.concat([frameIndexIn(fe)]));
+        } else if (probe && probe.crossOrigin) {
+          ensureFrameRegistered(fe, path.concat([frameIndexIn(fe)]));
+          seen.add(fe);
+        }
+      }
+    };
+    try { visit(document, []); } catch (_) { /* never break the host page */ }
+    // Prune entries for frames that left the document tree (removed or
+    // replaced): their listeners died with the window, so drop the bookkeeping.
+    for (const fe of Array.from(frameEntries.keys())) {
+      if (seen.has(fe)) continue;
+      const entry = frameEntries.get(fe);
+      if (entry && entry.crossOrigin && frameCounters.crossOrigin > 0) {
+        frameCounters.crossOrigin -= 1;
+      }
+      detachFrameListeners(fe);
+      frameEntries.delete(fe);
+    }
+    if (state.elementMode) syncShields();
+  }
+
+  /* ---------------- deep pick: cross-origin frame shields ---------------- */
+  // The top document receives NO mouse events while the cursor is over ANY
+  // iframe, and a cross-origin frame can never be entered or listened to.
+  // Each inaccessible frame gets a transparent shield box in the TOP
+  // document (inside our closed shadow root, so it never appears in page
+  // hit tests): the shield is the only event path that can present the
+  // bounded best-effort frame target with an explicit cross-origin label
+  // and zero inner-DOM claims. Shields exist only in element mode.
+  const shields = []; // [{shield, frameEl, path}]
+  let shieldSyncRaf = 0;
+  let frameScanTimer = 0;
+  const FRAME_SCAN_MS = 1000; // periodic registry refresh while picking
+
+  function createShieldFor(entry) {
+    if (!shadow || !entry || !entry.frameEl || !entry.crossOrigin) return null;
+    if (shields.some((s) => s.frameEl === entry.frameEl)) return null;
+    const shield = document.createElement('div');
+    shield.className = 'comet-frame-shield';
+    shield.setAttribute('role', 'presentation');
+    shield.addEventListener('mousemove', (e) => {
+      if (!state.elementMode) return;
+      mouse = { x: e.clientX, y: e.clientY };
+      mouseDirty = true;
+      if (isReducedMotion()) hoverTick();
+    });
+    shield.addEventListener('mousedown', (e) => {
+      if (!state.elementMode) return;
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    shield.addEventListener('click', (e) => {
+      if (!state.elementMode) return;
+      e.preventDefault();
+      e.stopPropagation();
+      handlePickResult({
+        hit: entry.frameEl,
+        doc: entry.frameEl.ownerDocument,
+        path: entry.path || [],
+        crossOrigin: true,
+      }, e);
+    });
+    shield.style.display = 'none';
+    shadow.appendChild(shield);
+    shields.push({ shield, frameEl: entry.frameEl, path: entry.path || [] });
+    return shield;
+  }
+
+  // Position every shield over its frame's current top-viewport box.
+  function syncShields() {
+    if (shieldSyncRaf) return;
+    shieldSyncRaf = requestAnimationFrame(() => {
+      shieldSyncRaf = 0;
+      for (const s of shields) {
+        if (!s.shield || !s.shield.parentNode) continue;
+        let r = null;
+        try { r = viewportRectOf(s.frameEl); } catch (_) { r = null; }
+        if (!state.elementMode || !r || r.width < 1 || r.height < 1) {
+          s.shield.style.display = 'none';
+          continue;
+        }
+        s.shield.style.display = 'block';
+        s.shield.style.left = r.left + 'px';
+        s.shield.style.top = r.top + 'px';
+        s.shield.style.width = r.width + 'px';
+        s.shield.style.height = r.height + 'px';
+      }
+    });
+  }
+
+  function scheduleShieldSync() {
+    if (state.elementMode) syncShields();
+  }
+
+  // The shield box under a point (top viewport), or null.
+  function shieldAt(x, y) {
+    for (const s of shields) {
+      if (!s.shield || s.shield.style.display === 'none') continue;
+      const r = s.shield.getBoundingClientRect();
+      if (r && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return s;
+    }
+    return null;
+  }
+
+  function clearShields() {
+    for (const s of shields) {
+      if (s.shield && s.shield.parentNode) {
+        try { s.shield.parentNode.removeChild(s.shield); } catch (_) { /* ok */ }
+      }
+    }
+    shields.length = 0;
+    if (shieldSyncRaf) {
+      cancelAnimationFrame(shieldSyncRaf);
+      shieldSyncRaf = 0;
+    }
+  }
+
+  // Element-mode lifecycle: refresh the frame registry, rebuild shields,
+  // and keep both fresh while the picker is active (pages add, remove, and
+  // navigate frames at any time).
+  function startFrameScan() {
+    refreshFrameRegistry();
+    if (!frameScanTimer) {
+      frameScanTimer = setInterval(() => {
+        refreshFrameRegistry();
+      }, FRAME_SCAN_MS);
+    }
+  }
+
+  function stopFrameScan() {
+    if (frameScanTimer) {
+      clearInterval(frameScanTimer);
+      frameScanTimer = 0;
+    }
+    clearShields();
+  }
+
+  // Lazy registration: when the cursor crosses INTO an iframe, the top
+  // document fires mouseover at the frame boundary (it receives no
+  // mousemove over the frame), so register the frame here and let its own
+  // listeners take over from the first child-frame mousemove.
+  function onDocMouseOver(e) {
+    if (!state.elementMode) return;
+    const path = e.composedPath();
+    for (let i = 0; i < path.length && i <= MAX_FRAME_DEPTH; i++) {
+      const node = path[i];
+      if (node && node.nodeType === 1 && (node.tagName === 'IFRAME' || node.tagName === 'FRAME')) {
+        ensureFrameRegistered(node, framePathOf(node.ownerDocument).concat([frameIndexIn(node)]));
+        return; // outermost frame in the composed path is enough
+      }
+    }
   }
 
   function cssPath(el) {
@@ -2070,8 +3546,11 @@
   // active and the hover box is showing. A hovered element that is already
   // committed shows its own queue number (E<n>); any other element shows the
   // total queued count, so the queue length is always visible while picking.
+  // A cross-origin frame under the cursor is labeled honestly (bounded
+  // best-effort target: the frame itself, never a claim of inner-DOM access).
   function hoverChipLabel(el) {
     let label = chipFromEl(el);
+    if (hoveredCrossOrigin) label += ' · cross-origin';
     if (!state.elementMode || !state.elements.length) return label;
     const qi = state.elements.findIndex((en) => en.el === el);
     if (qi !== -1) {
@@ -2089,7 +3568,10 @@
     // last meaningful hovered element; keep its selector for captureState.
     retainHoveredSelector(el);
     const tag = el.tagName.toLowerCase();
-    const r = el.getBoundingClientRect();
+    // Deep pick (F1): rect is translated to the TOP viewport, so descriptors
+    // stay normalized to the annotation viewport even for same-origin frame
+    // elements (correct under iframe scroll offsets and nested frames).
+    const vr = viewportRectOf(el);
     let cls = '';
     try { cls = el.getAttribute('class') || ''; } catch (_) { /* svg etc. */ }
     if (typeof cls !== 'string' && typeof el.className === 'string') cls = el.className;
@@ -2102,7 +3584,7 @@
     let ariaLabel = '';
     try { ariaLabel = el.getAttribute('aria-label') || ''; } catch (_) { /* ok */ }
     const n = (v) => Math.round(clamp01(v) * 1e6) / 1e6;
-    return {
+    const d = {
       index: state.nextIndex,
       tag,
       id: el.id || '',
@@ -2112,13 +3594,22 @@
       ariaLabel,
       cssPath: cssPath(el),
       rect: {
-        x: n(r.x / window.innerWidth),
-        y: n(r.y / window.innerHeight),
-        w: n(r.width / window.innerWidth),
-        h: n(r.height / window.innerHeight),
+        x: n(vr.left / window.innerWidth),
+        y: n(vr.top / window.innerHeight),
+        w: n(vr.width / window.innerWidth),
+        h: n(vr.height / window.innerHeight),
       },
       instruction: '', // filled on Add (trimmed, cap 500)
     };
+    // Deep pick (F1, schema v1.7): optional frame + shadow metadata. Both are
+    // omitted for flat top-document elements, so legacy descriptors are
+    // byte-compatible. shadow.hosts is the open shadow-host chain
+    // (outermost first), cssPath stays root-relative for replay.
+    const framePath = framePathOf(el.ownerDocument);
+    if (framePath.length) d.frame = { path: framePath, crossOrigin: false };
+    const sm = shadowMetaOf(el);
+    if (sm.depth) d.shadow = { depth: sm.depth, hosts: sm.hosts };
+    return d;
   }
 
   /* ---------------- element mode: overlay positioning ---------------- */
@@ -2182,7 +3673,7 @@
       return;
     }
     let r = null;
-    try { r = hoveredEl.getBoundingClientRect(); } catch (_) { r = null; }
+    try { r = viewportRectOf(hoveredEl); } catch (_) { r = null; }
     const box = rectBox(r);
     if (!box) {
       hideHoverOutlineBox();
@@ -2244,7 +3735,7 @@
       return;
     }
     let r = null;
-    try { r = hoveredEl.getBoundingClientRect(); } catch (_) { r = null; }
+    try { r = viewportRectOf(hoveredEl); } catch (_) { r = null; }
     const target = rectBox(r);
     if (!target) {
       cancelHoverLerp();
@@ -2274,24 +3765,43 @@
     applyHoverOutlineBox(target);
   }
 
+  // Live viewport rect of a selection entry; unresolved entries fall back to
+  // the stored prior rect scaled to the current viewport (ghost position).
+  function selectionRectOf(en) {
+    if (en && en.el) {
+      try { return viewportRectOf(en.el); } catch (_) { return null; }
+    }
+    const d = en && en.descriptor ? en.descriptor : null;
+    if (d && d.rect && typeof d.rect === 'object') {
+      const vw = Math.max(1, window.innerWidth);
+      const vh = Math.max(1, window.innerHeight);
+      return {
+        left: Number(d.rect.x) * vw,
+        top: Number(d.rect.y) * vh,
+        width: Number(d.rect.w) * vw,
+        height: Number(d.rect.h) * vh,
+      };
+    }
+    return null;
+  }
+
   function positionSelections() {
     if (!selLayer) return;
     for (const en of state.elements) {
       if (!en.outlineEl) continue;
-      let r = null;
-      try { r = en.el.getBoundingClientRect(); } catch (_) { r = null; }
-      placeRect(en.outlineEl, r);
+      placeRect(en.outlineEl, selectionRectOf(en));
     }
     if (pending && pending.outlineEl) {
-      let r = null;
-      try { r = pending.el.getBoundingClientRect(); } catch (_) { r = null; }
-      placeRect(pending.outlineEl, r);
+      placeRect(pending.outlineEl, selectionRectOf(pending));
     }
   }
 
   function repositionAll() {
     positionHover();
     positionSelections();
+    // Deep pick (F1): cross-origin shields follow their frames on scroll
+    // and resize (frame-internal scrolls arrive via per-frame listeners).
+    scheduleShieldSync();
     // rAF-throttled hover-box recompute on scroll/resize (element mode only).
     scheduleHoverOutlineBox();
     if (hintProp) scheduleRedraw();
@@ -2349,9 +3859,26 @@
           }
           if (hoverBoxEl) hoverBoxEl.style.display = 'none';
         } else {
-          let hit = null;
-          try { hit = document.elementFromPoint(mouse.x, mouse.y); } catch (_) { hit = null; }
-          try { hoveredEl = resolveMeaningful(hit); } catch (_) { hoveredEl = null; }
+          // Deep pick (F1): resolveAtPoint descends into same-origin frames
+          // under the cursor (elementFromPoint pierces open shadow roots).
+          // A cross-origin shield (if any) is the exact hit area of its
+          // bounded frame-level target.
+          const shieldHit = shieldAt(mouse.x, mouse.y);
+          let r = null;
+          if (shieldHit) {
+            hoveredEl = shieldHit.frameEl;
+            hoveredCrossOrigin = true;
+          } else {
+            try { r = resolveAtPoint(mouse.x, mouse.y, document, []); } catch (_) { r = null; }
+            hoveredCrossOrigin = !!(r && r.crossOrigin);
+            if (r && r.crossOrigin) {
+              // Bounded best-effort target: the frame element itself, never
+              // a meaningful ancestor around an inaccessible frame.
+              try { hoveredEl = r.hit; } catch (_) { hoveredEl = null; }
+            } else {
+              try { hoveredEl = resolveMeaningful(r ? r.hit : null); } catch (_) { hoveredEl = null; }
+            }
+          }
           // Retain the last meaningful hovered selector (Freeze State
           // Capture): only real page hover targets update it, and it is
           // never cleared by moving over our own UI or empty page areas.
@@ -2393,6 +3920,7 @@
     cancelHoverLerp();
     hoverTargetRect = null;
     hoverVisualRect = null;
+    hoveredCrossOrigin = false;
     if (hlEl) hlEl.style.display = 'none';
     hideHoverOutlineBox();
   }
@@ -2444,6 +3972,39 @@
       labelSpan.className = 'comet-selection-label';
       labelSpan.textContent = label;
       main.appendChild(labelSpan);
+      // Deep pick (F1): per-row badges for frame depth, shadow depth, and the
+      // honest cross-origin limitation (frame-level target only).
+      // Anchor resilience (F2): per-row badges for the resolution state.
+      const desc = en.descriptor || {};
+      const badges = [];
+      let crossOriginBadge = false;
+      const anchorRes = desc.anchor && typeof desc.anchor === 'object' ? desc.anchor.resolution : null;
+      if (anchorRes === 'fallback') badges.push('moved');
+      else if (anchorRes === 'unresolved') badges.push('unresolved');
+      if (desc.frame && typeof desc.frame === 'object') {
+        if (desc.frame.crossOrigin === true) {
+          badges.push('cross-origin');
+          crossOriginBadge = true;
+        }
+        if (Array.isArray(desc.frame.path) && desc.frame.path.length) {
+          badges.push('frame ' + desc.frame.path.join('.'));
+        }
+      }
+      if (desc.shadow && typeof desc.shadow === 'object' && desc.shadow.depth) {
+        badges.push('shadow ' + desc.shadow.depth);
+      }
+      if (badges.length) {
+        const badgeSpan = document.createElement('span');
+        badgeSpan.className = 'comet-selection-badge'
+          + (crossOriginBadge ? ' is-crossorigin' : '')
+          + (anchorRes === 'fallback' ? ' is-anchor-moved' : '')
+          + (anchorRes === 'unresolved' ? ' is-anchor-unresolved' : '');
+        badgeSpan.textContent = badges.join(' · ');
+        main.appendChild(badgeSpan);
+        if (crossOriginBadge) {
+          main.title = 'Edit ' + label + ' (cross-origin frame: inner DOM is not accessible; the frame itself is the target)';
+        }
+      }
       const note = String((en.descriptor && en.descriptor.instruction) || '').replace(/\s+/g, ' ').trim();
       if (note) {
         const noteSpan = document.createElement('span');
@@ -2561,7 +4122,16 @@
       state.activeIndex = -1;
     }
     pending = { descriptor, el, isEdit, editIndex, outlineEl };
-    chatHead.textContent = chipFromEl(el) + (isEdit ? ' - edit instruction' : '');
+    // Deep pick (F1): a cross-origin frame target carries an honest label in
+    // the chat head so the limitation is visible, never silently implied.
+    // Anchor resilience (F2): an unresolved entry (no live element) is
+    // labeled explicitly so the user knows the target is gone.
+    const coSuffix = (descriptor && descriptor.frame && descriptor.frame.crossOrigin === true)
+      ? ' · cross-origin' : '';
+    const headChip = el ? chipFromEl(el)
+      : 'E' + String(descriptor && descriptor.index != null ? descriptor.index : (isEdit ? editIndex + 1 : ''))
+        + ' (unresolved)';
+    chatHead.textContent = headChip + coSuffix + (isEdit ? ' - edit instruction' : '');
     chatInput.value = isEdit ? (state.elements[editIndex].descriptor.instruction || '') : '';
     // Element instructions live in the inspector, not the bottom-right chat
     // card (the card is annotate-note only). The panel opens below via
@@ -2573,7 +4143,11 @@
     // A panel failure must never break element picking: log via the diag ring
     // and continue the focus/selection flow so the next click still works.
     try {
-      openInspector(el, inspDesc);
+      // Anchor resilience (F2): unresolved entries have no live element, so
+      // the style editor cannot bind; keep the panel closed and the row
+      // instruction visible instead.
+      if (el) openInspector(el, inspDesc);
+      else if (inspPanel) inspPanel.hidden = true;
     } catch (err) {
       diagLog('error', 'openInspector failed: ' + (err && err.message ? err.message : String(err)));
     }
@@ -2757,16 +4331,38 @@
     // Picker semantics: the page must not react to selection clicks.
     e.preventDefault();
     e.stopPropagation();
-    let hit = null;
-    try { hit = document.elementFromPoint(e.clientX, e.clientY); } catch (_) { hit = null; }
-    const el = resolveMeaningful(hit);
+    let r = null;
+    try { r = resolveAtPoint(e.clientX, e.clientY, document, []); } catch (_) { r = null; }
+    handlePickResult(r, e);
+  }
+
+  // Shared selection logic for top-document and same-origin frame clicks.
+  // `r` is the resolveAtPoint result (may carry a cross-origin frame hit).
+  function handlePickResult(r, e) {
+    if (!r || !r.hit) return;
+    let el = null;
+    if (r.crossOrigin) {
+      // Bounded best-effort target: the cross-origin frame element itself.
+      // No meaningful-walk here (its light-DOM ancestors are NOT the target)
+      // and no inner-DOM claim is ever made or stored.
+      el = r.hit;
+    } else {
+      try { el = resolveMeaningful(r.hit); } catch (_) { el = null; }
+    }
     if (!el) return;
     const d = describeElement(el);
-    const existingIdx = state.elements.findIndex((en) => en.descriptor.cssPath === d.cssPath);
+    if (r.crossOrigin) {
+      // frame.path is the inclusive index chain (parent frames + this
+      // frame), so the stored descriptor identifies the bounded target on
+      // its own; crossOrigin:true honestly marks the limitation.
+      d.frame = { path: r.path || [], crossOrigin: true };
+    }
+    const key = descriptorKey(d);
+    const existingIdx = state.elements.findIndex((en) => descriptorKey(en.descriptor) === key);
 
     // Shift+click is the additive toggle. Additions commit immediately so a
     // second shift-click can toggle them out without a chat-card round trip.
-    if (e.shiftKey) {
+    if (e && e.shiftKey) {
       if (existingIdx !== -1) {
         removeSelectionAt(existingIdx);
         return;
@@ -2774,7 +4370,7 @@
       if (pending && !pending.isEdit) cancelChat();
       d.index = state.nextIndex++;
       const outlineEl = createOutline(d.index);
-      state.elements.push({ descriptor: d, el, outlineEl });
+      state.elements.push({ descriptor: d, el, outlineEl, crossOrigin: r.crossOrigin === true });
       state.activeIndex = state.elements.length - 1;
       updateCount();
       updateSelectionPulse();
@@ -2787,11 +4383,10 @@
     // already-committed element keeps the whole queue and enters edit mode;
     // the committed selection list always persists (queue-first model).
     if (existingIdx !== -1) {
-      const idx = state.elements.findIndex((en) => en.descriptor.cssPath === d.cssPath);
-      openChat(d, el, true, idx);
+      openChat(d, el, true, existingIdx);
       return;
     }
-    if (pending && pending.descriptor.cssPath === d.cssPath) {
+    if (pending && descriptorKey(pending.descriptor) === key) {
       if (inspInput) inspInput.focus(); // same pending element -> just refocus
       return;
     }
@@ -3071,7 +4666,7 @@
     // Temporary outline when the element is not yet in the selection list.
     if (!selLayer || isReducedMotion()) return;
     let r = null;
-    try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+    try { r = viewportRectOf(el); } catch (_) { r = null; }
     if (!r || r.width < 1 || r.height < 1) return;
     const tmp = document.createElement('div');
     tmp.className = 'comet-el comet-el-reveal-pulse';
@@ -3102,7 +4697,7 @@
 
   function formatRectReadout(el) {
     let r = null;
-    try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+    try { r = viewportRectOf(el); } catch (_) { r = null; }
     const sx = window.scrollX || window.pageXOffset || 0;
     const sy = window.scrollY || window.pageYOffset || 0;
     if (!r) {
@@ -3437,7 +5032,7 @@
   function inspectorProps(el) {
     const out = [];
     let r = null;
-    try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
+    try { r = viewportRectOf(el); } catch (_) { r = null; }
     let cs = null;
     try { cs = getComputedStyle(el); } catch (_) { cs = null; }
     const fontSizePx = cs ? parsePx(cs.fontSize) : 16;
@@ -4752,7 +6347,7 @@
       }
     } catch (_) { /* fall through */ }
     try {
-      const r = el.getBoundingClientRect();
+      const r = viewportRectOf(el);
       return { left: r.left, top: r.top, width: r.width, height: r.height };
     } catch (_) {
       return null;
@@ -4783,7 +6378,7 @@
     if (inspPanel) {
       try {
         const pr = inspPanel.getBoundingClientRect();
-        const er = el.getBoundingClientRect();
+        const er = viewportRectOf(el);
         if (pr && er && er.width > 0 && er.height > 0
           && er.left >= pr.left && er.top >= pr.top
           && er.right <= pr.right && er.bottom <= pr.bottom) {
@@ -4799,7 +6394,7 @@
     const el = inspector.el;
     if (isEditorInternalTarget(el)) return;
     let box = null;
-    try { box = el.getBoundingClientRect(); } catch (_) { box = null; }
+    try { box = viewportRectOf(el); } catch (_) { box = null; }
     if (!box) return;
     let cs = null;
     try { cs = getComputedStyle(el); } catch (_) { cs = null; }
@@ -4964,15 +6559,21 @@
       if (chatCard) chatCard.hidden = true;
       closeInspector();
       stopHoverLoop();
+      stopFrameScan(); // deep pick (F1): shields + periodic frame scan end
       mouse = null;
       mouseDirty = false;
       hoveredEl = null;
+      hoveredCrossOrigin = false;
     }
     state.elementMode = on;
     if (on) {
       state.annotateOn = false;
       hideAnnotNoteCard(); // note card is annotate-only; committed note kept
       startHoverLoop();
+      // Deep pick (F1): (re)scan the frame tree and rebuild cross-origin
+      // shields when the picker starts; the periodic timer keeps both fresh
+      // while pages add, remove, and navigate frames.
+      startFrameScan();
     }
     applyMode();
     updateSelectionPulse();
@@ -5148,7 +6749,7 @@
     let bottom = -Infinity;
     for (const en of selected) {
       let r = null;
-      try { r = en && en.el && en.el.getBoundingClientRect(); } catch (_) { r = null; }
+      try { r = viewportRectOf(en.el); } catch (_) { r = null; }
       if (!r) continue;
       const l = Number(r.left);
       const t = Number(r.top);
@@ -5197,6 +6798,50 @@
       }
       if (Object.keys(edits).length) d.edits = edits;
       else delete d.edits;
+    }
+    // Schema v1.7 (F1): ship optional frame/shadow metadata in a canonical
+    // shape; empty or malformed values are dropped so payloads stay valid
+    // under the hub's strict nested-key validation.
+    if (d.frame && typeof d.frame === 'object') {
+      const fp = Array.isArray(d.frame.path) ? d.frame.path : [];
+      if (!fp.length && d.frame.crossOrigin !== true) delete d.frame;
+      else {
+        d.frame = {
+          path: fp.filter((n) => Number.isInteger(n) && n >= 0).slice(0, MAX_FRAME_DEPTH),
+          crossOrigin: d.frame.crossOrigin === true,
+        };
+      }
+    }
+    if (d.shadow && typeof d.shadow === 'object') {
+      const hosts = Array.isArray(d.shadow.hosts)
+        ? d.shadow.hosts.filter((h) => typeof h === 'string' && h).slice(0, MAX_SHADOW_DEPTH)
+        : [];
+      if (!hosts.length) delete d.shadow;
+      else d.shadow = { depth: hosts.length, hosts };
+    }
+    // Schema v1.8 (F2): ship optional anchor metadata in a canonical shape;
+    // malformed or empty values are dropped so payloads stay valid under the
+    // hub's strict nested-key validation.
+    if (d.anchor && typeof d.anchor === 'object' && !Array.isArray(d.anchor)) {
+      const a = d.anchor;
+      const okRes = a.resolution === 'exact' || a.resolution === 'fallback' || a.resolution === 'unresolved';
+      if (a.version === ANCHOR_VERSION && okRes) {
+        const anchorOut = { version: ANCHOR_VERSION, resolution: a.resolution };
+        if (typeof a.confidence === 'number' && Number.isFinite(a.confidence)) {
+          anchorOut.confidence = Math.max(0, Math.min(1, a.confidence));
+        }
+        if (Array.isArray(a.fallback) && a.fallback.length) {
+          const signals = a.fallback
+            .filter((s) => s === 'attrs' || s === 'text' || s === 'aria' || s === 'rect')
+            .slice(0, 4);
+          if (signals.length) anchorOut.fallback = signals;
+        }
+        d.anchor = anchorOut;
+      } else {
+        delete d.anchor;
+      }
+    } else {
+      delete d.anchor;
     }
     return d;
   }
@@ -5624,6 +7269,12 @@
   function teardownHost() {
     stopInspectorRingTween();
     removeFreeze(); // Freeze State Capture: always remove the injected style
+    // Onboarding (F6): drop the tour card and its listeners with the host.
+    tourTeardown();
+    // Deep pick (F1): drop frame listeners, cross-origin shields, and the
+    // element-mode frame scan so nothing of ours survives the teardown.
+    stopFrameScan();
+    detachAllFrameListeners();
     toolbarDockLayoutToken += 1;
     stopToolbarOrientationMorph();
     if (toolbarDragRaf) {
@@ -5771,6 +7422,8 @@
     window.removeEventListener('resize', onWindowResize);
     window.removeEventListener('orientationchange', onWindowResize);
     window.removeEventListener('pagehide', onPageHide); // exiting never writes a draft
+    window.removeEventListener('popstate', onHistoryChange);
+    window.removeEventListener('hashchange', onHistoryChange);
     saveTabState({ enabled: false }); // deactivation persists per tab
     try {
       chrome.storage.local.set({ toolEnabled: false }); // master switch stays off across refreshes
@@ -5841,6 +7494,13 @@
       try {
         chrome.storage.local.set({ toolEnabled: true }); // master switch reflects active tool
       } catch (_) { /* storage unavailable */ }
+      // F6: refresh the session always-on flag and show the tour on this
+      // (manual) activation unless the one-time local flag is set.
+      try {
+        const got = await chrome.storage.session.get(ALWAYS_ON_KEY);
+        onboardingAlwaysOn = !!(got && got[ALWAYS_ON_KEY]);
+      } catch (_) { onboardingAlwaysOn = false; }
+      maybeShowTour();
       pingTabId();
     } catch (err) {
       try { if (host && host.parentNode) host.parentNode.removeChild(host); } catch (_) { /* ok */ }
@@ -5916,6 +7576,16 @@
     }
     if (msg.type === 'browserlinkExit') {
       fullExit();
+      return false;
+    }
+    if (msg.type === 'browserlinkShowTour') {
+      // Popup "Replay intro": the local flag was removed; show the tour on
+      // this tab even if it already ran once in this page context.
+      if (host && host.parentNode) {
+        showTour(true);
+      } else {
+        reinject().then(() => showTour(true)).catch(() => { /* ok */ });
+      }
       return false;
     }
     return false;
@@ -6413,9 +8083,32 @@
     window.addEventListener('click', onPageClick, true);
     window.addEventListener('keydown', onKeyDown, true);
     document.addEventListener('scroll', repositionAll, true); // incl. inner scrollers
+    // Deep pick (F1): lazily register same-origin frames the cursor crosses
+    // into (mouseover fires at the frame boundary in the top document even
+    // though mousemove does not). Idempotent via the WeakSet guard, so no
+    // duplicate frame listeners can accumulate on refresh or reinjection.
+    document.addEventListener('mouseover', onDocMouseOver);
     window.addEventListener('resize', onWindowResize);
     window.addEventListener('orientationchange', onWindowResize);
     window.addEventListener('pagehide', onPageHide); // F3: flush draft on refresh
+    // Anchor resilience (F2): one bounded re-anchor per SPA history event.
+    // pushState/replaceState are wrapped once per injection and CHAIN to any
+    // previous wrapper, so re-injection never duplicates notifications and
+    // never loses them (each wrapper schedules on its own instance; stale
+    // instances are no-ops because their state is empty after exit).
+    const wrapHistory = (fnName) => {
+      const prev = history[fnName];
+      if (typeof prev !== 'function') return;
+      history[fnName] = function (...args) {
+        const r = prev.apply(this, args);
+        scheduleReanchor(fnName === 'replaceState' ? 'replaceState' : 'pushState');
+        return r;
+      };
+    };
+    wrapHistory('pushState');
+    wrapHistory('replaceState');
+    window.addEventListener('popstate', onHistoryChange);
+    window.addEventListener('hashchange', onHistoryChange);
     if (!messagesBound) {
       messagesBound = true;
       chrome.runtime.onMessage.addListener(onRuntimeMessage);
@@ -6457,11 +8150,35 @@
         diagLog('init:skip', 'disabled by master switch');
         return;
       }
+      // Session always-on (F6): a freshly loaded page with no per-tab state
+      // stays dormant unless the popup "Always on for this browser session"
+      // toggle is on. Per-tab state (explicit exit, or manual activation via
+      // reinject) always wins; dormant pages keep the message listener bound
+      // so the popup can still activate them manually.
+      let alwaysOn = false;
+      try {
+        const got = await chrome.storage.session.get(ALWAYS_ON_KEY);
+        alwaysOn = !!(got && got[ALWAYS_ON_KEY]);
+      } catch (_) { alwaysOn = false; }
+      onboardingAlwaysOn = alwaysOn;
+      const perTabChoice = !!(st && typeof st.enabled === 'boolean');
+      if (!perTabChoice && !alwaysOn) {
+        diagLog('init:skip', 'dormant: always-on off, manual activation required');
+        return;
+      }
       buildUI();
       bindEvents();
       await injectShadowStyles();
       restoreTabState(st);
+      // Deep pick (F1): register same-origin frames up front so picking works
+      // inside them immediately (idempotent; also refreshed lazily on
+      // mouseover and on demand by resolveAtPoint).
+      refreshFrameRegistry();
       diagAttach();
+      // Onboarding (F6): first activation shows the three-step tour unless
+      // the one-time local flag is set. Fire-and-forget: a storage failure
+      // must never block the toolbar.
+      maybeShowTour();
       const health = diagHealth(true);
       diagLog('init:done',
         'ready=' + (health.ok ? 'yes' : 'no')
@@ -6532,6 +8249,50 @@
       computeCaptureRect,
       send,
       updateMotionPreference,
+      // Deep pick (F1): harness-accessible picker primitives for behavioral
+      // verification of shadow-DOM, same-origin iframe, and cross-origin
+      // degradation behavior.
+      resolveAtPoint,
+      viewportRectOf,
+      resolveByDescriptor,
+      descriptorKey,
+      describeElement,
+      handlePickResult,
+      refreshFrameRegistry,
+      ensureFrameRegistered,
+      get frameEntriesSize() { return frameEntries.size; },
+      get frameCounters() { return Object.assign({}, frameCounters); },
+      get hoveredCrossOrigin() { return hoveredCrossOrigin; },
+      get hoveredEl() { return hoveredEl; },
+      get crossOriginShieldCount() { return shields.length; },
+      // Anchor resilience (F2): harness-accessible re-anchor primitives for
+      // behavioral verification of deterministic fallback order, confidence
+      // gating, and ambiguous/hidden/removed degradation.
+      reanchorElement,
+      reanchorAllElements,
+      applyAnchorResolution,
+      scheduleReanchor,
+      normalizeAnchorText,
+      anchorRectDistance,
+      isUsableAnchorTarget,
+      get anchorPassCount() { return reanchorPassCount; },
+      get lastAnchorPass() { return lastAnchorPass ? Object.assign({}, lastAnchorPass) : null; },
+      // Onboarding (F6): harness hooks for the tour and session always-on.
+      // showTour(true) is the explicit reset path the popup Replay intro
+      // uses; advanceTour/dismissTour mirror pointer and keyboard actions.
+      showTour: (fromReset) => showTour(!!fromReset),
+      advanceTour: () => tourAdvance(),
+      dismissTour: () => tourComplete('skip'),
+      setAlwaysOn: (v) => {
+        onboardingAlwaysOn = !!v;
+        return chrome.storage.session.set({ [ALWAYS_ON_KEY]: !!v }).catch(() => {});
+      },
+      get tourStep() { return tourStep; },
+      get tourShownCount() { return tourShownCount; },
+      get tourActive() { return !!(tourCard && tourCard.parentNode); },
+      get onboarded() { return onboardedFlag; },
+      get alwaysOn() { return onboardingAlwaysOn; },
+      get tourSuppressed() { return tourSuppressed; },
     };
   }
 

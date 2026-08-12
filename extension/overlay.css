@@ -33,9 +33,11 @@
 :host([data-capturing='partial']) .comet-hl,
 :host([data-capturing='partial']) .comet-hover-box,
 :host([data-capturing='partial']) canvas,
+:host([data-capturing='partial']) .comet-frame-shield,
 :host([data-capturing='full']) .comet-hl,
 :host([data-capturing='full']) .comet-hover-box,
-:host([data-capturing='full']) canvas {
+:host([data-capturing='full']) canvas,
+:host([data-capturing='full']) .comet-frame-shield {
   visibility: hidden !important;
 }
 
@@ -239,6 +241,11 @@
   color: #ff6b6b;
   text-shadow: 0 0 11px rgba(255, 82, 82, 0.38);
 }
+/* Anchor resilience (F2): amber warning state for unresolved re-anchors. */
+.status.warn {
+  color: #ffd166;
+  text-shadow: 0 0 11px rgba(255, 209, 102, 0.38);
+}
 
 /* ---- element picker layer (shadow-internal, fixed viewport layer) ---- */
 .comet-sel-layer {
@@ -314,6 +321,56 @@
   box-sizing: border-box;
   white-space: nowrap;
   box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.30), 0 2px 6px rgba(0, 0, 0, 0.40), 0 0 11px rgba(255, 82, 82, 0.42);
+}
+
+/* State chip on the marker itself: small pill at the bottom-right corner. */
+.comet-el-state {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  transform: translate(50%, 50%);
+  font: bold 9px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 5px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.comet-el-state.is-moved {
+  background: rgba(240, 168, 62, 0.95);
+  color: #241a05;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+.comet-el-state.is-unresolved {
+  background: rgba(115, 123, 141, 0.95);
+  color: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
+/* Anchor resilience (F2): truthful marker states after draft replay. A
+   re-anchored (moved) marker turns amber to signal the target moved; an
+   unresolved marker renders as a translucent ghost at the prior rect with a
+   gray badge, so an instruction is never hidden and never claimed for a
+   wrong element. */
+.comet-el.is-moved {
+  border-color: #ffb020;
+  border-style: dashed;
+  box-shadow: 0 0 14px rgba(255, 176, 32, 0.22), inset 0 0 13px rgba(255, 176, 32, 0.05);
+}
+.comet-el.is-moved .comet-el-badge {
+  background: linear-gradient(180deg, #ffc34d, #f09a12);
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.30), 0 2px 6px rgba(0, 0, 0, 0.40), 0 0 11px rgba(255, 176, 32, 0.45);
+}
+.comet-el.is-unresolved {
+  border-color: rgba(160, 166, 178, 0.85);
+  border-style: dotted;
+  opacity: 0.55;
+  box-shadow: none;
+}
+.comet-el.is-unresolved .comet-el-badge {
+  background: linear-gradient(180deg, #b6bcc8, #8b919e);
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.30), 0 2px 6px rgba(0, 0, 0, 0.35);
 }
 
 /* ---- instruction chat card (bottom-right of viewport) ---- */
@@ -1791,6 +1848,40 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Deep pick (F1): per-row frame/shadow depth + cross-origin limitation badges. */
+.comet-selection-badge {
+  display: inline-block;
+  flex: 0 0 auto;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: rgba(74, 158, 255, 0.14);
+  color: #9cc9ff;
+  font: 600 9.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.comet-selection-badge.is-crossorigin {
+  background: rgba(255, 190, 92, 0.16);
+  color: #ffd28f;
+}
+/* Deep pick (F1): transparent shield over each cross-origin iframe. The top
+   document receives no mouse events over an iframe and the frame can never
+   be entered, so the shield is the only event path that presents the bounded
+   best-effort frame target. It exists only in element mode (display toggled
+   by content.js), sits below every other surface (canvas, toolbar, chip),
+   and is hidden from captures via the data-capturing rules above. */
+.comet-frame-shield {
+  position: fixed;
+  z-index: 2147483645;
+  box-sizing: border-box;
+  background: rgba(74, 158, 255, 0.05);
+  outline: 1px dashed rgba(74, 158, 255, 0.55);
+  cursor: crosshair;
+  pointer-events: auto;
+  display: none;
+}
 .comet-selection-remove {
   appearance: none;
   flex: 0 0 auto;
@@ -2771,4 +2862,115 @@
   white-space: pre-wrap;
   word-break: break-word;
   color: #9aa0a6;
+}
+
+/* ---------------- onboarding coach marks (F6) ---------------- */
+/* The tour card and spotlight live inside the closed shadow root; the host
+ * is pointer-events:none, so the interactive parts opt back in. The ring is
+ * purely visual and never blocks the control it highlights. */
+.comet-tour {
+  position: fixed;
+  inset: 0;
+  /* Paints above the toolbar/chat layer (2147483647) so the ring around a
+   * toolbar control and the card near the note card are never occluded. */
+  z-index: 2147483647;
+  pointer-events: none;
+}
+
+.comet-tour-ring {
+  position: fixed;
+  z-index: 1;
+  pointer-events: none;
+  border: 2px solid #4a9eff;
+  border-radius: 10px;
+  box-shadow:
+    0 0 0 2px rgba(74, 158, 255, 0.25),
+    0 0 24px rgba(74, 158, 255, 0.35);
+  transition: left 0.18s ease, top 0.18s ease, width 0.18s ease, height 0.18s ease;
+}
+
+.comet-tour-card {
+  position: fixed;
+  z-index: 2;
+  pointer-events: auto;
+  box-sizing: border-box;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(28, 31, 39, 0.97);
+  color: #e8eaed;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  animation: comet-tour-pop 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+
+@keyframes comet-tour-pop {
+  from { opacity: 0; transform: translateY(8px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.comet-tour-card:focus {
+  outline: 2px solid #4a9eff;
+  outline-offset: 2px;
+}
+
+.comet-tour-step {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #4a9eff;
+  margin-bottom: 6px;
+}
+
+.comet-tour-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.comet-tour-body {
+  font-size: 12px;
+  color: #c6cad1;
+  margin-bottom: 10px;
+}
+
+.comet-tour-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.comet-tour-actions .comet-btn {
+  width: auto;
+  padding: 6px 14px;
+  font-size: 12px;
+}
+
+.comet-tour-actions .comet-btn:focus-visible {
+  outline: 2px solid #4a9eff;
+  outline-offset: 2px;
+}
+
+.comet-tour-skip {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.comet-tour-skip:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.comet-tour-trust {
+  margin-top: 8px;
+  font-size: 10.5px;
+  color: #9aa0a6;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .comet-tour-card,
+  .comet-tour-ring {
+    animation: none;
+    transition: none;
+  }
 }
