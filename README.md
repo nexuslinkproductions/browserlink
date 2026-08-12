@@ -131,6 +131,18 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
   URL and restored with best-effort cssPath re-anchoring (unresolved markers
   are counted, never dropped). No account, no cloud sync; a draft clears
   only after a confirmed Send or Clear All.
+- **Anchor resilience (mutation-resistant re-anchoring)** - when a saved
+  element's exact cssPath no longer resolves (DOM drift, SPA route change,
+  refresh after a mutation), draft replay re-anchors it deterministically:
+  exact cssPath first, then stable attributes, then normalized text/aria
+  label, then prior rectangle proximity, above a documented confidence
+  threshold. Ambiguous or below-threshold targets stay unresolved - never
+  attached to a wrong element, never dropped - and render as ghost markers
+  at their prior spot with their instruction intact. SPA history changes
+  (pushState/replaceState/popstate) trigger one bounded re-anchor pass, and
+  markers show their state: amber for moved, gray ghost for unresolved.
+  Recovery is honest and best-effort: moved and unresolved markers stay
+  sendable as truthful context.
 - **Copy AI Brief** - one click copies the newest annotation as an AI-ready
   Markdown brief: page URL/title/viewport, per-element cssPaths,
   instructions, edits, Intent/Priority, capture state, notes, stroke

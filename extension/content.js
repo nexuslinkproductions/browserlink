@@ -89,9 +89,18 @@
  * Drafts (F3) persist across refresh in chrome.storage.local, keyed by the
  * canonical URL (origin + pathname + search, hash excluded): normalized
  * strokes, queued notes, and element descriptors (instruction + optional
- * intent/severity) restore on reinject with best-effort cssPath
- * re-anchoring. The draft clears only after a confirmed successful Send or
- * Clear All; live CSS/text edits are never stored or replayed.
+ * intent/severity) restore on reinject. Anchor resilience (F2, schema v1.8)
+ * makes restore deterministic: exact cssPath replay first, then stable
+ * attributes, normalized text/aria label, then prior-rect proximity, each
+ * tier gated by a documented confidence floor. Restored targets are stamped
+ * with anchor metadata (resolution exact/fallback/unresolved + confidence +
+ * fallback signals); entries that cannot be re-anchored stay in the draft as
+ * unresolved items with their instruction intact (ghost marker at the prior
+ * rect) - never attached to a wrong element, never silently dropped. SPA
+ * history events (pushState/replaceState/popstate/hashchange) trigger one
+ * bounded, debounced re-anchor pass after DOM stabilization. The draft
+ * clears only after a confirmed successful Send or Clear All; live CSS/text
+ * edits are never stored or replayed.
  *
  * The page DOM is NEVER touched beyond appending the shadow host.
  */
@@ -415,12 +424,15 @@
         moved: draftStats.moved || 0,
         restoredStrokes: draftStats.restoredStrokes,
         restoredNotes: draftStats.restoredNotes,
+        ambiguous: draftStats.ambiguous || 0,
         unresolved: draftStats.unresolved,
-      } : { key: null, ageMs: 0, restored: 0, moved: 0, restoredStrokes: 0, restoredNotes: 0, unresolved: 0 },
+      } : { key: null, ageMs: 0, restored: 0, moved: 0, restoredStrokes: 0, restoredNotes: 0, ambiguous: 0, unresolved: 0 },
       // Anchor resilience (F2): per-resolution counts over in-memory
       // elements plus bounded-pass bookkeeping. Every entry carries a
       // resolution once a restore or re-anchor pass has run; fresh picks
       // have no anchor field yet (picked at their current location).
+      // ambiguous is a strict subset of unresolved: duplicate signals tied,
+      // so no candidate was trusted.
       anchor: {
         exact: state.elements.filter((en) => en.descriptor && en.descriptor.anchor
           && en.descriptor.anchor.resolution === 'exact').length,
@@ -428,7 +440,24 @@
           && en.descriptor.anchor.resolution === 'fallback').length,
         unresolved: state.elements.filter((en) => en.descriptor && en.descriptor.anchor
           && en.descriptor.anchor.resolution === 'unresolved').length,
+        ambiguous: lastAnchorPass ? lastAnchorPass.ambiguous : 0,
         passes: reanchorPassCount,
+        lastPass: lastAnchorPass ? {
+          at: lastAnchorPass.at,
+          reason: lastAnchorPass.reason,
+          exact: lastAnchorPass.exact,
+          fallback: lastAnchorPass.fallback,
+          ambiguous: lastAnchorPass.ambiguous,
+          unresolved: lastAnchorPass.unresolved,
+        } : null,
+        perElement: state.elements.map((en) => {
+          const a = en.descriptor && en.descriptor.anchor ? en.descriptor.anchor : null;
+          return {
+            index: en.descriptor ? en.descriptor.index : null,
+            resolution: a ? a.resolution : null,
+            confidence: (a && typeof a.confidence === 'number') ? a.confidence : null,
+          };
+        }),
       },
       canvasCtx: !!(canvas && ctx),
       messagesBound: messagesBound,
@@ -2534,6 +2563,29 @@
     return Math.hypot(cx - stored.x, cy - stored.y) / Math.sqrt(2);
   }
 
+  // Identity guard for exact replay: the element at the stored cssPath is
+  // only 'exact' when its stable signals still match the stored descriptor.
+  // A path that now resolves to a different element (reordered siblings,
+  // re-rendered lists, SPA view swaps) is treated as drifted and falls
+  // through to the deterministic fallback chain instead of attaching the
+  // wrong element as if nothing changed.
+  function exactMatchesStored(desc, el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (desc.tag && el.tagName.toLowerCase() !== String(desc.tag).toLowerCase()) return false;
+    if (desc.id && el.id !== desc.id) return false;
+    if (desc.text) {
+      let t = '';
+      try { t = el.textContent || ''; } catch (_) { t = ''; }
+      if (normalizeAnchorText(t) !== normalizeAnchorText(desc.text)) return false;
+    }
+    if (desc.ariaLabel) {
+      let a = '';
+      try { a = el.getAttribute('aria-label') || ''; } catch (_) { a = ''; }
+      if (normalizeAnchorText(a) !== normalizeAnchorText(desc.ariaLabel)) return false;
+    }
+    return true;
+  }
+
   // Deterministic fallback re-anchoring for one stored descriptor. Returns
   // { el, resolution, confidence, fallback, reason }; el is null exactly
   // when the result is unresolved. reason is diagnostics-only (never
@@ -2544,10 +2596,12 @@
   function reanchorElement(desc) {
     const none = (reason) => ({ el: null, resolution: 'unresolved', confidence: 0, fallback: [], reason: reason || 'none' });
     if (!desc || typeof desc !== 'object') return none('none');
-    // Tier 1: exact cssPath replay (fastest path; frame+shadow aware).
+    // Tier 1: exact cssPath replay (fastest path; frame+shadow aware). The
+    // identity guard rejects a path that now resolves to a DIFFERENT
+    // element, so reordered/re-rendered lists fall through to fallback.
     let exact = null;
     try { exact = resolveByDescriptor(desc); } catch (_) { exact = null; }
-    if (exact && isUsableAnchorTarget(exact)) {
+    if (exact && exactMatchesStored(desc, exact) && isUsableAnchorTarget(exact)) {
       return { el: exact, resolution: 'exact', confidence: ANCHOR_CONFIDENCE.exact, fallback: [], reason: 'exact' };
     }
     const root = anchorRootOf(desc);
@@ -2568,7 +2622,13 @@
         const list = root.querySelectorAll(tag);
         for (let i = 0; i < list.length && candidates.length < REANCHOR_CANDIDATE_CAP; i++) {
           rawCount += 1;
-          if (isUsableAnchorTarget(list[i])) candidates.push(list[i]);
+          const el = list[i];
+          if (!isUsableAnchorTarget(el)) continue;
+          // Never consider an element whose live id contradicts the stored
+          // id: ids are the strongest identity signal and not editable by
+          // the inspector, so a live id mismatch means a different element.
+          if (desc.id && el.id && el.id !== desc.id) continue;
+          candidates.push(el);
         }
       } catch (_) { /* invalid tag: no candidates */ }
     }
@@ -7803,6 +7863,18 @@
       get hoveredCrossOrigin() { return hoveredCrossOrigin; },
       get hoveredEl() { return hoveredEl; },
       get crossOriginShieldCount() { return shields.length; },
+      // Anchor resilience (F2): harness-accessible re-anchor primitives for
+      // behavioral verification of deterministic fallback order, confidence
+      // gating, and ambiguous/hidden/removed degradation.
+      reanchorElement,
+      reanchorAllElements,
+      applyAnchorResolution,
+      scheduleReanchor,
+      normalizeAnchorText,
+      anchorRectDistance,
+      isUsableAnchorTarget,
+      get anchorPassCount() { return reanchorPassCount; },
+      get lastAnchorPass() { return lastAnchorPass ? Object.assign({}, lastAnchorPass) : null; },
     };
   }
 

@@ -241,6 +241,11 @@
   color: #ff6b6b;
   text-shadow: 0 0 11px rgba(255, 82, 82, 0.38);
 }
+/* Anchor resilience (F2): amber warning state for unresolved re-anchors. */
+.status.warn {
+  color: #ffd166;
+  text-shadow: 0 0 11px rgba(255, 209, 102, 0.38);
+}
 
 /* ---- element picker layer (shadow-internal, fixed viewport layer) ---- */
 .comet-sel-layer {
@@ -316,6 +321,56 @@
   box-sizing: border-box;
   white-space: nowrap;
   box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.30), 0 2px 6px rgba(0, 0, 0, 0.40), 0 0 11px rgba(255, 82, 82, 0.42);
+}
+
+/* State chip on the marker itself: small pill at the bottom-right corner. */
+.comet-el-state {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  transform: translate(50%, 50%);
+  font: bold 9px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 5px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.comet-el-state.is-moved {
+  background: rgba(240, 168, 62, 0.95);
+  color: #241a05;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+.comet-el-state.is-unresolved {
+  background: rgba(115, 123, 141, 0.95);
+  color: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
+/* Anchor resilience (F2): truthful marker states after draft replay. A
+   re-anchored (moved) marker turns amber to signal the target moved; an
+   unresolved marker renders as a translucent ghost at the prior rect with a
+   gray badge, so an instruction is never hidden and never claimed for a
+   wrong element. */
+.comet-el.is-moved {
+  border-color: #ffb020;
+  border-style: dashed;
+  box-shadow: 0 0 14px rgba(255, 176, 32, 0.22), inset 0 0 13px rgba(255, 176, 32, 0.05);
+}
+.comet-el.is-moved .comet-el-badge {
+  background: linear-gradient(180deg, #ffc34d, #f09a12);
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.30), 0 2px 6px rgba(0, 0, 0, 0.40), 0 0 11px rgba(255, 176, 32, 0.45);
+}
+.comet-el.is-unresolved {
+  border-color: rgba(160, 166, 178, 0.85);
+  border-style: dotted;
+  opacity: 0.55;
+  box-shadow: none;
+}
+.comet-el.is-unresolved .comet-el-badge {
+  background: linear-gradient(180deg, #b6bcc8, #8b919e);
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.30), 0 2px 6px rgba(0, 0, 0, 0.35);
 }
 
 /* ---- instruction chat card (bottom-right of viewport) ---- */

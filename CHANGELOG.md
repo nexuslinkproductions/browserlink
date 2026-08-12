@@ -36,6 +36,18 @@ All notable changes to browserlink are documented here. Format follows
     to start downloads and observe completion or cancellation; failures
     (hub offline, empty corpus, absent screenshot, cancelled download) are
     reported honestly. Copy AI Brief is unchanged.
+- **Anchor resilience (mutation-resistant draft re-anchoring)** - when an
+  element's exact cssPath no longer resolves (DOM drift, SPA route change,
+  refresh after a mutation), draft replay falls back deterministically to
+  stable attributes, then normalized text/aria label, then prior rectangle
+  proximity, and marks the re-anchored target as moved (amber marker).
+  Ambiguous or below-threshold candidates stay unresolved: the instruction
+  remains in the draft as recoverable, sendable context rendered as a ghost
+  marker at the prior rect, and is never attached to a wrong element. SPA
+  pushState/replaceState/popstate changes trigger one bounded re-anchor pass
+  after the DOM settles, with no duplicate markers or listeners. Exact
+  cssPath replay stays the first path, legacy drafts restore unchanged, and
+  Send/Clear All keep their existing draft-clearing contract.
 - **Share link (local read-only annotation page)** - `GET
   /annotations/<name>/share` renders one stored annotation as a readable,
   read-only HTML page: page URL, title, viewport, label, notes, per-element

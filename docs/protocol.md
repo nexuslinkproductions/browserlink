@@ -1,7 +1,14 @@
-# browserlink protocol - annotation schema v1.7
+# browserlink protocol - annotation schema v1.8
 
 The public contract between the extension, the hub, and any harness. Versioned;
 changes require a new minor or major version and a compatibility shim.
+
+**Schema v1.8** (backward compatible with v1.0 through v1.7): adds optional
+per-element `elements[].anchor` metadata recording how a stored element was
+re-anchored on a changed live page (resolution state, confidence, and the
+deterministic fallback signals used, see below). Wrong types, unknown nested
+keys, unknown enum values, and out-of-range numbers return HTTP 400; elements
+without the field remain valid.
 
 **Schema v1.7** (backward compatible with v1.0 through v1.6): adds optional
 per-element `elements[].frame` and `elements[].shadow` deep-pick metadata
@@ -79,7 +86,7 @@ HTTP 400.
 | `viewport` | object | required; `w`, `h` positive integers |
 | `label` | string | optional; user context label, ≤ 200 chars |
 | `strokes` | array | required; each: `color` string, `width` number > 0, `points` array of ≥ 2 `[x, y]` pairs, each coordinate in `[0, 1]` (normalized to the annotation viewport) |
-| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below), `frame`/`shadow` optional deep-picker objects (schema v1.7, see below) |
+| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below), `frame`/`shadow` optional deep-picker objects (schema v1.7, see below), `anchor` optional object (schema v1.8, see below) |
 | `screenshot` | string | optional (schema v1.4); PNG data URL `data:image/png;base64,<data>`; max 10MB decoded; non-PNG or invalid base64 → HTTP 400 |
 | `captureState` | object | optional (schema v1.6); Freeze State Capture metadata, exactly four typed fields (see below); unknown keys → HTTP 400 |
 
@@ -199,6 +206,55 @@ Rules:
 - `rect` is always normalized to the TOP annotation viewport, including for
   elements inside same-origin iframes (the extension translates child-frame
   rectangles into top-level viewport coordinates).
+
+### elements[].anchor (schema v1.8)
+
+Optional per-element anchor metadata emitted by the F2 anchor-resilience
+replay when a stored element is restored on a page whose DOM has drifted.
+The field records the truthful resolution state so consumers know whether
+the element was found exactly, re-anchored by fallback signals, or left
+unresolved. Legacy elements without it are stored unchanged (backward
+compatible with every earlier schema).
+
+| Field | Type | Rules |
+|---|---|---|
+| `version` | int | required; the anchor format version, currently `1` |
+| `resolution` | string enum | required; one of `exact` (original cssPath replay), `fallback` (deterministic signal chain below), `unresolved` (no candidate reached the confidence threshold) |
+| `confidence` | number | optional; the 0..1 score of the winning path (`exact` 1, `attrs` 0.95, `text`/`aria` 0.85, `rect` 0.7); must be 0..1 when present |
+| `fallback` | array of string enums | optional; the deterministic signals used, in order, each from `attrs`, `text`, `aria`, `rect`; non-empty and at most 4 entries; present only when `resolution` is `fallback` |
+
+Example:
+
+```json
+{ "index": 1, "tag": "button", "cssPath": "ul#mut-list > li:nth-of-type(2)",
+  "anchor": { "version": 1, "resolution": "fallback", "confidence": 0.85,
+              "fallback": ["text"] } }
+```
+
+Replay order and rules:
+
+- Exact `cssPath` replay is always the first and fastest path (frame path,
+  then shadow hosts, then cssPath), exactly as in schema v1.7. It wins with
+  confidence 1 when it resolves to exactly one usable (connected and
+  visible) element.
+- When the exact path fails, fallback signals run in fixed order:
+  - stable attributes: the stored `id` (when present) must match exactly
+    AND the stored class tokens (when present) must overlap at least 0.8;
+  - normalized text/aria: whitespace-collapsed, case-insensitive match of
+    the stored `text` (unique candidate), else of the stored `ariaLabel`;
+  - prior rectangle proximity: a unique candidate within 0.18 of the
+    stored normalized rect center (as a fraction of the viewport diagonal).
+- A tier wins only when it finds exactly one usable candidate. Duplicate
+  candidates, hidden or detached elements, and empty tiers fall through to
+  the next tier; when no tier wins, the element stays `unresolved` and is
+  never attached to a different element.
+- `anchor` must be an object with only the keys `version`, `resolution`,
+  `confidence`, and `fallback`; unknown nested keys, wrong types, unknown
+  enum values, missing `version`/`resolution`, and `confidence` outside
+  0..1 are rejected with HTTP 400.
+- Re-anchoring never deletes stored drafts and never loops: history
+  pushState/replaceState/popstate and hashchange collapse into one bounded
+  pass after the DOM stabilizes, with no duplicate markers or listeners.
 
 ### captureState (schema v1.6)
 
