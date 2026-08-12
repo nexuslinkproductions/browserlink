@@ -211,6 +211,7 @@
   let hoverBoxRaf = 0;       // rAF throttle for scroll/resize box recompute
   let chatCard = null;
   let inspMetaEl = null; // intent/severity chip row inside the element inspector
+  let inspThreadEl = null; // F8: thread history panel inside the element inspector
   let chatHead = null;
   let chatInput = null;
   let chipEl = null;         // 48px collapsed chip
@@ -765,6 +766,20 @@
           };
         }),
       },
+      // Element threads (F8): thread identity + ordered reply history of
+      // committed element instructions. sent marks items that already
+      // shipped in a stored annotation (the next reply's parentId target).
+      thread: {
+        id: thread.id,
+        count: thread.items.length,
+        items: thread.items.map((it) => ({
+          id: it.id,
+          parentId: it.parentId,
+          textLen: it.text ? it.text.length : 0,
+          index: it.index,
+          sent: it.sent,
+        })),
+      },
       canvasCtx: !!(canvas && ctx),
       messagesBound: messagesBound,
       // Onboarding (F6): tour + session always-on state for one-instance
@@ -1062,6 +1077,20 @@
         }
         return out;
       }),
+      // F8: thread identity + ordered item history survive the draft. The
+      // block is absent for empty threads (pre-F8 drafts restore without
+      // it), so draft format stays backward compatible at v1.
+      thread: thread.items.length ? {
+        id: thread.id,
+        seq: thread.seq,
+        items: thread.items.map((it) => ({
+          id: it.id,
+          parentId: it.parentId,
+          text: String(it.text || '').slice(0, MAX_INSTR),
+          index: it.index,
+          sent: it.sent,
+        })),
+      } : null,
     };
   }
 
@@ -1236,6 +1265,46 @@
       if (d2.index > maxIndex) maxIndex = d2.index;
     }
     if (maxIndex >= state.nextIndex) state.nextIndex = maxIndex + 1;
+    // F8: restore the thread identity + ordered item history. The block is
+    // optional (pre-F8 drafts have none) and sanitized: ids and text are
+    // capped, the list is capped at MAX_THREAD_ITEMS, and an invalid chain
+    // (missing parents, cycles, cross-thread references) falls back to a
+    // fresh thread so the restored elements still ship. seq continues after
+    // the highest restored item id so new replies never collide.
+    let restoredThread = false;
+    if (d.thread && typeof d.thread === 'object') {
+      const t = d.thread;
+      const tid = (typeof t.id === 'string' && t.id && t.id.length <= MAX_THREAD_ID_LEN)
+        ? t.id : null;
+      const rawItems = Array.isArray(t.items) ? t.items.slice(0, MAX_THREAD_ITEMS) : [];
+      const items = [];
+      for (const raw of rawItems) {
+        if (!raw || typeof raw !== 'object') continue;
+        const id = (typeof raw.id === 'string' && raw.id)
+          ? String(raw.id).slice(0, MAX_THREAD_ID_LEN) : null;
+        if (!id) continue;
+        items.push({
+          id,
+          parentId: raw.parentId == null
+            ? null
+            : (typeof raw.parentId === 'string' ? String(raw.parentId).slice(0, MAX_THREAD_ID_LEN) : null),
+          text: String(raw.text || '').slice(0, MAX_INSTR),
+          index: (Number.isInteger(raw.index) && raw.index >= 0) ? raw.index : null,
+          sent: (typeof raw.sent === 'string' && raw.sent)
+            ? String(raw.sent).slice(0, MAX_THREAD_ID_LEN) : null,
+        });
+      }
+      const tv = threadValidateItems(items, []);
+      if (tid && items.length && tv.ok) {
+        thread = { id: tid, items, seq: 0 };
+        for (const it of items) {
+          const m = /^p(\d+)$/.exec(it.id);
+          if (m) thread.seq = Math.max(thread.seq, Number(m[1]));
+        }
+        restoredThread = true;
+      }
+    }
+    if (!restoredThread) threadReset();
     if (state.strokes.length) redraw();
     if (state.elements.length) {
       updateCount();
@@ -1269,6 +1338,220 @@
       + ' elements=' + restored + ' moved=' + moved + ' ambiguous=' + ambiguous
       + ' unresolved=' + unresolved);
   }
+
+  /* ---------------- Element threads (F8) ----------------
+   * One thread per page context: the ordered, append-only reply history of
+   * committed element instructions. The FIRST committed instruction mints a
+   * stable threadId and becomes the root item (parentId null); every later
+   * commit is a reply whose parentId points at the previous item, so the
+   * chain can never branch or cycle from normal use. The whole current
+   * batch ships in one annotation carrying top-level threadId (schema
+   * v1.9); when the batch continues a thread that was ALREADY sent, the
+   * annotation also carries parentId = the stored annotation id of the
+   * nearest sent ancestor, learned from the hub after each confirmed send
+   * (GET /annotations, newest first). The hub validates the link on store
+   * (parent exists, same thread, acyclic) and its thread route replays the
+   * whole thread in order. The inspector renders the thread history
+   * chronologically with append-only replies; edits update an item in
+   * place. Legacy drafts without a thread block restore without threads.
+   */
+  const MAX_THREAD_ITEMS = 20;    // thread history cap (note-queue parity)
+  const MAX_THREAD_ID_LEN = 100;  // schema v1.9 cap (schema.ts MAX_THREAD_ID)
+  // items[i] = { id: 'p<seq>', parentId, text, index, sent }
+  // sent = stored annotation id that shipped this item, or null (unsent).
+  let thread = { id: null, items: [], seq: 0 };
+
+  function threadReset() {
+    thread = { id: null, items: [], seq: 0 };
+  }
+
+  // Stable thread id for this page context (timestamp base36 + random).
+  function threadMintId() {
+    return 'thr-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+  }
+
+  // Record a committed element instruction as one thread item. The first
+  // commit mints the thread; later NEW commits append replies (parentId =
+  // previous item). Edits update the item text in place so the chain stays
+  // append-only. History is capped at MAX_THREAD_ITEMS by dropping the
+  // OLDEST items and re-rooting the new front, so the surviving chain never
+  // dangles.
+  function threadCommit(entryIndex, text, isEdit) {
+    if (isEdit && thread.items[entryIndex]) {
+      thread.items[entryIndex].text = text;
+      return thread.items[entryIndex];
+    }
+    if (!thread.id) thread.id = threadMintId();
+    const id = 'p' + (++thread.seq);
+    const parentId = thread.items.length ? thread.items[thread.items.length - 1].id : null;
+    const item = { id, parentId, text, index: entryIndex, sent: null };
+    thread.items.push(item);
+    if (thread.items.length > MAX_THREAD_ITEMS) {
+      thread.items.splice(0, thread.items.length - MAX_THREAD_ITEMS);
+      thread.items[0].parentId = null; // new front becomes the root
+    }
+    return item;
+  }
+
+  // Pure validation of a thread's item chain, exercised by the mechanism
+  // gate: roots (parentId null) are valid; a reply must reference an
+  // existing item in the SAME thread (missing parents rejected); an item
+  // whose parentId belongs to another thread list is a cross-thread parent
+  // (rejected); walking parent chains must never revisit an id (cycles
+  // rejected). Returns {ok:true} or {ok:false, error}.
+  function threadValidateItems(items, otherThreads) {
+    if (!Array.isArray(items)) return { ok: false, error: 'items must be a list' };
+    const seen = new Set();
+    for (const it of items) {
+      if (!it || typeof it !== 'object') return { ok: false, error: 'item must be an object' };
+      const id = typeof it.id === 'string' && it.id ? it.id : '';
+      if (!id) return { ok: false, error: 'item id missing' };
+      if (seen.has(id)) return { ok: false, error: 'duplicate item id ' + id };
+      seen.add(id);
+      const parentId = it.parentId == null ? null : (typeof it.parentId === 'string' ? it.parentId : '');
+      if (parentId === null) continue; // root
+      if (!parentId) return { ok: false, error: 'item ' + id + ' has an invalid parentId' };
+      if (Array.isArray(otherThreads)) {
+        for (const other of otherThreads) {
+          if (other && Array.isArray(other) && other.some((o) => o && o.id === parentId)) {
+            return { ok: false, error: 'cross-thread parent ' + parentId };
+          }
+        }
+      }
+      const parent = items.find((o) => o.id === parentId);
+      if (!parent) return { ok: false, error: 'missing parent ' + parentId };
+      // Cycle walk: the chain must terminate at a root without revisiting.
+      let cur = it;
+      const chain = new Set([id]);
+      let guard = 0;
+      while (cur && cur.parentId) {
+        if (++guard > MAX_THREAD_ITEMS + 1) return { ok: false, error: 'thread cycle detected' };
+        const next = items.find((o) => o.id === cur.parentId);
+        if (!next) return { ok: false, error: 'missing parent ' + cur.parentId };
+        if (chain.has(next.id)) return { ok: false, error: 'thread cycle detected' };
+        chain.add(next.id);
+        cur = next;
+      }
+    }
+    return { ok: true };
+  }
+
+  // The annotation-level parentId for the NEXT send: the stored annotation
+  // id of the nearest SENT ancestor in the thread (walked from the head
+  // backwards), or null when nothing in this thread has shipped yet (the
+  // annotation is then the thread root).
+  function threadPayloadParentId() {
+    if (!thread.id || !thread.items.length) return null;
+    for (let i = thread.items.length - 1; i >= 0; i--) {
+      if (thread.items[i].sent) return thread.items[i].sent;
+    }
+    return null;
+  }
+
+  // After a confirmed send, learn the stored annotation id from the hub
+  // (GET /annotations, newest first; the annotation we just posted is the
+  // newest, guarded by a 15s mtime sanity bound) and stamp it on every
+  // item that shipped, so the next send carries a valid parentId. Never
+  // throws: a hub that is offline or slow just leaves items unsent and the
+  // next send stays a root in the same thread.
+  async function threadLearnSentId() {
+    if (!thread.id || !thread.items.length) return;
+    let endpoint = 'http://127.0.0.1:8787';
+    try {
+      const got = await chrome.storage.local.get('endpoint');
+      if (got && typeof got.endpoint === 'string' && got.endpoint) endpoint = got.endpoint;
+    } catch (_) { /* storage unavailable: default endpoint */ }
+    try {
+      const res = await fetch(endpoint.replace(/\/+$/, '') + '/annotations');
+      if (!res.ok) return;
+      const body = await res.json();
+      const files = body && Array.isArray(body.files) ? body.files : [];
+      if (!files.length || !files[0] || typeof files[0].name !== 'string') return;
+      const name = files[0].name;
+      const mtime = Number(files[0].mtime) || 0;
+      if (Date.now() / 1000 - mtime > 15) return; // not the annotation we just sent
+      let stamped = false;
+      for (const it of thread.items) {
+        if (!it.sent) { it.sent = name; stamped = true; }
+      }
+      if (stamped) {
+        diagLog('thread:sent', 'thread=' + thread.id + ' annotation=' + name);
+        refreshThreadPanel();
+      }
+    } catch (_) { /* hub offline: keep prior state, next send stays a root */ }
+  }
+
+  // Render the inspector thread panel: the ordered reply history of the
+  // current page-context thread. The panel is hidden until the first item
+  // exists; the current element's item is highlighted, sent items carry a
+  // "sent" badge, and replies are append-only via the preserved instruction
+  // field (committing the next element instruction appends the next reply).
+  function refreshThreadPanel() {
+    if (!inspPanel || !inspThreadEl) return;
+    const listEl = inspThreadEl.querySelector('.comet-thread-list');
+    if (!listEl) return;
+    if (!thread.id || !thread.items.length) {
+      inspThreadEl.hidden = true;
+      return;
+    }
+    inspThreadEl.hidden = false;
+    const idEl = inspThreadEl.querySelector('.comet-thread-id');
+    if (idEl) idEl.textContent = String(thread.id);
+    const countEl = inspThreadEl.querySelector('.comet-thread-count');
+    if (countEl) countEl.textContent = thread.items.length === 1
+      ? '1 item' : thread.items.length + ' items';
+    listEl.innerHTML = '';
+    for (let i = 0; i < thread.items.length; i++) {
+      const it = thread.items[i];
+      const row = document.createElement('div');
+      row.className = 'comet-thread-item';
+      if (it.index === state.activeIndex) row.classList.add('is-current');
+      const role = document.createElement('span');
+      role.className = 'comet-thread-role';
+      role.textContent = (i === 0 || !it.parentId) ? 'Root' : 'Reply';
+      const chip = document.createElement('span');
+      chip.className = 'comet-thread-elem';
+      chip.textContent = 'E' + String(it.index != null ? it.index : i + 1);
+      const text = document.createElement('span');
+      text.className = 'comet-thread-text';
+      text.textContent = String(it.text || '').slice(0, MAX_INSTR);
+      text.title = String(it.text || '');
+      const sent = document.createElement('span');
+      sent.className = 'comet-thread-sent';
+      sent.textContent = 'sent';
+      sent.style.display = it.sent ? '' : 'none';
+      row.appendChild(role);
+      row.appendChild(chip);
+      row.appendChild(text);
+      row.appendChild(sent);
+      listEl.appendChild(row);
+    }
+  }
+
+  // Supplemental styles for the thread panel, appended in BOTH style paths
+  // (overlay.css or the fallback), keeping the thread UI self-contained in
+  // content.js so later waves never depend on overlay.css for it. The panel
+  // is static content (no transitions), so reduced-motion needs no override.
+  const THREAD_PANEL_CSS =
+    '.comet-thread{border-top:1px solid rgba(255,255,255,.14);padding-top:6px;' +
+    'display:flex;flex-direction:column;gap:6px;}' +
+    '.comet-thread[hidden]{display:none;}' +
+    '.comet-thread-head{display:flex;align-items:center;gap:6px;font-size:11px;color:#9aa0a6;}' +
+    '.comet-thread-title{font-weight:600;text-transform:uppercase;letter-spacing:.05em;}' +
+    '.comet-thread-id{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+    'font:10px/1.3 ui-monospace,Menlo,Consolas,monospace;}' +
+    '.comet-thread-count{flex:0 0 auto;}' +
+    '.comet-thread-list{display:flex;flex-direction:column;gap:4px;max-height:120px;overflow-y:auto;}' +
+    '.comet-thread-item{display:flex;align-items:baseline;gap:6px;padding:3px 6px;border-radius:5px;' +
+    'background:rgba(255,255,255,.04);border:1px solid transparent;}' +
+    '.comet-thread-item.is-current{border-color:rgba(74,158,255,.55);background:rgba(74,158,255,.08);}' +
+    '.comet-thread-role{flex:0 0 auto;font-size:10px;font-weight:600;color:#6ab0ff;' +
+    'text-transform:uppercase;letter-spacing:.04em;}' +
+    '.comet-thread-elem{flex:0 0 auto;font-size:10px;color:#9aa0a6;}' +
+    '.comet-thread-text{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
+    'white-space:nowrap;font-size:11px;color:#e8eaed;}' +
+    '.comet-thread-sent{flex:0 0 auto;font-size:9px;color:#35c759;}' +
+    '.comet-thread-hint{font-size:10px;color:#9aa0a6;font-style:italic;}';
 
   /* ---------------- toolbar position / collapse / edge dock ---------------- */
   const TOOLBAR_DOCK_SIDES = ['left', 'right', 'bottom'];
@@ -4061,6 +4344,20 @@
     const wasActive = state.activeIndex === index || inspector.descriptor === removed.descriptor;
     if (pending && pending.el === removed.el) pending = null;
     state.elements.splice(index, 1);
+    // F8: keep the thread history aligned with the element list. The item
+    // for the removed element is dropped and the item that follows is
+    // re-parented to the new previous item, so the chain never dangles.
+    const itemAt = thread.items.findIndex((it) => it.index === index);
+    if (itemAt !== -1) {
+      thread.items.splice(itemAt, 1);
+      if (thread.items[itemAt]) {
+        thread.items[itemAt].parentId = itemAt > 0 ? thread.items[itemAt - 1].id : null;
+      }
+    }
+    for (const it of thread.items) {
+      if (typeof it.index === 'number' && it.index > index) it.index -= 1;
+    }
+    refreshThreadPanel();
     removeOutlineWithFade(removed.outlineEl);
     if (!state.elements.length) {
       state.activeIndex = -1;
@@ -4201,6 +4498,9 @@
 
   function addChat() {
     if (!pending) return;
+    // F8: capture the edit flag before pending is cleared; the committed
+    // instruction is one thread item (edit = update in place, new = reply).
+    const wasEdit = !!pending.isEdit;
     // The instruction field is the inspector textarea in element mode (the
     // chat card is annotate-note only); fall back to the card input.
     const src = (inspInput && inspPanel && !inspPanel.hidden) ? inspInput : chatInput;
@@ -4225,6 +4525,9 @@
     if (INTENTS.indexOf(metaDesc.intent) === -1) delete metaDesc.intent;
     if (SEVERITIES.indexOf(metaDesc.severity) === -1) delete metaDesc.severity;
     pending = null;
+    // F8: the committed instruction becomes (or updates) one thread item.
+    threadCommit(committedIndex, instr, wasEdit);
+    refreshThreadPanel();
     if (chatInput) chatInput.value = '';
     if (inspInput) inspInput.value = state.elements[committedIndex].descriptor.instruction || '';
     if (inspInput) inspInput.focus(); // inspector stays open for the next element
@@ -6151,6 +6454,7 @@
     const on = !!pending;
     inspAddEl.disabled = !on;
     inspAddEl.classList.toggle('is-disabled', !on);
+    refreshThreadPanel(); // F8: thread history follows the active element
   }
 
   // Subtle radial glow that follows the cursor inside the panel bounds.
@@ -6617,6 +6921,7 @@
     updateSelectionPulse();
     redraw();
     clearDraft(); // F3: Clear All removes the persisted URL draft
+    threadReset(); // F8: Clear All starts a fresh thread
   }
 
   /* ---------------- Freeze State Capture (schema v1.6) ---------------- */
@@ -7015,6 +7320,18 @@
     // url, viewport, userAgent, language, devicePixelRatio, timezone
     // offset). Every new send includes env; legacy sends now carry it too.
     const envSnapshot = environmentPayload();
+    // F8: an invalid thread chain is rejected BEFORE send (a reply must
+    // point at an existing item in the same thread; cycles and cross-thread
+    // parents never reach the hub). The hub re-validates on store.
+    const threadValidation = threadValidateItems(thread.items, []);
+    if (!threadValidation.ok) {
+      setStatus('Thread invalid: ' + threadValidation.error, 'err');
+      diagLog('send:blocked', 'thread=' + threadValidation.error);
+      sendFeedback(button, false);
+      endSendPulse(false);
+      sendBusy = false;
+      return;
+    }
     let label = '';
     try {
       const got = await chrome.storage.local.get('contextLabel');
@@ -7039,6 +7356,16 @@
       // v1.4: every selected descriptor carries its own instruction + edits.
       elements: state.elements.map(descriptorForPayload),
     };
+    // F8: thread identity on the annotation. The batch belongs to the
+    // page-context thread (top-level threadId, schema v1.9); when it
+    // continues a thread that already shipped, parentId references the
+    // stored annotation id of the nearest sent ancestor so the hub thread
+    // route can replay root + replies in order.
+    if (thread.id && thread.items.length) {
+      payload.threadId = thread.id;
+      const parentId = threadPayloadParentId();
+      if (parentId) payload.parentId = parentId;
+    }
     const captureRect = computeCaptureRect(state.elements);
     if (captureRect) payload.captureRect = captureRect;
     diagLastCaptureRect = captureRect;
@@ -7137,6 +7464,9 @@
       updateSelectionPulse();
       redraw();
       clearDraft(); // F3: draft clears ONLY after a confirmed successful POST
+      // F8: stamp the stored annotation id on every shipped thread item so
+      // the next send carries a valid parentId (fire-and-forget).
+      threadLearnSentId();
       // Nothing left to send: let the button collapse away after 2.5s.
       sendHideTimer = setTimeout(hideSendButton, 2500);
     } else {
@@ -7345,6 +7675,7 @@
     inspSelectionCountEl = null;
     inspSelectionList = null;
     inspResetAllBtn = null;
+    inspThreadEl = null;
     inspInput = null;
     modeToggle = null;
     modePill = null;
@@ -7774,6 +8105,19 @@
       '<div class="comet-selection-head"><span class="comet-selection-count">0 selected</span></div>' +
       '<div class="comet-selection-list"></div>' +
       '<div class="comet-insp-rows"></div>' +
+      // F8: element thread panel - the ordered reply history of committed
+      // element instructions (root first, replies after). Append-only:
+      // committing the next element instruction adds the next reply. The
+      // instruction field below is preserved as the first instruction field.
+      '<div class="comet-thread" hidden>' +
+      '  <div class="comet-thread-head">' +
+      '    <span class="comet-thread-title">Thread</span>' +
+      '    <span class="comet-thread-id"></span>' +
+      '    <span class="comet-thread-count"></span>' +
+      '  </div>' +
+      '  <div class="comet-thread-list"></div>' +
+      '  <div class="comet-thread-hint">Append-only: commit the next element instruction to reply.</div>' +
+      '</div>' +
       '<div class="comet-insp-foot">' +
       '  <div class="comet-insp-foot-meta">' +
       '    <span class="comet-insp-count">0 edits</span>' +
@@ -7855,6 +8199,7 @@
     chatHead = chatCard.querySelector('.comet-chat-head');
     chatInput = chatCard.querySelector('.comet-chat-input');
     inspRows = inspPanel.querySelector('.comet-insp-rows');
+    inspThreadEl = inspPanel.querySelector('.comet-thread');
     inspCountEl = inspPanel.querySelector('.comet-insp-count');
     inspSelectionCountEl = inspPanel.querySelector('.comet-selection-count');
     inspSelectionList = inspPanel.querySelector('.comet-selection-list');
@@ -8008,6 +8353,9 @@
         '.comet-diag-body{flex:1;overflow:auto;max-height:calc(40vh - 30px);margin:0;padding:8px;' +
         'white-space:pre-wrap;word-break:break-word;color:#9aa0a6;}';
     }
+    // F8: thread panel styles appended in BOTH paths (overlay.css or the
+    // fallback), keeping the thread UI self-contained in content.js.
+    css += THREAD_PANEL_CSS;
     style.textContent = css;
     shadow.appendChild(style);
   }
@@ -8321,6 +8669,16 @@
       get onboarded() { return onboardedFlag; },
       get alwaysOn() { return onboardingAlwaysOn; },
       get tourSuppressed() { return tourSuppressed; },
+      // Element threads (F8): harness hooks for the thread validator and
+      // identity chain (the mechanism gate drives these with root, reply,
+      // cycle, cross-thread, restore, unresolved, and cap fixtures).
+      threadReset,
+      threadCommit,
+      threadValidateItems,
+      threadPayloadParentId,
+      get threadId() { return thread.id; },
+      get threadItems() { return thread.items.map((it) => Object.assign({}, it)); },
+      get threadCount() { return thread.items.length; },
     };
   }
 

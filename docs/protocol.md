@@ -109,8 +109,8 @@ HTTP 400.
 | `captureState` | object | optional (schema v1.6); Freeze State Capture metadata, exactly four typed fields (see below); unknown keys → HTTP 400 |
 | `env` | object | optional (schema v1.9); browser environment snapshot captured once at send start, exactly seven typed fields (see below); unknown keys, invalid timestamps, invalid bounds, or oversized strings → HTTP 400 |
 | `textQuote` | object | optional (schema v1.9); normalized page-text quote with bounded context (see below); accepted at the top level and per element with the same shape and limits |
-| `threadId` | string | optional (schema v1.9); non-empty string of at most 100 characters; reserved for element threads |
-| `parentId` | string | optional (schema v1.9); non-empty string of at most 100 characters; references an existing item in the same thread |
+| `threadId` | string | optional (schema v1.9); non-empty string of at most 100 characters; identifies the element thread the annotation belongs to (F8) |
+| `parentId` | string | optional (schema v1.9); non-empty string of at most 100 characters; the stored annotation name this reply continues (F8) |
 
 The hub stores the payload and may rewrite `screenshot` (see below). It may
 add `ts` (epoch ms) and `savedAt` (ISO-8601 UTC).
@@ -390,29 +390,42 @@ Rules:
 
 ### threadId and parentId (schema v1.9)
 
-Optional top-level thread identity fields, reserved for element threads.
-`threadId` identifies the thread a committed element instruction belongs to;
-`parentId` references an existing item in the same thread (a reply). Both
-fields are independent and optional: a root annotation carries `threadId`
-only, a reply carries both, and legacy annotations carry neither.
+Optional top-level thread identity fields (F4 reserves them; F8 element
+threads use them). `threadId` identifies the thread a committed element
+instruction belongs to; `parentId` references an existing item in the same
+thread (a reply). Both fields are independent and optional: a root
+annotation carries `threadId` only, a reply carries both, and legacy
+annotations carry neither. `parentId` is the stored annotation name of the
+parent (both `X` and `X.json` are accepted).
 
 | Field | Type | Rules |
 |---|---|---|
 | `threadId` | string | optional; non-empty, at most 100 characters |
-| `parentId` | string | optional; non-empty, at most 100 characters |
+| `parentId` | string | optional; non-empty, at most 100 characters; references a stored annotation in the same thread |
 
 Rules:
 
 - Wrong types, empty strings, and oversized strings are rejected by hub
   validation with HTTP 400 (for example
   `threadId must be a non-empty string of at most 100 characters`).
-- The hub stores both fields as given; thread-cycle and parent-existence
-  semantics are enforced by the producer before send.
+- Thread identity is validated by the hub at POST time, in addition to the
+  extension's pre-send checks. A payload with `parentId` but no `threadId`
+  is rejected with `parentId requires threadId`. The parent must exist in
+  the corpus (`parent annotation not found`) and carry the SAME `threadId`
+  (`cross-thread parent`); a bounded walk of the parent chain rejects any
+  cycle with `thread cycle detected`. Every stored annotation therefore
+  belongs to at most one acyclic chain, and each POST is stored only when
+  the link it declares is provably valid.
+- Root annotations (`threadId` only) and legacy annotations (neither field)
+  are always valid.
+- The whole thread of an annotation is replayable via the REST thread route
+  (see docs/rest.md, Threads).
 
 ### Responses
 
 - `200` → `{"ok": true, "file": "<ts>.json"}`
-- `400` → `{"error": "<message>"}` (schema violation, bad filename)
+- `400` → `{"error": "<message>"}` (schema violation, thread link violation,
+  bad filename)
 - `404` → `{"error": "annotation not found"}`
 - `413` → `{"error": "payload too large"}`
 

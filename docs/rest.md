@@ -40,6 +40,8 @@ else `~/.browserlink/annotations`. Annotations are stored under
 | `/annotations/<name>/share.png` | GET | - | `200` stored screenshot PNG (`image/png`) referenced by the share page, or `404` |
 | `/annotations/<name>/bundle` | GET | - | `200` deterministic ZIP bundle (`application/zip`, `Content-Disposition: attachment`) or `404` |
 | `/annotations/latest/bundle` | GET | - | `200` bundle of the newest annotation or `404` when the corpus is empty |
+| `/annotations/<name>/thread` | GET | - | `200` whole-thread replay (`{threadId, count, items}`) in chronological order, `404` when the annotation is missing or has no thread (see [Threads](#threads-f8)) |
+| `/annotations/latest/thread` | GET | - | `200` thread of the newest annotation or `404` when the corpus is empty or the newest annotation has no thread |
 | `/annotations/backup.zip` | GET | - | `200` full-corpus backup ZIP snapshot (`application/zip`); valid and explicit even when the corpus is empty |
 
 Annotation names must match `^[A-Za-z0-9._-]+$`; unsafe names (traversal
@@ -64,6 +66,87 @@ filter is present the response is `{files, skippedCorrupt}`:
 `skippedCorrupt` counts JSON records that could not be parsed and were
 skipped, so one corrupt record can never fail the whole query. Results stay
 newest-first, matching the plain list ordering.
+
+## Threads (F8)
+
+An element thread is the ordered, append-only reply history of committed
+element instructions: the first instruction is the ROOT of the thread, and
+every later instruction is a REPLY. The extension mints a stable `threadId`
+per page context (schema v1.9, at most 100 characters) and ships it on every
+annotation in that thread. A reply annotation additionally carries
+`parentId`, the stored annotation name of the nearest already-sent ancestor
+(what the reply continues). Both `X` and `X.json` are accepted as the parent
+reference.
+
+POST `/annotations` validates the link before storing:
+
+| Condition | Response |
+|---|---|
+| `parentId` without `threadId` | `400 {"error": "parentId requires threadId"}` |
+| `parentId` that is not a stored annotation | `400 {"error": "parent annotation not found"}` |
+| `parentId` whose annotation carries a different `threadId` | `400 {"error": "cross-thread parent"}` |
+| parent chain that revisits an id | `400 {"error": "thread cycle detected"}` |
+
+Because every stored annotation was validated on store (its parent already
+existed), the corpus cannot contain a cycle by induction; the bounded chain
+walk is defense in depth. Root annotations (`threadId` only) and legacy
+annotations (neither field) are always valid and store unchanged.
+
+`GET /annotations/<name>/thread` replays the whole thread: every stored
+annotation sharing the named annotation's `threadId`, sorted by stored name
+ascending (stored names are millisecond timestamps, so name order IS
+chronological order - root first, then replies).
+
+```json
+{
+  "threadId": "thr-m1abc-2x9k4f",
+  "count": 2,
+  "items": [
+    { "name": "20260812-070000-001.json", "threadId": "thr-m1abc-2x9k4f",
+      "url": "https://example.test/", "elements": [ /* ... */ ] },
+    { "name": "20260812-070100-002.json", "threadId": "thr-m1abc-2x9k4f",
+      "parentId": "20260812-070000-001.json", "elements": [ /* ... */ ] }
+  ]
+}
+```
+
+Unsafe names answer `400 {"error": "invalid annotation name"}`; a missing
+annotation answers `404 {"error": "not found"}`; an existing annotation
+without thread fields answers `404 {"error": "no thread"}`.
+`GET /annotations/latest/thread` is an alias for the newest annotation.
+Reads never write to the data dir.
+
+Client-side caps (extension): the thread history is capped at 20 items
+(note-queue parity) and each instruction at 500 characters; dropping the
+oldest items re-roots the surviving chain, so the reply links never dangle.
+Edits update the existing item in place; the chain itself is append-only.
+
+## Webhook handoff (F8)
+
+When `BROWSERLINK_WEBHOOK_URL` is set, the hub registers the webhook
+adapter and every stored annotation triggers ONE bounded JSON event POST to
+that URL (5s timeout, never retried). The body is the deterministic
+`annotation.thread.v1` event - a small, Slack/Linear-compatible envelope,
+NOT the raw annotation (no screenshot bytes), so deliveries stay far below
+the 1MB body cap:
+
+| Field | Meaning |
+|---|---|
+| `event` | fixed `"annotation.thread.v1"` |
+| `annotationId` | the stored annotation id (file name without `.json`) |
+| `threadId` | the annotation's thread id, or `null` (legacy) |
+| `parentId` | the stored name this reply continues, or `null` (root/legacy) |
+| `url` / `title` | page URL and title, or `null` |
+| `selector` / `tag` | `elements[0]` CSS path and tag, or `null` |
+| `intent` / `severity` | `elements[0]` metadata when set, else `null` |
+| `instruction` | `elements[0]` instruction (the committed text; for a reply this IS the reply body) |
+| `replyText` | the instruction text when `parentId` is set (so receivers render the reply body without re-reading `instruction`), else `null` |
+| `shareUrl` | `<hub base>/annotations/<stored name>/share` when the stored name is derivable; the base is `BROWSERLINK_HUB_URL` or the default `http://127.0.0.1:8787` |
+
+Legacy annotations without thread fields deliver unchanged: the same event
+shape with `threadId` and `parentId` null. A webhook failure (HTTP error,
+timeout, network failure, oversized body) is logged to the shared error log
+and NEVER blocks local storage or the other adapters.
 
 ## Export (Copy AI Brief)
 
