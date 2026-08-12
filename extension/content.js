@@ -2529,6 +2529,11 @@
       const root = el.getRootNode();
       const doc = (root && root.nodeType === 9) ? root : el.ownerDocument;
       if (doc && (el === doc.documentElement || el === doc.body)) break; // never html/body
+      // F1 deep pick: an element reached inside an OPEN shadow root is a
+      // precise pick target by itself. elementFromPoint pierced the root to
+      // return it, so do not skip it in favor of the host element; the host
+      // chain is recorded separately as descriptor shadow metadata.
+      if (root && root.nodeType === 11) return el;
       if (hasMeaning(el)) return el;
       // Cross an open shadow boundary: the host is a normal element in the
       // outer tree, so the walk continues through it. Closed roots are
@@ -2688,6 +2693,23 @@
       try { hit = d.elementFromPoint(x, y); } catch (_) { hit = null; }
       if (!hit || hit.nodeType !== 1) {
         return { hit: null, doc: d, path: p, crossOrigin: false };
+      }
+      // Shadow-root descent (F1, schema v1.7): document.elementFromPoint
+      // does not pierce open shadow roots, it returns the shadow HOST.
+      // Descend manually, bounded by MAX_SHADOW_DEPTH: ShadowRoot has its
+      // own elementFromPoint, but its coordinate space is the host's
+      // border box, so translate the point first. Open roots only.
+      for (let sguard = 0; sguard < MAX_SHADOW_DEPTH && hit && hit.nodeType === 1 && hit.shadowRoot; sguard++) {
+        let hr = null;
+        try { hr = hit.getBoundingClientRect(); } catch (_) { hr = null; }
+        if (!hr || hr.width < 1 || hr.height < 1) break;
+        const lx = x - hr.left;
+        const ly = y - hr.top;
+        if (lx < 0 || ly < 0 || lx > hr.width || ly > hr.height) break;
+        let inner = null;
+        try { inner = hit.shadowRoot.elementFromPoint(lx, ly); } catch (_) { inner = null; }
+        if (!inner || inner.nodeType !== 1 || inner === hit) break;
+        hit = inner;
       }
       const probe = probeFrameDoc(hit);
       if (!probe) {
