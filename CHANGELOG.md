@@ -8,6 +8,20 @@ All notable changes to browserlink are documented here. Format follows
 
 ### Added
 
+- **Agent-ready context (F4)** - every annotation now carries a schema v1.9
+  environment snapshot (`capturedAt`, page `url`, `viewport`, `userAgent`,
+  `language`, `devicePixelRatio`, `timezoneOffsetMinutes`), an optional
+  `textQuote` descriptor, and optional thread identity fields (`threadId`,
+  `parentId`, reserved for element threads). The AI brief gains Agent
+  Context and Reproduction Context sections that render these values
+  exactly as captured, with explicit `(omitted)` states and nothing ever
+  fabricated.
+- **Annotation recall (F7)** - local full-text search across all stored
+  annotations. `GET /annotations?q=` matches case-insensitively across
+  label, url, title, notes, and element text/instructions (NFC-normalized),
+  composes with optional `url` and `since` filters, and is mirrored 1:1 in
+  the MCP `annotations_list` tool. The popup gains a debounced search box
+  with keyboard reachability and per-result navigation.
 - **Element threads and webhook handoff (F8)** - committed element
   instructions now form an ordered, append-only reply thread instead of
   single-turn records. The first instruction in a page context mints a
@@ -32,6 +46,20 @@ All notable changes to browserlink are documented here. Format follows
   below the 1MB cap; legacy annotations deliver the same event with null
   thread fields, and a webhook failure never blocks local storage or the
   other adapters.
+- **Text-selection quick actions (F9)** - a non-empty page text selection
+  opens a compact quick-action surface with Note, Ask AI, and Highlight.
+  Note queues a quote-linked note, Ask AI opens the existing instruction
+  flow without auto-send, and Highlight stores a visual quote marker; all
+  carry the schema v1.9 `textQuote` descriptor. Whitespace-only selections,
+  password/input fields, extension UI, and selections inside inaccessible
+  frames produce no surface.
+- **Programmatic control (F10)** - MCP `annotations_list` gains composeable
+  filters (`q`, `url`, `since`, `cssPathPrefix`, `hasEdits`, `intent`,
+  `severity`, `limit`) with AND semantics and stable ordering, and the
+  extension supports per-route opt-out: exact-origin or pathname-prefix
+  entries in the popup keep a route dormant and trigger a clean exit on
+  navigation, with a `browserlinkRouteControl` service-worker message for
+  harnesses. No new permissions were added.
 
 ## [2.6.0] - 2026-08-12
 

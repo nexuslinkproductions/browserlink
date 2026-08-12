@@ -31,7 +31,7 @@ else `~/.browserlink/annotations`. Annotations are stored under
 | Route | Method | Body | Response |
 |---|---|---|---|
 | `/annotations` | GET | - | `{files: [{name, size, mtime}]}` newest first (JSON files only); optional `q`, `url`, and `since` query params filter the corpus (see [Search](#search-f7)) |
-| `/annotations` | POST | annotation payload (schema v1.8) | `200 {ok: true, file: "<name>.json"}`; `400` validation error, `413` payload over 10 MB, `400` malformed JSON |
+| `/annotations` | POST | annotation payload (schema v1.9) | `200 {ok: true, file: "<name>.json"}`; `400` validation error, `413` payload over 10 MB, `400` malformed JSON |
 | `/annotations/<name>` | GET | - | stored annotation JSON or `404 {error: "not found"}` |
 | `/annotations/<name>/export.md` | GET | - | `200` Markdown AI brief (`text/markdown; charset=utf-8`) or `404` |
 | `/annotations/latest/export.md` | GET | - | `200` Markdown AI brief of the newest annotation or `404` |
