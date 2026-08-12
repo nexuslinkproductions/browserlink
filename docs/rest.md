@@ -38,6 +38,9 @@ else `~/.browserlink/annotations`. Annotations are stored under
 | `/annotations/<name>/share` | GET | - | `200` read-only HTML share page (`text/html; charset=utf-8`) or `404` |
 | `/annotations/latest/share` | GET | - | `200` read-only HTML share page of the newest annotation or `404` |
 | `/annotations/<name>/share.png` | GET | - | `200` stored screenshot PNG (`image/png`) referenced by the share page, or `404` |
+| `/annotations/<name>/bundle` | GET | - | `200` deterministic ZIP bundle (`application/zip`, `Content-Disposition: attachment`) or `404` |
+| `/annotations/latest/bundle` | GET | - | `200` bundle of the newest annotation or `404` when the corpus is empty |
+| `/annotations/backup.zip` | GET | - | `200` full-corpus backup ZIP snapshot (`application/zip`); valid and explicit even when the corpus is empty |
 
 Annotation names must match `^[A-Za-z0-9._-]+$`; unsafe names (traversal
 like `..`, slashes) answer `400 {error: "invalid annotation name"}` on the
@@ -88,6 +91,57 @@ alias for the newest annotation. Reads never write to the data dir.
 The popup's **Copy share link** button lists `/annotations`, takes the
 newest entry, and copies `<endpoint>/annotations/<name>/share` to the
 clipboard with a success state naming the annotation.
+
+## Bundle and backup (local downloads)
+
+`GET /annotations/<name>/bundle` downloads one annotation as a deterministic
+ZIP archive (`application/zip`, `Content-Disposition: attachment; filename="<stem>-bundle.zip"`):
+
+- `manifest.json` - `schema: "browserlink.annotation.bundle.v1"` plus the
+  annotation name, the brief name, the PNG name (or `null` when the
+  annotation has no screenshot), and the sorted list of included files.
+- `<name>.json` - the stored annotation JSON, byte-for-byte identical to the
+  file on disk.
+- `<stem>.md` - the deterministic AI brief Markdown (the same sections as
+  `GET /annotations/<name>/export.md`), but with `@file:`/`@image:`
+  references RELATIVE to the bundle files, so the archive is portable
+  across machines and never discloses absolute host filesystem paths.
+- `<stem>.png` - the stored screenshot when present. A missing PNG is
+  declared as `manifest.screenshot: null`; the bundle never contains a
+  broken or fabricated image reference.
+
+`GET /annotations/latest/bundle` is an alias for the newest annotation and
+answers `404 {error: "not found"}` when the corpus is empty.
+
+`GET /annotations/backup.zip` downloads one consistent snapshot of the whole
+corpus (`Content-Disposition: attachment; filename="browserlink-backup.zip"`):
+
+- `manifest.json` - `schema: "browserlink.corpus.backup.v1"`, `count`, a
+  per-annotation `annotations` list (`{name, screenshot}`), and the sorted
+  list of included files. An empty corpus yields a valid archive whose
+  manifest declares `count: 0`.
+- For every stored annotation: the JSON, the Markdown brief, and the PNG
+  when present. Unreadable records are skipped, never fatal.
+
+Determinism and safety: entries are name-sorted and carry a fixed timestamp,
+so identical corpora produce byte-identical archives. Every entry name comes
+from the safe-name rule `^[A-Za-z0-9._-]+$` (or the fixed `manifest.json`),
+so archives contain only safe relative paths - never absolute filesystem
+paths and never traversal names. Reads never write to the data dir.
+
+Snapshot semantics: the hub stores each annotation as PNG first, then JSON
+(both atomic renames). A backup that lists a JSON can therefore always read
+its sibling PNG: every archive is a complete before-or-after snapshot of the
+corpus, never a partial file set, even while annotations are being written
+concurrently.
+
+Unsafe names answer `400 {error: "invalid annotation name"}`; missing files
+answer `404 {error: "not found"}`.
+
+Downloads are browser-native: the extension fetches these routes and hands
+the bytes to `chrome.downloads.download`, so the user picks the destination
+through the browser's normal download dialog. Nothing is uploaded anywhere;
+see [security.md](security.md).
 
 ## Example
 

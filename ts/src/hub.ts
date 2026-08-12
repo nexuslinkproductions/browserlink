@@ -6,6 +6,7 @@
 import * as http from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { URL } from "node:url";
 import {
   VERSION,
@@ -179,6 +180,190 @@ function escapeHtml(value: unknown): string {
 
 function stringOf(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/* ---------------------------------------------------------------------------
+ * Deterministic ZIP writer (store method, no compression).
+ *
+ * Depends only on the standard library (CRC-32 table built inline), so bundle
+ * and backup archives need no new dependency. Every entry carries a fixed DOS
+ * timestamp (1980-01-01 00:00:00) and entries are emitted in sorted name
+ * order, so identical inputs always produce byte-identical archives. Entry
+ * names are validated annotation names (NAME_RE) or fixed strings such as
+ * "manifest.json", so every archive path is relative and safe.
+ * ------------------------------------------------------------------------- */
+
+const ZIP_LOCAL_HEADER = 0x04034b50;
+const ZIP_CENTRAL_HEADER = 0x02014b50;
+const ZIP_EOCD = 0x06054b50;
+
+let crcTable: Uint32Array | null = null;
+function crc32(data: Buffer): number {
+  if (crcTable === null) {
+    crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) {
+        c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      }
+      crcTable[n] = c >>> 0;
+    }
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < data.length; i++) {
+    crc = (crcTable[(crc ^ data[i]) & 0xff] ^ (crc >>> 8)) >>> 0;
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(): { time: number; date: number } {
+  // Fixed 1980-01-01 00:00:00 keeps archives byte-deterministic.
+  return { time: 0, date: 0x0021 };
+}
+
+type ZipEntry = { name: string; data: Buffer };
+
+/** Build a deterministic ZIP archive (store method). Entries are name-sorted. */
+function buildZip(entries: ZipEntry[]): Buffer {
+  const sorted = [...entries].sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+  );
+  const chunks: Buffer[] = [];
+  const central: Buffer[] = [];
+  let offset = 0;
+  for (const entry of sorted) {
+    const nameBytes = Buffer.from(entry.name, "utf8");
+    const crc = crc32(entry.data);
+    const { time, date } = dosDateTime();
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(ZIP_LOCAL_HEADER, 0);
+    local.writeUInt16LE(20, 4); // version needed: 2.0
+    local.writeUInt16LE(0x0800, 6); // general purpose: UTF-8 names
+    local.writeUInt16LE(0, 8); // method: stored
+    local.writeUInt16LE(time, 10);
+    local.writeUInt16LE(date, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(entry.data.length, 18); // compressed size
+    local.writeUInt32LE(entry.data.length, 22); // uncompressed size
+    local.writeUInt16LE(nameBytes.length, 26);
+    local.writeUInt16LE(0, 28); // extra length
+    chunks.push(local, nameBytes, entry.data);
+
+    const centralEntry = Buffer.alloc(46);
+    centralEntry.writeUInt32LE(ZIP_CENTRAL_HEADER, 0);
+    centralEntry.writeUInt16LE(20, 4); // version made by
+    centralEntry.writeUInt16LE(20, 6); // version needed
+    centralEntry.writeUInt16LE(0x0800, 8);
+    centralEntry.writeUInt16LE(0, 10); // method
+    centralEntry.writeUInt16LE(time, 12);
+    centralEntry.writeUInt16LE(date, 14);
+    centralEntry.writeUInt32LE(crc, 16);
+    centralEntry.writeUInt32LE(entry.data.length, 20);
+    centralEntry.writeUInt32LE(entry.data.length, 24);
+    centralEntry.writeUInt16LE(nameBytes.length, 28);
+    centralEntry.writeUInt16LE(0, 30); // extra length
+    centralEntry.writeUInt16LE(0, 32); // comment length
+    centralEntry.writeUInt16LE(0, 34); // disk number start
+    centralEntry.writeUInt16LE(0, 36); // internal attributes
+    centralEntry.writeUInt32LE(0, 38); // external attributes
+    centralEntry.writeUInt32LE(offset, 42);
+    central.push(centralEntry, nameBytes);
+    offset += 30 + nameBytes.length + entry.data.length;
+  }
+  const centralBytes = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(ZIP_EOCD, 0);
+  eocd.writeUInt16LE(0, 4); // disk number
+  eocd.writeUInt16LE(0, 6); // central dir disk
+  eocd.writeUInt16LE(sorted.length, 8);
+  eocd.writeUInt16LE(sorted.length, 10);
+  eocd.writeUInt32LE(centralBytes.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  eocd.writeUInt16LE(0, 20); // comment length
+  return Buffer.concat([...chunks, centralBytes, eocd]);
+}
+
+const BUNDLE_SCHEMA = "browserlink.annotation.bundle.v1";
+const BACKUP_SCHEMA = "browserlink.corpus.backup.v1";
+
+/** Stored annotation JSON names, newest first (same ordering as GET /annotations). */
+function listAnnotationNames(): string[] {
+  const directory = annotationsDir();
+  const names: Array<{ name: string; mtime: number }> = [];
+  try {
+    if (fs.existsSync(directory) && fs.statSync(directory).isDirectory()) {
+      for (const name of fs.readdirSync(directory)) {
+        if (!name.endsWith(".json") || !NAME_RE.test(name)) continue;
+        const filePath = path.join(directory, name);
+        try {
+          const st = fs.statSync(filePath);
+          if (st.isFile()) names.push({ name, mtime: st.mtimeMs });
+        } catch {
+          continue;
+        }
+      }
+    }
+  } catch {
+    // empty list
+  }
+  names.sort((a, b) => b.mtime - a.mtime);
+  return names.map((n) => n.name);
+}
+
+/**
+ * One annotation's bundle entries: JSON (byte-for-byte copy of the stored
+ * file), the deterministic Markdown brief (identical bytes to /export.md),
+ * and the sibling PNG when present. Missing PNG degrades to screenshot:null
+ * instead of failing the export.
+ */
+function annotationEntries(
+  name: string,
+): { entries: ZipEntry[]; screenshot: string | null } {
+  const directory = annotationsDir();
+  const stem = name.replace(/\.json$/, "");
+  const jsonPath = path.join(directory, name);
+  const annotation = JSON.parse(fs.readFileSync(jsonPath, "utf8")) as JsonObject;
+  const entries: ZipEntry[] = [
+    { name, data: fs.readFileSync(jsonPath) },
+    {
+      name: `${stem}.md`,
+      data: Buffer.from(
+        // No base dir: @file / @image references stay RELATIVE to the
+        // bundle, so the archive is portable across machines and never
+        // discloses absolute host filesystem paths.
+        formatAnnotationMarkdown(annotation, name),
+        "utf8",
+      ),
+    },
+  ];
+  let screenshot: string | null = null;
+  const pngName = siblingPngName(name);
+  try {
+    const pngPath = path.join(directory, pngName);
+    if (fs.existsSync(pngPath) && fs.statSync(pngPath).isFile()) {
+      entries.push({ name: pngName, data: fs.readFileSync(pngPath) });
+      screenshot = pngName;
+    }
+  } catch {
+    // absent image: declared as null, never a broken reference
+  }
+  return { entries, screenshot };
+}
+
+function sendZip(
+  res: http.ServerResponse,
+  filename: string,
+  body: Buffer,
+): void {
+  res.writeHead(200, {
+    "Content-Type": "application/zip",
+    "Content-Disposition": `attachment; filename="${filename}"`,
+    "Content-Length": body.length,
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  });
+  res.end(body);
 }
 
 // The share page is static HTML with no scripts, no forms, and no external
@@ -683,6 +868,76 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
     }
   }
 
+  // One annotation as a deterministic ZIP bundle: manifest.json naming the
+  // schema and included files, the annotation JSON byte-for-byte, the same
+  // Markdown brief /export.md serves, and the PNG when present. Missing
+  // images are declared in the manifest (screenshot: null), never stubbed.
+  function serveBundle(res: http.ServerResponse, name: string): void {
+    try {
+      const filePath = path.join(annotationsDir(), name);
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+        sendJson(res, 404, { error: "not found" });
+        return;
+      }
+      const stem = name.replace(/\.json$/, "");
+      const { entries, screenshot } = annotationEntries(name);
+      const manifest: JsonObject = {
+        schema: BUNDLE_SCHEMA,
+        annotation: name,
+        brief: `${stem}.md`,
+        screenshot,
+        files: ["manifest.json", ...entries.map((e) => e.name)].sort(),
+      };
+      const zip = buildZip([
+        { name: "manifest.json", data: jsonBytes(manifest) },
+        ...entries,
+      ]);
+      sendZip(res, `${stem}-bundle.zip`, Buffer.from(zip));
+    } catch {
+      sendJson(res, 404, { error: "not found" });
+    }
+  }
+
+  // Full-corpus backup: one deterministic ZIP snapshot of every stored
+  // annotation (JSON + brief + PNG when present) plus a manifest. Reads are
+  // snapshot-copy: PNGs are renamed before their JSON on store, so a backup
+  // that lists a JSON can always read its PNG, making every archive a
+  // complete before-or-after snapshot of the corpus, never a partial file
+  // set. An empty corpus still produces a valid archive whose manifest
+  // declares count 0. Unreadable records are skipped, never fatal.
+  function serveBackup(res: http.ServerResponse): void {
+    try {
+      const names = listAnnotationNames();
+      const entries: ZipEntry[] = [];
+      const records: JsonObject[] = [];
+      const fileNames: string[] = ["manifest.json"];
+      for (const name of names) {
+        let record: { entries: ZipEntry[]; screenshot: string | null };
+        try {
+          record = annotationEntries(name);
+        } catch {
+          continue; // corrupt/unreadable record: skip honestly
+        }
+        entries.push(...record.entries);
+        records.push({ name, screenshot: record.screenshot });
+        for (const e of record.entries) fileNames.push(e.name);
+      }
+      const manifest: JsonObject = {
+        schema: BACKUP_SCHEMA,
+        count: records.length,
+        annotations: records,
+        files: fileNames.filter((n) => NAME_RE.test(n)).sort(),
+      };
+      const zip = buildZip([
+        { name: "manifest.json", data: jsonBytes(manifest) },
+        ...entries,
+      ]);
+      sendZip(res, "browserlink-backup.zip", Buffer.from(zip));
+    } catch {
+      sendJson(res, 500, { error: "backup failed" });
+    }
+  }
+
 
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? "GET";
@@ -845,6 +1100,33 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
           return;
         }
         serveSharePng(res, name);
+        return;
+      }
+      // F3: newest annotation bundle (deterministic ZIP: JSON + brief + PNG).
+      if (pathname === "/annotations/latest/bundle") {
+        const newest = listAnnotationNames()[0] ?? null;
+        if (newest === null) {
+          sendJson(res, 404, { error: "not found" });
+          return;
+        }
+        serveBundle(res, newest);
+        return;
+      }
+      if (pathname.startsWith("/annotations/") && pathname.endsWith("/bundle")) {
+        const name = pathname.slice(
+          "/annotations/".length,
+          -"/bundle".length,
+        );
+        if (!isSafeName(name)) {
+          sendJson(res, 400, { error: "invalid annotation name" });
+          return;
+        }
+        serveBundle(res, name);
+        return;
+      }
+      // F3: full-corpus backup (deterministic ZIP snapshot; valid when empty).
+      if (pathname === "/annotations/backup.zip") {
+        serveBackup(res);
         return;
       }
       if (pathname.startsWith("/annotations/")) {

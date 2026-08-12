@@ -22,6 +22,19 @@
  *   - "Copy share link": copies the newest annotation's local read-only
  *     share URL (<endpoint>/annotations/<name>/share); the success state
  *     names the annotation.
+ *   - "Save newest capture as PNG/JPEG": downloads the newest annotation's
+ *     stored screenshot through the browser's normal download dialog
+ *     (chrome.downloads, saveAs), converting PNG to JPEG locally with
+ *     OffscreenCanvas when JPEG is selected. All downloads are local:
+ *     no upload, no account.
+ *   - "Download newest bundle": downloads <endpoint>/annotations/latest/bundle
+ *     as a deterministic ZIP (manifest.json + annotation JSON + AI brief
+ *     Markdown + PNG when present), saved via the browser download dialog.
+ *   - "Backup all annotations": downloads <endpoint>/annotations/backup.zip,
+ *     one consistent snapshot of the whole corpus (valid even when empty).
+ *   - Every button reports the outcome honestly: format and file name on
+ *     success, absent screenshot, empty corpus, hub offline, or a
+ *     cancelled/failed download on failure. Copy AI Brief is unchanged.
  */
 'use strict';
 
@@ -450,6 +463,222 @@ async function copyShareLink() {
   }
 }
 
+/* ---- Local save and backup (F3) ---- */
+
+/* Newest stored annotation name, or null when the corpus is empty.
+ * Shared by the save/backup buttons; hub lists newest first. */
+async function getNewestName(endpoint) {
+  const listRes = await fetch(endpoint + '/annotations');
+  if (!listRes.ok) throw new Error('annotations list ' + listRes.status);
+  const body = await listRes.json();
+  const files = (body && Array.isArray(body.files)) ? body.files : [];
+  return (files[0] && files[0].name) ? String(files[0].name) : null;
+}
+
+/* Start a browser-native download of a blob with the given filename, then
+ * report the terminal state honestly: complete, or cancelled/failed via the
+ * download item's interrupt error. Uses saveAs so the user picks the
+ * destination through the browser's normal download dialog. */
+function downloadBlob(blob, filename) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(blob);
+    chrome.downloads.download({ url: url, filename: filename, saveAs: true }, (downloadId) => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        URL.revokeObjectURL(url);
+        resolve({ ok: false, error: String(err.message || 'download not started') });
+        return;
+      }
+      const listener = (delta) => {
+        if (delta.id !== downloadId) return;
+        if (delta.state && delta.state.current === 'complete') {
+          chrome.downloads.onChanged.removeListener(listener);
+          URL.revokeObjectURL(url);
+          resolve({ ok: true });
+        } else if (delta.state && delta.state.current === 'interrupted') {
+          chrome.downloads.onChanged.removeListener(listener);
+          URL.revokeObjectURL(url);
+          const error = (delta.error && delta.error.current)
+            ? String(delta.error.current)
+            : 'unknown';
+          resolve({ ok: false, error: error });
+        }
+      };
+      chrome.downloads.onChanged.addListener(listener);
+    });
+  });
+}
+
+/* Convert a PNG blob to JPEG locally (OffscreenCanvas). Returns null when
+ * conversion is impossible, so the caller reports failure honestly. */
+async function pngToJpeg(blob) {
+  try {
+    const bitmap = await createImageBitmap(blob);
+    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.drawImage(bitmap, 0, 0);
+    return await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.92 });
+  } catch (_) {
+    return null;
+  }
+}
+
+/* One status line for a completed/failed download. */
+function reportDownload(out, filename, result) {
+  if (result.ok) {
+    out.textContent = 'saved ' + filename + ' ✓';
+    out.className = 'result ok';
+  } else if (/cancel/i.test(result.error)) {
+    out.textContent = 'download cancelled';
+    out.className = 'result err';
+  } else {
+    out.textContent = 'failed: ' + (result.error || 'download failed');
+    out.className = 'result err';
+  }
+}
+
+/* Save newest capture: fetch the newest annotation's stored screenshot and
+ * download it as PNG (as stored) or JPEG (converted locally). Honest states
+ * for empty corpus, absent screenshot, hub offline, and download failures. */
+async function saveCapture() {
+  const out = $('captureResult');
+  out.textContent = 'saving…';
+  out.className = 'result';
+  let endpoint;
+  try {
+    endpoint = await resolveEndpoint();
+  } catch (_) {
+    out.textContent = 'failed: hub offline';
+    out.className = 'result err';
+    return;
+  }
+  try {
+    const name = await getNewestName(endpoint);
+    if (!name) {
+      out.textContent = 'no annotations yet';
+      out.className = 'result err';
+      return;
+    }
+    const stem = name.replace(/\.json$/, '');
+    const annRes = await fetch(endpoint + '/annotations/' + encodeURIComponent(name));
+    if (!annRes.ok) throw new Error('annotation ' + annRes.status);
+    const ann = await annRes.json();
+    if (!ann || typeof ann.screenshotFile !== 'string' || !ann.screenshotFile) {
+      out.textContent = 'no screenshot stored for ' + name;
+      out.className = 'result err';
+      return;
+    }
+    const pngRes = await fetch(
+      endpoint + '/annotations/' + encodeURIComponent(name) + '/share.png',
+    );
+    if (!pngRes.ok) {
+      out.textContent = 'screenshot missing on disk for ' + name;
+      out.className = 'result err';
+      return;
+    }
+    let blob = await pngRes.blob();
+    let ext = 'png';
+    if ($('captureFormat').value === 'jpeg') {
+      const jpeg = await pngToJpeg(blob);
+      if (!jpeg) {
+        out.textContent = 'failed: could not convert capture to JPEG';
+        out.className = 'result err';
+        return;
+      }
+      blob = jpeg;
+      ext = 'jpeg';
+    }
+    const filename = stem + '.' + ext;
+    reportDownload(out, filename, await downloadBlob(blob, filename));
+  } catch (err) {
+    out.textContent = 'failed: ' + ((err && err.message) ? err.message : 'hub offline');
+    out.className = 'result err';
+  }
+}
+
+/* Download newest bundle: deterministic ZIP of the newest annotation
+ * (manifest + JSON + AI brief + PNG when present). */
+async function downloadBundle() {
+  const out = $('bundleResult');
+  out.textContent = 'saving…';
+  out.className = 'result';
+  let endpoint;
+  try {
+    endpoint = await resolveEndpoint();
+  } catch (_) {
+    out.textContent = 'failed: hub offline';
+    out.className = 'result err';
+    return;
+  }
+  try {
+    const name = await getNewestName(endpoint);
+    if (!name) {
+      out.textContent = 'no annotations yet';
+      out.className = 'result err';
+      return;
+    }
+    const res = await fetch(endpoint + '/annotations/latest/bundle');
+    if (!res.ok) throw new Error('bundle ' + res.status);
+    const blob = await res.blob();
+    const filename = name.replace(/\.json$/, '') + '-bundle.zip';
+    reportDownload(out, filename, await downloadBlob(blob, filename));
+  } catch (err) {
+    out.textContent = 'failed: ' + ((err && err.message) ? err.message : 'hub offline');
+    out.className = 'result err';
+  }
+}
+
+/* Backup all annotations: one consistent snapshot ZIP of the whole corpus
+ * (valid even when empty; the report shows the annotation count). */
+async function downloadBackup() {
+  const out = $('backupResult');
+  out.textContent = 'saving…';
+  out.className = 'result';
+  let endpoint;
+  try {
+    endpoint = await resolveEndpoint();
+  } catch (_) {
+    out.textContent = 'failed: hub offline';
+    out.className = 'result err';
+    return;
+  }
+  try {
+    let count = 0;
+    try {
+      const listRes = await fetch(endpoint + '/annotations');
+      if (listRes.ok) {
+        const body = await listRes.json();
+        if (body && Array.isArray(body.files)) count = body.files.length;
+      }
+    } catch (_) { /* count is cosmetic only */ }
+    const res = await fetch(endpoint + '/annotations/backup.zip');
+    if (!res.ok) throw new Error('backup ' + res.status);
+    const blob = await res.blob();
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp =
+      String(now.getFullYear()) + pad(now.getMonth() + 1) + pad(now.getDate()) +
+      '-' + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
+    const filename = 'browserlink-backup-' + stamp + '.zip';
+    const result = await downloadBlob(blob, filename);
+    if (result.ok) {
+      out.textContent = 'saved ' + filename + ' (' + count + ' annotation' +
+        (count === 1 ? '' : 's') + ') ✓';
+      out.className = 'result ok';
+    } else if (/cancel/i.test(result.error)) {
+      out.textContent = 'download cancelled';
+      out.className = 'result err';
+    } else {
+      out.textContent = 'failed: ' + (result.error || 'download failed');
+      out.className = 'result err';
+    }
+  } catch (err) {
+    out.textContent = 'failed: ' + ((err && err.message) ? err.message : 'hub offline');
+    out.className = 'result err';
+  }
+}
+
 /* wiring */
 $('toolToggle').addEventListener('change', onToolToggle);
 $('saveEndpoint').addEventListener('click', saveEndpoint);
@@ -463,6 +692,9 @@ $('contextLabel').addEventListener('input', saveLabel);
 $('sendTest').addEventListener('click', sendTest);
 $('copyBrief').addEventListener('click', copyLatestBrief);
 $('copyShare').addEventListener('click', copyShareLink);
+$('saveCapture').addEventListener('click', saveCapture);
+$('downloadBundle').addEventListener('click', downloadBundle);
+$('downloadBackup').addEventListener('click', downloadBackup);
 checkHub();
 loadEndpoint();
 loadLabel();

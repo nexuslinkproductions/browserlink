@@ -1408,3 +1408,439 @@ describe("share page route", () => {
     });
   });
 });
+
+/* ---------------------------------------------------------------------------
+ * F3: GET /annotations/latest/bundle, /annotations/<name>/bundle, and
+ * /annotations/backup.zip (local save and backup).
+ * Section kept separate from schema/hub suites so concurrent feature edits
+ * to other parts of this file never touch these probes.
+ * ------------------------------------------------------------------------- */
+
+/** Independent ZIP reader: central directory walk with CRC and size checks. */
+function parseZip(buf: Buffer): Map<string, Buffer> {
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  assert.ok(eocd >= 0, "EOCD present");
+  const count = buf.readUInt16LE(eocd + 10);
+  let cursor = buf.readUInt32LE(eocd + 16);
+  const out = new Map<string, Buffer>();
+  for (let i = 0; i < count; i++) {
+    assert.equal(buf.readUInt32LE(cursor), 0x02014b50, "central header magic");
+    const method = buf.readUInt16LE(cursor + 10);
+    const crc = buf.readUInt32LE(cursor + 16);
+    const compSize = buf.readUInt32LE(cursor + 20);
+    const uncompSize = buf.readUInt32LE(cursor + 24);
+    const nameLen = buf.readUInt16LE(cursor + 28);
+    const extraLen = buf.readUInt16LE(cursor + 30);
+    const commentLen = buf.readUInt16LE(cursor + 32);
+    const localOffset = buf.readUInt32LE(cursor + 42);
+    const name = buf.subarray(cursor + 46, cursor + 46 + nameLen).toString("utf8");
+    assert.equal(method, 0, `entry ${name} is stored (no compression)`);
+    assert.equal(buf.readUInt32LE(localOffset), 0x04034b50, "local header magic");
+    const lNameLen = buf.readUInt16LE(localOffset + 26);
+    const lExtraLen = buf.readUInt16LE(localOffset + 28);
+    const data = buf.subarray(
+      localOffset + 30 + lNameLen + lExtraLen,
+      localOffset + 30 + lNameLen + lExtraLen + compSize,
+    );
+    assert.equal(data.length, uncompSize, `entry ${name} sizes agree`);
+    out.set(name, Buffer.from(data));
+    cursor += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
+describe("F3 bundle and backup routes", () => {
+  async function zipRequest(
+    base: string,
+    route: string,
+  ): Promise<{ status: number; contentType: string | null; disposition: string | null; buf: Buffer }> {
+    const res = await fetch(`${base}${route}`);
+    return {
+      status: res.status,
+      contentType: res.headers.get("content-type"),
+      disposition: res.headers.get("content-disposition"),
+      buf: Buffer.from(await res.arrayBuffer()),
+    };
+  }
+
+  const nameRe = /^[A-Za-z0-9._-]+$/;
+
+  test("newest bundle: JSON, brief, PNG, manifest, deterministic bytes", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const payload = {
+          ...samplePayload(),
+          label: "Bundle fixture",
+          notes: ["first note", "second note"],
+          elements: [
+            { index: 1, tag: "button", text: "Shop now", instruction: "Make blue" },
+          ],
+          screenshot: TINY_PNG_DATA_URL,
+        };
+        const posted = await request(hub.base, "POST", "/annotations", payload);
+        assert.equal(posted.status, 200);
+        const jsonName = posted.json.file as string;
+        const stem = jsonName.replace(/\.json$/, "");
+
+        const first = await zipRequest(hub.base, "/annotations/latest/bundle");
+        assert.equal(first.status, 200);
+        assert.equal(first.contentType, "application/zip");
+        assert.ok(first.disposition && first.disposition.includes("attachment"));
+        assert.ok(first.disposition && first.disposition.includes(`${stem}-bundle.zip`));
+
+        const files = parseZip(first.buf);
+        // Entries are name-sorted (deterministic): timestamp names sort
+        // before "manifest.json" lexicographically.
+        assert.deepEqual([...files.keys()], [
+          jsonName,
+          `${stem}.md`,
+          `${stem}.png`,
+          "manifest.json",
+        ], "deterministic sorted entry order");
+
+        // Manifest names schema and included files.
+        const manifest = JSON.parse(files.get("manifest.json")!.toString("utf8"));
+        assert.equal(manifest.schema, "browserlink.annotation.bundle.v1");
+        assert.equal(manifest.annotation, jsonName);
+        assert.equal(manifest.brief, `${stem}.md`);
+        assert.equal(manifest.screenshot, `${stem}.png`);
+        assert.deepEqual(manifest.files, [
+          jsonName,
+          `${stem}.md`,
+          `${stem}.png`,
+          "manifest.json",
+        ]);
+
+        // JSON is byte-for-byte the stored file.
+        const storedBytes = await readFile(path.join(dir, "annotations", jsonName));
+        assert.deepEqual(files.get(jsonName)!, storedBytes, "JSON bytes match stored file");
+        const stored = JSON.parse(storedBytes.toString("utf8"));
+        assert.equal(stored.label, "Bundle fixture");
+
+        // Brief carries RELATIVE file references: portable archive, no
+        // absolute host filesystem paths disclosed (G4 discipline).
+        const md = files.get(`${stem}.md`)!.toString("utf8");
+        assert.ok(md.includes("# AI Brief"), "brief is the deterministic AI brief");
+        assert.ok(md.includes(`- @file:${jsonName}`), "relative @file reference");
+        assert.ok(md.includes(`- @image:${stem}.png`), "relative @image reference");
+        assert.ok(!md.includes(dir), "no absolute data-dir path in the bundle");
+        assert.ok(!md.includes("/annotations/"), "no filesystem path in the bundle");
+
+        // PNG matches the stored PNG bytes.
+        const storedPng = await readFile(
+          path.join(dir, "annotations", siblingPngName(jsonName)),
+        );
+        assert.deepEqual(files.get(`${stem}.png`)!, storedPng, "PNG bytes match stored file");
+
+        // All entry names are safe relative paths.
+        for (const name of files.keys()) {
+          assert.ok(nameRe.test(name), `safe entry name: ${name}`);
+          assert.ok(!name.includes("/") && !name.includes(".."), `no traversal: ${name}`);
+        }
+
+        // Deterministic: a second fetch is byte-identical.
+        const second = await zipRequest(hub.base, "/annotations/latest/bundle");
+        assert.deepEqual(second.buf, first.buf, "repeated bundle bytes identical");
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("named bundle route, unsafe name 400, missing name 404", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const posted = await request(hub.base, "POST", "/annotations", {
+          ...samplePayload(),
+          screenshot: TINY_PNG_DATA_URL,
+        });
+        assert.equal(posted.status, 200);
+        const jsonName = posted.json.file as string;
+
+        const named = await zipRequest(hub.base, `/annotations/${jsonName}/bundle`);
+        assert.equal(named.status, 200);
+        const namedFiles = parseZip(named.buf);
+        assert.ok(namedFiles.has("manifest.json"));
+        assert.ok(namedFiles.has(jsonName));
+
+        const unsafe = await fetch(`${hub.base}/annotations/a/b/bundle`);
+        assert.equal(unsafe.status, 400);
+        assert.deepEqual(await unsafe.json(), { error: "invalid annotation name" });
+
+        const missing = await fetch(
+          `${hub.base}/annotations/20260101-000000-999.json/bundle`,
+        );
+        assert.equal(missing.status, 404);
+        assert.deepEqual(await missing.json(), { error: "not found" });
+
+        // Empty corpus: a fresh data dir answers 404 for the newest bundle.
+        await withTempDataDir(async () => {
+          const hub2 = await startHub();
+          try {
+            const empty = await fetch(`${hub2.base}/annotations/latest/bundle`);
+            assert.equal(empty.status, 404);
+            assert.deepEqual(await empty.json(), { error: "not found" });
+          } finally {
+            await hub2.close();
+          }
+        });
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("no-PNG bundle declares the absent image instead of failing", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const posted = await request(hub.base, "POST", "/annotations", {
+          ...samplePayload(),
+          notes: ["text only"],
+        });
+        assert.equal(posted.status, 200);
+        const jsonName = posted.json.file as string;
+        const stem = jsonName.replace(/\.json$/, "");
+
+        const res = await zipRequest(hub.base, `/annotations/${jsonName}/bundle`);
+        assert.equal(res.status, 200);
+        const files = parseZip(res.buf);
+        assert.deepEqual([...files.keys()], [
+          jsonName,
+          `${stem}.md`,
+          "manifest.json",
+        ], "no PNG entry without a screenshot");
+        const manifest = JSON.parse(files.get("manifest.json")!.toString("utf8"));
+        assert.equal(manifest.screenshot, null, "absent image declared as null");
+        assert.deepEqual(manifest.files, [
+          jsonName,
+          `${stem}.md`,
+          "manifest.json",
+        ]);
+        const md = files.get(`${stem}.md`)!.toString("utf8");
+        assert.ok(!md.includes("Screenshot:"), "brief has no PNG reference");
+        assert.ok(!md.includes("@image:"), "brief has no @image reference");
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("empty corpus backup is a valid explicit empty backup", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const res = await zipRequest(hub.base, "/annotations/backup.zip");
+        assert.equal(res.status, 200);
+        assert.equal(res.contentType, "application/zip");
+        const files = parseZip(res.buf);
+        assert.deepEqual([...files.keys()], ["manifest.json"]);
+        const manifest = JSON.parse(files.get("manifest.json")!.toString("utf8"));
+        assert.equal(manifest.schema, "browserlink.corpus.backup.v1");
+        assert.equal(manifest.count, 0);
+        assert.deepEqual(manifest.annotations, []);
+        assert.deepEqual(manifest.files, ["manifest.json"]);
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("multi-record backup: full set, hashes, deterministic ordering", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const first = await request(hub.base, "POST", "/annotations", {
+          ...samplePayload(),
+          label: "A with png",
+          screenshot: TINY_PNG_DATA_URL,
+        });
+        assert.equal(first.status, 200);
+        const second = await request(hub.base, "POST", "/annotations", {
+          ...samplePayload(),
+          label: "B text only",
+        });
+        assert.equal(second.status, 200);
+        const third = await request(hub.base, "POST", "/annotations", {
+          ...samplePayload(),
+          label: "C with png",
+          screenshot: TINY_PNG_DATA_URL,
+        });
+        assert.equal(third.status, 200);
+        const names = [first.json.file, second.json.file, third.json.file].sort();
+
+        const res = await zipRequest(hub.base, "/annotations/backup.zip");
+        assert.equal(res.status, 200);
+        assert.ok(res.disposition && res.disposition.includes("browserlink-backup.zip"));
+        const files = parseZip(res.buf);
+
+        // Every stored record is present with its brief, PNG when stored.
+        for (const name of names) {
+          assert.ok(files.has(name), `JSON present: ${name}`);
+          assert.ok(files.has(name.replace(/\.json$/, "") + ".md"), `brief present: ${name}`);
+        }
+        const withPng = names.filter((n) => files.has(siblingPngName(n)));
+        assert.equal(withPng.length, 2, "two PNGs included");
+        assert.ok(!files.has(siblingPngName(second.json.file)), "text-only record has no PNG");
+
+        // Each JSON parses and matches its stored file bytes.
+        for (const name of names) {
+          const storedBytes = await readFile(path.join(dir, "annotations", name));
+          assert.deepEqual(files.get(name)!, storedBytes, `stored bytes: ${name}`);
+          const parsed = JSON.parse(files.get(name)!.toString("utf8"));
+          assert.ok(typeof parsed.label === "string");
+        }
+
+        // PNG hashes match the stored PNGs.
+        for (const name of withPng) {
+          const storedPng = await readFile(
+            path.join(dir, "annotations", siblingPngName(name)),
+          );
+          assert.deepEqual(
+            files.get(siblingPngName(name))!,
+            storedPng,
+            `PNG bytes: ${name}`,
+          );
+        }
+
+        // Manifest: count, per-record screenshot flags, sorted file list.
+        const manifest = JSON.parse(files.get("manifest.json")!.toString("utf8"));
+        assert.equal(manifest.schema, "browserlink.corpus.backup.v1");
+        assert.equal(manifest.count, 3);
+        assert.equal(manifest.annotations.length, 3);
+        const screenshots = manifest.annotations.map(
+          (a: { name: string; screenshot: string | null }) => a.screenshot,
+        );
+        assert.equal(screenshots.filter((s: string | null) => s !== null).length, 2);
+        const manifestFiles: string[] = manifest.files;
+        assert.deepEqual(manifestFiles, [...manifestFiles].sort(), "manifest.files sorted");
+        assert.deepEqual([...files.keys()], [...files.keys()].sort(), "entries sorted");
+        assert.deepEqual(manifestFiles, [...files.keys()].sort(), "manifest matches entries");
+
+        // No unsafe paths anywhere.
+        for (const name of files.keys()) {
+          assert.ok(nameRe.test(name), `safe entry name: ${name}`);
+          assert.ok(!name.includes("/") && !name.includes(".."), `no traversal: ${name}`);
+        }
+
+        // Deterministic: repeated backup is byte-identical.
+        const again = await zipRequest(hub.base, "/annotations/backup.zip");
+        assert.deepEqual(again.buf, res.buf, "repeated backup bytes identical");
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("snapshot during concurrent write is complete before-or-after", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        await request(hub.base, "POST", "/annotations", {
+          ...samplePayload(),
+          screenshot: TINY_PNG_DATA_URL,
+        });
+        const racing = {
+          ...samplePayload(),
+          notes: ["racing annotation"],
+          screenshot: TINY_PNG_DATA_URL,
+        };
+        const [posted, backupRes] = await Promise.all([
+          request(hub.base, "POST", "/annotations", racing),
+          fetch(`${hub.base}/annotations/backup.zip`).then(async (r) => ({
+            status: r.status,
+            buf: Buffer.from(await r.arrayBuffer()),
+          })),
+        ]);
+        assert.equal(posted.status, 200);
+        assert.equal(backupRes.status, 200);
+        const racingName = posted.json.file as string;
+
+        const files = parseZip(backupRes.buf);
+        const stem = racingName.replace(/\.json$/, "");
+        const hasJson = files.has(racingName);
+        const hasPng = files.has(siblingPngName(racingName));
+        const hasMd = files.has(`${stem}.md`);
+        // Never a partial file set: JSON implies its full triple, and no
+        // PNG/MD appears without its JSON.
+        assert.ok(!(hasPng && !hasJson), "PNG never appears without its JSON");
+        assert.ok(!(hasMd && !hasJson), "brief never appears without its JSON");
+        assert.ok(!(hasJson && !(hasPng && hasMd)), "JSON implies PNG + brief");
+        assert.ok(
+          hasJson || (!hasPng && !hasMd),
+          "either the full record or nothing (before-or-after snapshot)",
+        );
+
+        // The archive still parses fully with correct entry counts.
+        const manifest = JSON.parse(files.get("manifest.json")!.toString("utf8"));
+        assert.equal(manifest.count, hasJson ? 2 : 1);
+        assert.deepEqual(
+          [...files.keys()],
+          [...files.keys()].sort(),
+          "deterministic ordering holds under concurrency",
+        );
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("GET bundle and backup perform no writes", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const posted = await request(hub.base, "POST", "/annotations", {
+          ...samplePayload(),
+          screenshot: TINY_PNG_DATA_URL,
+        });
+        assert.equal(posted.status, 200);
+        const jsonName = posted.json.file as string;
+
+        const snapshot = () => {
+          const map = new Map<string, [number, number]>();
+          const walk = (d: string) => {
+            for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+              const p = path.join(d, entry.name);
+              if (entry.isDirectory()) walk(p);
+              else {
+                const st = fs.statSync(p);
+                map.set(p, [st.size, st.mtimeMs]);
+              }
+            }
+          };
+          walk(dir);
+          return map;
+        };
+        const stateBefore = snapshot();
+
+        for (const route of [
+          `/annotations/${jsonName}/bundle`,
+          "/annotations/latest/bundle",
+          "/annotations/backup.zip",
+        ]) {
+          const res = await fetch(`${hub.base}${route}`);
+          assert.equal(res.status, 200);
+        }
+
+        const stateAfter = snapshot();
+        assert.equal(stateAfter.size, stateBefore.size, "no new files");
+        for (const [p, [size, mtime]] of stateBefore) {
+          const after = stateAfter.get(p);
+          assert.ok(after, `file still present: ${p}`);
+          assert.equal(after[0], size, `size unchanged: ${p}`);
+          assert.equal(after[1], mtime, `mtime unchanged: ${p}`);
+        }
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+});

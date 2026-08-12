@@ -30,7 +30,8 @@
     "activeTab",
     "storage",
     "scripting",
-    "alarms"
+    "alarms",
+    "downloads"
   ],
   "host_permissions": [
     "http://127.0.0.1:8787/*",

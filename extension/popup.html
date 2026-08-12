@@ -145,6 +145,12 @@
   }
   .result.ok { color: #35c759; }
   .result.err { color: #ff5252; }
+  .note {
+    margin: 0 0 12px;
+    font-size: 11px;
+    color: #9aa0a6;
+  }
+  .gap { margin-top: 14px; }
 </style>
 </head>
 <body>
@@ -189,6 +195,27 @@
 
   <button id="copyShare" type="button" title="Copy a local read-only URL for the newest annotation">Copy share link</button>
   <div id="shareResult" class="result"></div>
+
+  <div class="gap"></div>
+  <p class="note">Save and backup: browser-native downloads, saved to your
+    machine through the browser's normal download dialog. No upload, no
+    account, nothing leaves this computer.</p>
+
+  <label for="captureFormat">Save newest capture as</label>
+  <div class="row">
+    <select id="captureFormat">
+      <option value="png">PNG</option>
+      <option value="jpeg">JPEG</option>
+    </select>
+    <button id="saveCapture" type="button" class="mini">Save</button>
+  </div>
+  <div id="captureResult" class="result"></div>
+
+  <button id="downloadBundle" type="button" title="Download the newest annotation as a bundle (JSON + AI brief + PNG when present)">Download newest bundle</button>
+  <div id="bundleResult" class="result"></div>
+
+  <button id="downloadBackup" type="button" title="Download one snapshot of every stored annotation">Backup all annotations</button>
+  <div id="backupResult" class="result"></div>
 
   <script src="popup.js"></script>
 </body>
