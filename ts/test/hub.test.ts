@@ -138,12 +138,12 @@ describe("HTTP routes", () => {
       try {
         let res = await request(hub.base, "GET", "/health");
         assert.equal(res.status, 200);
-        assert.deepEqual(res.json, { ok: true, version: "2.2.0" });
+        assert.deepEqual(res.json, { ok: true, version: "2.5.0" });
 
         res = await request(hub.base, "GET", "/status");
         assert.equal(res.status, 200);
         assert.equal(res.json.ok, true);
-        assert.equal(res.json.version, "2.2.0");
+        assert.equal(res.json.version, "2.5.0");
         assert.equal(res.json.dataDir, dir);
         assert.equal(res.json.target, null);
         assert.ok(Array.isArray(res.json.adapters));
@@ -875,5 +875,194 @@ describe("webhook adapter", () => {
       if (prevUrl === undefined) delete process.env.BROWSERLINK_WEBHOOK_URL;
       else process.env.BROWSERLINK_WEBHOOK_URL = prevUrl;
     }
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * F4: GET /annotations/<name>/export.md (Copy AI Brief).
+ * Section kept separate from schema/hub suites so concurrent feature edits to
+ * other parts of this file never touch these probes.
+ * ------------------------------------------------------------------------- */
+describe("export.md route", () => {
+  async function rawRequest(
+    base: string,
+    route: string,
+  ): Promise<{ status: number; contentType: string | null; text: string }> {
+    const res = await fetch(`${base}${route}`);
+    return {
+      status: res.status,
+      contentType: res.headers.get("content-type"),
+      text: await res.text(),
+    };
+  }
+
+  test("complete annotation exports deterministic markdown with all sections", async () => {
+    await withTempDataDir(async (dir) => {
+      const hub = await startHub();
+      try {
+        const payload = {
+          source: "test",
+          url: "https://example.test/page?q=1|2",
+          title: "Test | page",
+          viewport: { w: 100, h: 100 },
+          label: "Export | fixture",
+          notes: ["first note", "second `note` with pipe | and newline\nhere"],
+          note: "legacy joined",
+          strokes: [
+            { color: "#f00", width: 2, points: [[0.1, 0.2], [0.3, 0.4]] },
+            { color: "#0f0", width: 3, points: [[0.5, 0.6], [0.7, 0.8]] },
+          ],
+          elements: [
+            {
+              index: 1,
+              tag: "button",
+              cssPath: "html body form button",
+              text: "Shop now",
+              instruction: "Make this blue and round",
+              intent: "fix",
+              severity: "blocking",
+              edits: { color: "#0af", fontSize: "16px" },
+            },
+          ],
+          captureState: {
+            animationsFrozen: true,
+            hoveredSelector: "div.card:hover",
+            activeElementSelector: null,
+            openDetailsSelectors: ["details.a", "details.b"],
+          },
+          screenshot: TINY_PNG_DATA_URL,
+        };
+        const posted = await request(hub.base, "POST", "/annotations", payload);
+        assert.equal(posted.status, 200);
+        const jsonName = posted.json.file as string;
+        const stored = JSON.parse(
+          await readFile(path.join(dir, "annotations", jsonName), "utf8"),
+        );
+        const pngName = stored.screenshotFile as string;
+
+        const first = await rawRequest(
+          hub.base,
+          `/annotations/${jsonName}/export.md`,
+        );
+        assert.equal(first.status, 200);
+        assert.equal(first.contentType, "text/markdown; charset=utf-8");
+        for (const heading of [
+          "# AI Brief",
+          "## Page",
+          "## Label",
+          "## Notes",
+          "## Elements",
+          "## Capture State",
+          "## Strokes",
+          "## Files",
+        ]) {
+          assert.ok(first.text.includes(heading), `missing heading ${heading}`);
+        }
+        // Raw values survive verbatim (escape nothing special).
+        assert.ok(first.text.includes("- URL: https://example.test/page?q=1|2"));
+        assert.ok(first.text.includes("- Title: Test | page"));
+        assert.ok(first.text.includes("Export | fixture"));
+        assert.ok(
+          first.text.includes("- second `note` with pipe | and newline\nhere"),
+        );
+        // Element details: index, tag, cssPath, text, instruction, edits, intent, priority.
+        assert.ok(first.text.includes("### Element 1"));
+        assert.ok(first.text.includes("- Tag: button"));
+        assert.ok(first.text.includes("- CSS path: `html body form button`"));
+        assert.ok(first.text.includes("- Text: Shop now"));
+        assert.ok(first.text.includes("- Instruction: Make this blue and round"));
+        assert.ok(first.text.includes("  - color: #0af"));
+        assert.ok(first.text.includes("  - fontSize: 16px"));
+        assert.ok(first.text.includes("- Intent: fix"));
+        assert.ok(first.text.includes("- Priority: blocking"));
+        // Page viewport.
+        assert.ok(first.text.includes("- Viewport: 100x100"));
+        // Capture state.
+        assert.ok(first.text.includes("- Animations frozen: true"));
+        assert.ok(first.text.includes("- Hovered selector: div.card:hover"));
+        assert.ok(first.text.includes("- Active element selector: null"));
+        assert.ok(
+          first.text.includes("- Open details selectors: details.a, details.b"),
+        );
+        // Strokes count and colors.
+        assert.ok(first.text.includes("- Count: 2"));
+        assert.ok(first.text.includes("- Colors: #f00, #0f0"));
+        // File references: JSON/PNG names plus @file/@image paths.
+        assert.ok(first.text.includes(`- Annotation: \`${jsonName}\``));
+        assert.ok(
+          first.text.includes(`- @file:${path.join(dir, "annotations", jsonName)}`),
+        );
+        assert.ok(first.text.includes(`- Screenshot: \`${pngName}\``));
+        assert.ok(
+          first.text.includes(`- @image:${path.join(dir, "annotations", pngName)}`),
+        );
+        assert.ok(!first.text.includes("\u2014"), "no U+2014 in export");
+
+        // Deterministic: repeated requests produce identical bytes.
+        const second = await rawRequest(
+          hub.base,
+          `/annotations/${jsonName}/export.md`,
+        );
+        assert.equal(second.status, 200);
+        assert.equal(second.text, first.text);
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("text-only annotation exports without a broken PNG reference", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const posted = await request(hub.base, "POST", "/annotations", {
+          ...samplePayload(),
+          notes: ["text only"],
+        });
+        assert.equal(posted.status, 200);
+        const jsonName = posted.json.file as string;
+        const res = await rawRequest(
+          hub.base,
+          `/annotations/${jsonName}/export.md`,
+        );
+        assert.equal(res.status, 200);
+        assert.equal(res.contentType, "text/markdown; charset=utf-8");
+        assert.ok(res.text.includes(`- Annotation: \`${jsonName}\``));
+        assert.ok(!res.text.includes("Screenshot:"), "no PNG reference without screenshot");
+        assert.ok(!res.text.includes("@image:"), "no @image reference without screenshot");
+        assert.ok(res.text.includes("- text only"));
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("unsafe name returns 400 like existing reads", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const res = await rawRequest(hub.base, "/annotations/a/b/export.md");
+        assert.equal(res.status, 400);
+        assert.deepEqual(JSON.parse(res.text), { error: "invalid annotation name" });
+      } finally {
+        await hub.close();
+      }
+    });
+  });
+
+  test("missing annotation returns 404", async () => {
+    await withTempDataDir(async () => {
+      const hub = await startHub();
+      try {
+        const res = await rawRequest(
+          hub.base,
+          "/annotations/20260101-000000-999.json/export.md",
+        );
+        assert.equal(res.status, 404);
+        assert.deepEqual(JSON.parse(res.text), { error: "not found" });
+      } finally {
+        await hub.close();
+      }
+    });
   });
 });

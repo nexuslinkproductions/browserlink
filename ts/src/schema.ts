@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-export const VERSION = "2.2.0";
+export const VERSION = "2.5.0";
 
 export const SCREENSHOT_PREFIX = "data:image/png;base64,";
 export const MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024;

@@ -366,6 +366,47 @@ async function sendTest() {
   }
 }
 
+/* Copy AI Brief: fetch the newest annotation's export.md and copy it.
+ * Direct hub fetches only (never routed through the content script).
+ * navigator.clipboard.writeText runs at the end of this click-gesture
+ * handler while the popup document stays focused. */
+async function copyLatestBrief() {
+  const out = $('briefResult');
+  out.textContent = 'copying…';
+  out.className = 'result';
+  let endpoint;
+  try {
+    endpoint = await resolveEndpoint();
+  } catch (_) {
+    out.textContent = 'failed: hub offline';
+    out.className = 'result err';
+    return;
+  }
+  try {
+    const listRes = await fetch(endpoint + '/annotations');
+    if (!listRes.ok) throw new Error('annotations list ' + listRes.status);
+    const body = await listRes.json();
+    const files = (body && Array.isArray(body.files)) ? body.files : [];
+    const newest = files[0]; // hub lists newest first (mtime desc)
+    if (!newest || !newest.name) {
+      out.textContent = 'no annotations yet';
+      out.className = 'result err';
+      return;
+    }
+    const mdRes = await fetch(
+      endpoint + '/annotations/' + encodeURIComponent(newest.name) + '/export.md',
+    );
+    if (!mdRes.ok) throw new Error('export ' + mdRes.status);
+    const markdown = await mdRes.text();
+    await navigator.clipboard.writeText(markdown);
+    out.textContent = 'copied ' + newest.name + ' ✓';
+    out.className = 'result ok';
+  } catch (err) {
+    out.textContent = 'failed: ' + ((err && err.message) ? err.message : 'hub offline');
+    out.className = 'result err';
+  }
+}
+
 /* wiring */
 $('toolToggle').addEventListener('change', onToolToggle);
 $('saveEndpoint').addEventListener('click', saveEndpoint);
@@ -377,6 +418,7 @@ $('refreshSessions').addEventListener('click', () => {
 $('sessionSelect').addEventListener('change', onSessionChange);
 $('contextLabel').addEventListener('input', saveLabel);
 $('sendTest').addEventListener('click', sendTest);
+$('copyBrief').addEventListener('click', copyLatestBrief);
 checkHub();
 loadEndpoint();
 loadLabel();

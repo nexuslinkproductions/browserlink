@@ -4,10 +4,22 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
-## [2.5.0] - Unreleased
+## [2.5.0] - 2026-08-12
 
 ### Added
 
+- **Copy AI Brief** - one click exports the newest annotation as structured
+  Markdown for an AI harness: page URL/title/viewport, per-element cssPaths,
+  instructions, edits, Intent/Priority labels, capture state, notes, stroke
+  summary, and local `@file`/`@image` references. New hub routes
+  `GET /annotations/<name>/export.md` and
+  `GET /annotations/latest/export.md`; the popup gains a Copy AI Brief
+  button that copies the brief to the clipboard.
+- **Persistent Drafts** - unsent strokes, queued notes, and element
+  instructions survive a refresh: drafts persist locally per canonical URL
+  and restore with best-effort cssPath re-anchoring (unresolved markers are
+  counted, never dropped). No account or cloud sync; a draft clears only
+  after a confirmed Send or Clear All.
 - **Freeze State Capture** - one-click Freeze pauses page CSS animations and
   transitions (transition duration/delay zeroed) for a clean, stable crop;
   the annotation payload carries optional `captureState` metadata with the
