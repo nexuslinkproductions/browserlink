@@ -312,7 +312,13 @@ async function loadEndpoint() {
 function saveEndpoint() {
   const v = normalizeEndpoint($('endpointInput').value);
   $('endpointInput').value = v;
-  chrome.storage.local.set({ endpoint: v }).catch(() => {});
+  chrome.storage.local.set({ endpoint: v }).catch((err) => {
+    // H7: surface the failure (typically the storage.local quota) instead of
+    // silently losing the config; the status line is the visible hint.
+    console.error('[browserlink] endpoint save failed: '
+      + ((err && err.message) ? err.message : String(err)));
+    setHubStatus('Endpoint save failed (storage error); check the console.', 'err');
+  });
   checkHub(); // re-check against the saved endpoint
 }
 
@@ -326,7 +332,11 @@ async function loadLabel() {
 
 function saveLabel() {
   const v = $('contextLabel').value;
-  chrome.storage.local.set({ contextLabel: v }).catch(() => {});
+  chrome.storage.local.set({ contextLabel: v }).catch((err) => {
+    // H7: surface the failure instead of silently losing the label.
+    console.error('[browserlink] context label save failed: '
+      + ((err && err.message) ? err.message : String(err)));
+  });
 }
 
 /* master switch ("Tool active"): default ON, persisted as "toolEnabled" */
@@ -361,7 +371,11 @@ async function loadToolEnabled() {
 
 function onToolToggle() {
   const enabled = $('toolToggle').checked;
-  chrome.storage.local.set({ toolEnabled: enabled }).catch(() => {});
+  chrome.storage.local.set({ toolEnabled: enabled }).catch((err) => {
+    // H7: surface the failure instead of silently losing the switch state.
+    console.error('[browserlink] tool toggle save failed: '
+      + ((err && err.message) ? err.message : String(err)));
+  });
   const msg = enabled
     ? { type: 'browserlinkToggle', enabled: true }
     : { type: 'browserlinkExit' };

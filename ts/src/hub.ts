@@ -20,7 +20,6 @@ import {
   atomicWriteBytes,
   validatePayload,
   validateTargetBody,
-  MAX_SCREENSHOT_BYTES,
   type JsonObject,
 } from "./schema.ts";
 import * as hermes from "./adapters/hermes.ts";
@@ -89,6 +88,17 @@ export function storeAnnotation(payload: JsonObject): string {
     `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-` +
     `${pad(now.getMilliseconds(), 3)}`;
 
+  // H1: millisecond timestamps are not unique on their own - two concurrent
+  // POSTs in the same millisecond would produce identical .json/.png names
+  // and the second would silently overwrite the first (annotation lost and
+  // the adapter dedupes both deliveries as one id). The whole function is
+  // synchronous on the single-threaded event loop, so a -N suffix that
+  // bumps while the .json name already exists is an airtight guard.
+  let base = timestamp;
+  for (let counter = 1; fs.existsSync(path.join(directory, `${base}.json`)); counter += 1) {
+    base = `${timestamp}-${counter}`;
+  }
+
   const stored: JsonObject = {};
   for (const [key, value] of Object.entries(payload)) {
     if (key !== "screenshot") stored[key] = value;
@@ -96,14 +106,14 @@ export function storeAnnotation(payload: JsonObject): string {
 
   const screenshot = payload.screenshot;
   if (typeof screenshot === "string" && screenshot.startsWith(SCREENSHOT_PREFIX)) {
-    const pngName = `${timestamp}.png`;
+    const pngName = `${base}.png`;
     const pngPath = path.join(directory, pngName);
     const raw = Buffer.from(screenshot.slice(SCREENSHOT_PREFIX.length), "base64");
     atomicWriteBytes(pngPath, raw);
     stored.screenshotFile = pngName;
   }
 
-  const jsonPath = path.join(directory, `${timestamp}.json`);
+  const jsonPath = path.join(directory, `${base}.json`);
   atomicWriteJson(jsonPath, stored);
 
   for (const key of Object.keys(payload)) delete payload[key];
@@ -235,6 +245,19 @@ function tryReadAnnotation(filePath: string): JsonObject | null {
   } catch {
     return null;
   }
+}
+
+// H11: a stored annotation that exists but cannot be read (corrupt JSON,
+// truncated write, permission error) is a server-side storage fault, not a
+// missing annotation. Map ENOENT/ENOTDIR to 404, everything else to 500.
+function annotationReadError(
+  err: unknown,
+): { status: number; error: string } {
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === "ENOENT" || code === "ENOTDIR") {
+    return { status: 404, error: "not found" };
+  }
+  return { status: 500, error: "corrupt annotation" };
 }
 
 /* ---------------------------------------------------------------------------
@@ -750,33 +773,118 @@ function requestPathname(reqUrl: string | undefined): string {
   return noHash || "/";
 }
 
+// H4: origin allowlist for the local hub. Any website could otherwise POST
+// /annotations (disk fill + adapter dispatch using the user's Hermes key),
+// POST /target, or read the annotation history. Allowed:
+// - no Origin header at all (curl, MCP, and other local tooling; browsers
+//   always send Origin on cross-origin requests, so an absent header cannot
+//   come from a hostile web page),
+// - chrome-extension:// or moz-extension:// origins (the MV3 extension;
+//   only an installed extension can emit these - web pages cannot set the
+//   Origin header at all, it is a forbidden header),
+// - same-origin http(s) requests (hub-served pages, e.g. the share page).
+function originAllowed(req: http.IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (origin === undefined || origin === "") return true;
+  try {
+    const url = new URL(origin);
+    if (url.protocol === "chrome-extension:" || url.protocol === "moz-extension:") {
+      return true;
+    }
+    const host = req.headers.host;
+    if (host && (url.protocol === "http:" || url.protocol === "https:") && url.host === host) {
+      return true;
+    }
+  } catch {
+    // Unparseable Origin: not from a browser; reject.
+    return false;
+  }
+  return false;
+}
+
+// H13: raw wire-body cap. Screenshots ship as base64 data URLs, which
+// inflate the payload by ~4/3 over the decoded bytes (10MB decoded ->
+// ~13.33MB base64, plus JSON overhead for strokes/elements/notes). The
+// schema's decoded cap is MAX_SCREENSHOT_BYTES (10MB); the raw cap must be
+// larger or the documented 10MB decoded contract is unreachable. 14MB
+// leaves ~640KB of headroom above the pure base64 floor.
+const MAX_RAW_BODY_BYTES = 14 * 1024 * 1024;
+
+// H10: explicit body-read deadline so a dribbling or stalled client cannot
+// hold a connection slot for Node's ~5 minute default.
+const BODY_READ_TIMEOUT_MS = 30_000;
+
 async function readJsonBody(
   req: http.IncomingMessage,
 ): Promise<{ payload: unknown; error: string | null; status: number | null }> {
-  try {
-    const lengthHeader = req.headers["content-length"];
-    if (lengthHeader === undefined) {
-      return { payload: null, error: "invalid JSON", status: 400 };
-    }
-    const length = Number.parseInt(String(lengthHeader), 10);
+  // Content-Length is optional: chunked (Transfer-Encoding) bodies are read
+  // to the raw cap. When declared, the length must be sane and within the
+  // raw cap; the body actually read must match it exactly.
+  const lengthHeader = req.headers["content-length"];
+  let length: number | null = null;
+  if (lengthHeader !== undefined) {
+    length = Number.parseInt(String(lengthHeader), 10);
     if (!Number.isFinite(length) || length < 0) {
       return { payload: null, error: "invalid JSON", status: 400 };
     }
     // Oversized annotation payloads (base64 screenshots inflate ~4/3) are
     // rejected up front with 413 so a single bad send can never exhaust the
     // hub or the downstream API server request cap (10 MB there too).
-    if (length > MAX_SCREENSHOT_BYTES) {
+    if (length > MAX_RAW_BODY_BYTES) {
       return { payload: null, error: "payload too large", status: 413 };
     }
-    const chunks: Buffer[] = [];
-    let received = 0;
+  }
+
+  const chunks: Buffer[] = [];
+  let received = 0;
+  let overCap = false;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    // Destroy the request so the read loop aborts instead of dribbling on.
+    req.destroy();
+  }, BODY_READ_TIMEOUT_MS);
+  try {
     for await (const chunk of req) {
-      const buf = chunk as Buffer;
-      chunks.push(buf);
-      received += buf.length;
-      if (received > length) break;
+      if (!overCap) {
+        const buf = chunk as Buffer;
+        chunks.push(buf);
+        received += buf.length;
+        if (received > MAX_RAW_BODY_BYTES) {
+          // Stop reading; the 413 response is written below. The socket is
+          // left intact so the client actually receives the response, and
+          // Node drops the connection once the request body is incomplete.
+          overCap = true;
+        }
+      }
     }
-    const raw = Buffer.concat(chunks).subarray(0, length).toString("utf8");
+  } catch {
+    // Aborted (read timeout or client disconnect).
+    if (timedOut) {
+      return { payload: null, error: "request body read timed out", status: 400 };
+    }
+    // Client closed the connection before the declared Content-Length
+    // arrived: that is a truncated body, not invalid JSON.
+    if (length !== null && received < length) {
+      return { payload: null, error: "body length mismatch", status: 400 };
+    }
+    return { payload: null, error: "invalid JSON", status: 400 };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (overCap) {
+    return { payload: null, error: "payload too large", status: 413 };
+  }
+
+  if (length !== null && received !== length) {
+    // Declared length mismatch (truncated or over-long body): never parse a
+    // silently truncated payload.
+    return { payload: null, error: "body length mismatch", status: 400 };
+  }
+
+  const raw = Buffer.concat(chunks).toString("utf8");
+  try {
     return { payload: JSON.parse(raw), error: null, status: null };
   } catch {
     return { payload: null, error: "invalid JSON", status: 400 };
@@ -921,8 +1029,9 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
         "Access-Control-Allow-Headers": "Content-Type",
       });
       res.end(body);
-    } catch {
-      sendJson(res, 404, { error: "not found" });
+    } catch (err) {
+      const failure = annotationReadError(err);
+      sendJson(res, failure.status, { error: failure.error });
     }
   }
 
@@ -955,8 +1064,9 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
         "Access-Control-Allow-Headers": "Content-Type",
       });
       res.end(body);
-    } catch {
-      sendJson(res, 404, { error: "not found" });
+    } catch (err) {
+      const failure = annotationReadError(err);
+      sendJson(res, failure.status, { error: failure.error });
     }
   }
 
@@ -977,8 +1087,9 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
         "Access-Control-Allow-Headers": "Content-Type",
       });
       res.end(body);
-    } catch {
-      sendJson(res, 404, { error: "not found" });
+    } catch (err) {
+      const failure = annotationReadError(err);
+      sendJson(res, failure.status, { error: failure.error });
     }
   }
 
@@ -1007,8 +1118,9 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
         ...entries,
       ]);
       sendZip(res, `${stem}-bundle.zip`, Buffer.from(zip));
-    } catch {
-      sendJson(res, 404, { error: "not found" });
+    } catch (err) {
+      const failure = annotationReadError(err);
+      sendJson(res, failure.status, { error: failure.error });
     }
   }
 
@@ -1087,14 +1199,22 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
         String(a.name) < String(b.name) ? -1 : String(a.name) > String(b.name) ? 1 : 0,
       );
       sendJson(res, 200, { threadId, count: items.length, items });
-    } catch {
-      sendJson(res, 404, { error: "not found" });
+    } catch (err) {
+      const failure = annotationReadError(err);
+      sendJson(res, failure.status, { error: failure.error });
     }
   }
 
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? "GET";
     const pathname = requestPathname(req.url);
+
+    // H4: reject requests from disallowed origins (any website) before any
+    // route runs, including OPTIONS preflight.
+    if (!originAllowed(req)) {
+      sendJson(res, 403, { error: "origin not allowed" });
+      return;
+    }
 
     if (method === "OPTIONS") {
       sendEmpty(res, 204);
@@ -1363,8 +1483,9 @@ export function createHub(port = 0, options: CreateHubOptions = {}): HubServer {
             "Access-Control-Allow-Headers": "Content-Type",
           });
           res.end(body);
-        } catch {
-          sendJson(res, 404, { error: "not found" });
+        } catch (err) {
+          const failure = annotationReadError(err);
+          sendJson(res, failure.status, { error: failure.error });
         }
         return;
       }

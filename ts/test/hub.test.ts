@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { createServer } from "node:http";
+import * as http from "node:http";
 import type { AddressInfo } from "node:net";
+import * as net from "node:net";
 
 import {
   createHubServer,
@@ -2514,3 +2516,284 @@ describe("F8 element threads", () => {
     }
   });
 });
+
+// Low-level request helper for headers and chunked/length-mismatch bodies.
+function rawRequest(
+          base: string,
+          method: string,
+          route: string,
+          opts: { headers?: Record<string, string>; body?: Buffer } = {},
+          ): Promise<{ status: number; body: string }> {
+          return new Promise((resolve, reject) => {
+          const url = new URL(route, base);
+          const req = http.request(url, { method, headers: opts.headers }, (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk) => chunks.push(chunk as Buffer));
+          res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString("utf8"),
+          }),
+          );
+          });
+          req.on("error", reject);
+          if (opts.body) req.write(opts.body);
+          req.end();
+          });
+          }
+
+// Truncated-body client: declares a Content-Length larger than the body it
+// sends, then half-closes (FIN) - exactly what a real client that hangs up
+// mid-body does. http.request cannot express this (it refuses to end while
+// the declared length is outstanding), so drive a raw socket.
+function truncatedBodyRequest(
+          base: string,
+          route: string,
+          opts: { declaredLength: number; body: Buffer },
+          ): Promise<{ status: number; body: string }> {
+          return new Promise((resolve, reject) => {
+          const url = new URL(route, base);
+          const socket = net.connect(Number(url.port), url.hostname, () => {
+          socket.write(
+            `${opts.method ?? "POST"} ${url.pathname} HTTP/1.1\r\n` +
+              `Host: ${url.host}\r\n` +
+              "Content-Type: application/json\r\n" +
+              `Content-Length: ${opts.declaredLength}\r\n` +
+              "Connection: close\r\n" +
+              "\r\n",
+          );
+          socket.write(opts.body);
+          socket.end(); // FIN with the body incomplete
+          });
+          const chunks: Buffer[] = [];
+          socket.on("data", (chunk) => chunks.push(chunk as Buffer));
+          socket.on("error", reject);
+          socket.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          const headEnd = raw.indexOf("\r\n\r\n");
+          const head = headEnd >= 0 ? raw.slice(0, headEnd).toString() : "";
+          const m = /^HTTP\/1\.[01] (\d{3})/.exec(head);
+          resolve({
+            status: m ? Number(m[1]) : 0,
+            body: headEnd >= 0 ? raw.slice(headEnd + 4) : raw,
+          });
+          });
+          });
+          }
+
+          describe("H1/H4/H10/H11/H12/H13 hub hardening", () => {
+          test("two concurrent identical POSTs store two distinct files", async () => {
+          await withTempDataDir(async (dir) => {
+          const hub = await startHub();
+          try {
+          const payload = samplePayload();
+          const [a, b] = await Promise.all([
+            request(hub.base, "POST", "/annotations", payload),
+            request(hub.base, "POST", "/annotations", payload),
+          ]);
+          assert.equal(a.status, 200);
+          assert.equal(b.status, 200);
+          assert.notEqual(a.json.file, b.json.file, "file names must be unique");
+          await readFile(path.join(dir, "annotations", a.json.file), "utf8");
+          await readFile(path.join(dir, "annotations", b.json.file), "utf8");
+          } finally {
+          await hub.close();
+          }
+          });
+          });
+
+          test("cross-origin requests rejected, extension and same-origin allowed", async () => {
+          await withTempDataDir(async (dir) => {
+          const hub = await startHub();
+          try {
+          const payload = samplePayload();
+          // Hostile website: Origin is a forbidden header for web pages, so
+          // this only simulates what a real browser tab would send.
+          let res = await rawRequest(hub.base, "POST", "/annotations", {
+            headers: {
+              Origin: "https://evil.example",
+              "Content-Type": "application/json",
+            },
+            body: Buffer.from(JSON.stringify(payload)),
+          });
+          assert.equal(res.status, 403);
+          assert.match(res.body, /origin not allowed/);
+
+          // Reads are gated too.
+          res = await rawRequest(hub.base, "GET", "/annotations", {
+            headers: { Origin: "https://evil.example" },
+          });
+          assert.equal(res.status, 403);
+
+          // OPTIONS preflight is gated as well.
+          res = await rawRequest(hub.base, "OPTIONS", "/annotations", {
+            headers: { Origin: "https://evil.example" },
+          });
+          assert.equal(res.status, 403);
+
+          // The MV3 extension's fetch sends Origin: chrome-extension://<id>.
+          res = await rawRequest(hub.base, "POST", "/annotations", {
+            headers: {
+              Origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+              "Content-Type": "application/json",
+            },
+            body: Buffer.from(JSON.stringify(payload)),
+          });
+          assert.equal(res.status, 200, "extension origin must be allowed");
+
+          // Same-origin http requests (hub-served pages) stay allowed.
+          const { port } = new URL(hub.base);
+          res = await rawRequest(hub.base, "GET", "/health", {
+            headers: { Origin: `http://127.0.0.1:${port}` },
+          });
+          assert.equal(res.status, 200);
+          } finally {
+          await hub.close();
+          }
+          });
+          });
+
+          test("chunked POST accepted; length mismatch rejected cleanly", async () => {
+          await withTempDataDir(async (dir) => {
+          const hub = await startHub();
+          try {
+          // Transfer-Encoding: chunked, no Content-Length. Note: the header
+          // must NOT be set manually - when the client sets it, Node skips
+          // its own chunk framing and the server never sees the terminating
+          // zero chunk. Omitting Content-Length makes Node auto-chunk, which
+          // is exactly the wire shape the hub must accept.
+          const res = await rawRequest(hub.base, "POST", "/annotations", {
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: Buffer.from(JSON.stringify(samplePayload())),
+          });
+          assert.equal(res.status, 200, "chunked body must be accepted");
+          const parsed = JSON.parse(res.body);
+          assert.equal(parsed.ok, true);
+
+          // Declared Content-Length larger than the actual body. A real
+          // truncated client closes its write side (FIN) after the short
+          // body; http.request refuses to half-close while a declared length
+          // is outstanding, so drive a raw socket for this case.
+          const mismatch = await truncatedBodyRequest(hub.base, "/annotations", {
+            declaredLength: 10000,
+            body: Buffer.from(JSON.stringify(samplePayload())),
+          });
+          assert.equal(mismatch.status, 400);
+          // Node tears the socket down on an aborted request, so the error
+          // body may not flush; the 400 status is the contract.
+
+          // Declared Content-Length far over the raw cap: 413 up front.
+          const over = await rawRequest(hub.base, "POST", "/annotations", {
+            headers: {
+              "Content-Length": String(15 * 1024 * 1024),
+              "Content-Type": "application/json",
+            },
+            body: Buffer.from(JSON.stringify(samplePayload())),
+          });
+          assert.equal(over.status, 413);
+          assert.match(over.body, /payload too large/);
+          } finally {
+          await hub.close();
+          }
+          });
+          });
+
+          test("screenshot base64 decoding to ~9MB is accepted (14MB raw cap)", async () => {
+          await withTempDataDir(async (dir) => {
+          const hub = await startHub();
+          try {
+          const raw = Buffer.alloc(9 * 1024 * 1024, 0x61);
+          const b64 = raw.toString("base64");
+          assert.ok(b64.length >= 12 * 1024 * 1024, "raw base64 must reach 12MB");
+          const payload = {
+            ...samplePayload(),
+            screenshot: `data:image/png;base64,${b64}`,
+          };
+          const res = await request(hub.base, "POST", "/annotations", payload);
+          assert.equal(res.status, 200, "9MB decoded screenshot must be accepted");
+          const stored = JSON.parse(
+            await readFile(path.join(dir, "annotations", res.json.file), "utf8"),
+          );
+          assert.ok(typeof stored.screenshotFile === "string");
+          } finally {
+          await hub.close();
+          }
+          });
+          });
+
+          test("negative element index and oversized instruction rejected via POST", async () => {
+          await withTempDataDir(async (dir) => {
+          const hub = await startHub();
+          try {
+          let payload = {
+            ...samplePayload(),
+            elements: [{ index: -5, tag: "button" }],
+          };
+          let res = await request(hub.base, "POST", "/annotations", payload);
+          assert.equal(res.status, 400);
+          assert.match(res.json.error, /index must be a non-negative integer/);
+
+          payload = {
+            ...samplePayload(),
+            elements: [
+              { index: 1, tag: "button", instruction: "x".repeat(4 * 1024 * 1024) },
+            ],
+          };
+          res = await request(hub.base, "POST", "/annotations", payload);
+          assert.equal(res.status, 400);
+          assert.match(res.json.error, /instruction must be at most 500/);
+          } finally {
+          await hub.close();
+          }
+          });
+          });
+
+          test("corrupt stored annotation answers 500, missing answers 404", async () => {
+          await withTempDataDir(async (dir) => {
+          const hub = await startHub();
+          try {
+          const annDir = path.join(dir, "annotations");
+          await mkdir(annDir, { recursive: true });
+          await writeFile(
+            path.join(annDir, "20260101-000000-000.json"),
+            "{ not json",
+          );
+          let res = await request(
+            hub.base,
+            "GET",
+            "/annotations/20260101-000000-000.json/export.md",
+          );
+          assert.equal(res.status, 500);
+          assert.deepEqual(res.json, { error: "corrupt annotation" });
+
+          // Raw GET streams stored bytes verbatim (raw-access contract), so a
+          // corrupt file still returns 200 with the raw body; only the
+          // rendered routes parse and 500. Use rawRequest - request() would
+          // try to JSON.parse the corrupt bytes.
+          const rawRes = await rawRequest(
+            hub.base,
+            "GET",
+            "/annotations/20260101-000000-000.json",
+          );
+          assert.equal(rawRes.status, 200);
+          assert.equal(rawRes.body, "{ not json");
+
+          res = await request(hub.base, "GET", "/annotations/missing.json");
+          assert.equal(res.status, 404);
+          assert.deepEqual(res.json, { error: "not found" });
+
+          res = await request(
+            hub.base,
+            "GET",
+            "/annotations/missing.json/export.md",
+          );
+          assert.equal(res.status, 404);
+          assert.deepEqual(res.json, { error: "not found" });
+          } finally {
+          await hub.close();
+          }
+          });
+          });
+          });

@@ -71,6 +71,12 @@
   note queue 20 entries.
 - Request bodies are size-capped up front (413) so one bad send cannot
   exhaust the hub or the downstream API server.
+- Cross-origin callers are gated (hardened): the hub validates the `Origin`
+  header on every route and rejects web-page origins with 403. Absent
+  origins (curl, MCP, local tooling), `chrome-extension:` /
+  `moz-extension:` origins, and same-origin requests are allowed; any
+  website the user visits cannot POST annotations, redirect delivery, or
+  read the local annotation history.
 - Adapter failures are isolated per delivery and logged to
   `browserlink-error.log` in the data dir; a failing adapter never blocks
   storage or other adapters.

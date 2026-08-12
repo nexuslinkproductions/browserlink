@@ -125,6 +125,13 @@ Wire format (POST body):
 - Decoded size must be ≤ 10MB; otherwise HTTP 400
 - Non-PNG data URLs (e.g. `data:image/jpeg;base64,...`) are rejected with HTTP 400
 
+Extension capture guard (hardened): the extension only captures when the
+sender tab is the ACTIVE tab of its own window. If the user switched tabs
+mid-send or sends from a background tab, the screenshot is omitted (an
+honest annotation without `screenshot`) rather than capturing a different
+page and cropping it with the sender's rect. Popup-initiated sends (no
+sender tab) capture the active tab as before.
+
 On-disk format:
 
 - Hub decodes the PNG and writes `<timestamp>.png` next to the annotation JSON
@@ -428,6 +435,15 @@ Rules:
   bad filename)
 - `404` → `{"error": "annotation not found"}`
 - `413` → `{"error": "payload too large"}`
+
+Extension send path (hardened): the extension resolves the hub endpoint
+exactly like its health check (stale stored endpoint falls back to
+`DEFAULT_ENDPOINT`), so sends always target the endpoint the popup reports
+as connected. Sends are bounded by a 20s timeout; a stalled hub surfaces
+as a send failure. On success the extension stamps the thread `parentId`
+for the next send from the response `file` (the exact annotation just
+stored); when the response lacks it (older hub), it falls back to the
+newest `GET /annotations` entry guarded by a 15s mtime bound.
 
 ## GET /target and POST /target
 

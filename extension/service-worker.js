@@ -15,6 +15,9 @@
 
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787';
 const HUB_STATUS_TIMEOUT_MS = 2000;
+// Bounded timeout for annotation POSTs: a stalled hub must not keep the
+// service worker alive with the sender stuck in 'sending...'.
+const HUB_POST_TIMEOUT_MS = 20000;
 const POLL_ALARM = 'browserlink-poll';
 
 /* Normalize a hub endpoint: trim, strip trailing slashes, and map
@@ -327,38 +330,95 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg.payload || typeof msg.payload !== 'object') return false;
     (async () => {
       const payload = Object.assign({}, msg.payload);
-      // Capture visible tab when possible; never block annotation on failure.
-      try {
-        const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
-        if (typeof dataUrl === 'string' && dataUrl) {
-          // v1.6.2: crop to the selected element(s) so the screenshot shows
-          // only the element, not the whole page (or the tool overlay).
-          // cropDataUrl returns null when a crop was requested but failed, so
-          // a UI-polluted full-page image is never stored.
-          const cropped = await cropDataUrl(dataUrl, payload.captureRect);
-          if (typeof cropped === 'string' && cropped) {
-            payload.screenshot = cropped;
+      // H2: captureVisibleTab captures the ACTIVE tab of a window, but the
+      // payload comes from the sender tab. When the sender tab is not the
+      // active tab of its own window (user switched tabs mid-send, or a
+      // background-tab send), skip the capture entirely: storing a
+      // screenshot of a different page and cropping it with the sender's
+      // rect would be wrong. Honest 'no screenshot' annotation instead.
+      const senderTab = sender && sender.tab ? sender.tab : null;
+      let mayCapture = true; // popup sends have no sender tab: capture as before
+      if (senderTab && typeof senderTab.id === 'number') {
+        mayCapture = false;
+        try {
+          const query = typeof senderTab.windowId === 'number'
+            ? { active: true, windowId: senderTab.windowId }
+            : { active: true, currentWindow: true };
+          const tabs = await chrome.tabs.query(query);
+          const active = tabs && tabs[0];
+          if (active && active.id === senderTab.id) {
+            mayCapture = true;
+          } else {
+            console.warn('[browserlink] annotate: sender tab ' + senderTab.id
+              + ' is not the active tab of its window; screenshot omitted');
           }
-        }
-      } catch (_) { /* proceed without screenshot */ }
+        } catch (_) { /* cannot verify: omit rather than capture the wrong page */ }
+      }
+      if (mayCapture) {
+        // Capture visible tab when possible; never block annotation on failure.
+        try {
+          const dataUrl = await chrome.tabs.captureVisibleTab(
+            senderTab && typeof senderTab.windowId === 'number' ? senderTab.windowId : null,
+            { format: 'png' });
+          if (typeof dataUrl === 'string' && dataUrl) {
+            // v1.6.2: crop to the selected element(s) so the screenshot shows
+            // only the element, not the whole page (or the tool overlay).
+            // cropDataUrl returns null when a crop was requested but failed, so
+            // a UI-polluted full-page image is never stored.
+            const cropped = await cropDataUrl(dataUrl, payload.captureRect);
+            if (typeof cropped === 'string' && cropped) {
+              payload.screenshot = cropped;
+            }
+          }
+        } catch (_) { /* proceed without screenshot */ }
+      }
 
-      const endpoint = await getEndpoint();
-      const res = await fetch(endpoint + '/annotations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
+      // H5: resolve the hub endpoint exactly like hubStatus (health probe +
+      // DEFAULT_ENDPOINT fallback) so sends use the same endpoint the popup
+      // reports as connected, never a stale stored value.
+      const endpoint = await resolveEndpoint();
+      // H9: bound the POST with AbortController so a stalled hub cannot keep
+      // the service worker alive and the sender stuck in 'sending...'; the
+      // abort surfaces as a send failure so the sender releases its busy lock.
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), HUB_POST_TIMEOUT_MS);
+      let res = null;
+      try {
+        res = await fetch(endpoint + '/annotations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: ctrl.signal,
+        });
+      } catch (err) {
+        clearTimeout(timer);
+        sendResponse({
+          ok: false,
+          error: ctrl.signal.aborted
+            ? 'hub send timed out after ' + HUB_POST_TIMEOUT_MS + 'ms'
+            : ((err && err.message) ? err.message : String(err)),
+        });
+        return;
+      }
+      clearTimeout(timer);
       let detail = '';
+      let storedFile = null;
       try {
         const text = await res.text();
         if (text) {
           const body = JSON.parse(text);
           if (body && body.error) detail = String(body.error);
-          else if (body && body.file) detail = String(body.file);
+          else if (body && typeof body.file === 'string') {
+            detail = String(body.file);
+            storedFile = body.file;
+          }
         }
       } catch (_) { /* non-JSON body */ }
       if (res.ok) {
-        sendResponse({ ok: true });
+        // H6: hand the stored file name back to the sender so it can stamp
+        // the exact thread parent id (race-free across concurrent tabs)
+        // instead of guessing the newest annotation.
+        sendResponse({ ok: true, file: storedFile });
       } else {
         sendResponse({ ok: false, error: detail || 'HTTP ' + res.status });
       }
