@@ -22,6 +22,16 @@ All notable changes to browserlink are documented here. Format follows
   aliases the newest annotation. The popup gains a **Copy share link**
   button that copies the newest annotation's share URL with a success state
   naming the annotation.
+- **Deep picker (shadow DOM + iframes)** - the element picker reaches
+  inside open shadow roots (any depth) and same-origin iframes, including
+  nested frames: hover highlight, numbered markers, inspector placement,
+  and element crops all translate into top-viewport coordinates, and
+  stored descriptors carry optional `frame`/`shadow` metadata (schema
+  v1.7, strict typing, backward compatible with earlier payloads).
+  Cross-origin iframes degrade explicitly: the frame itself becomes a
+  bounded best-effort target with an honest "cross-origin" label, and
+  browserlink never claims or attempts inner-DOM access for them. Closed
+  shadow roots remain opaque.
 
 ## [2.5.0] - 2026-08-12
 
