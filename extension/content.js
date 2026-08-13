@@ -1563,6 +1563,7 @@
       }
       const outlineEl = createOutline(d2.index);
       state.elements.push({ descriptor: d2, el, outlineEl });
+      syncAnchorRemovalObserver();
       // Anchor resilience (F2): stamp the truthful resolution state, mark
       // the marker (moved/unresolved), and count. A missing result is an
       // unresolved entry; its instruction is never attached and never
@@ -5067,6 +5068,7 @@
         el: pending.el,
         outlineEl: pending.outlineEl,
       });
+      syncAnchorRemovalObserver();
       committedIndex = state.elements.length - 1;
       state.activeIndex = committedIndex;
     }
@@ -5225,6 +5227,7 @@
       d.index = state.nextIndex++;
       const outlineEl = createOutline(d.index);
       state.elements.push({ descriptor: d, el, outlineEl, crossOrigin: r.crossOrigin === true });
+      syncAnchorRemovalObserver();
       state.activeIndex = state.elements.length - 1;
       updateCount();
       updateSelectionPulse();
@@ -5594,6 +5597,7 @@
     const desc = quoteDescriptor(q);
     const outlineEl = createOutline(desc.index);
     state.elements.push({ descriptor: desc, el: quoteAnchorElement(), outlineEl });
+    syncAnchorRemovalObserver();
     state.activeIndex = state.elements.length - 1;
     updateCount();
     updateSelectionPulse();
