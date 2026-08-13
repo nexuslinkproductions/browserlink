@@ -3515,21 +3515,19 @@
   }
 
   // Reduced-strictness identity gate for nearest surviving ancestor: the
-  // former parent must be a plausible container (tag match OR subtree
-  // contains the stored text/aria signals). Never claims html/body/host.
+  // former parent is accepted only when its subtree still carries a stored
+  // content signal (normalized text, aria-label), class-token overlap
+  // >= 0.8, or id equality. A bare tag match is not enough. Never claims
+  // html/body/host.
   function ancestorIsPlausible(el, desc) {
     if (!el || !desc || !isUsableAnchorTarget(el) || isExcludedAncestor(el)) return false;
-    const tag = String(desc.tag || '').toLowerCase();
-    let liveTag = '';
-    try { liveTag = String(el.tagName || '').toLowerCase(); } catch (_) { liveTag = ''; }
-    if (tag && liveTag === tag) return true;
     const wantText = desc.text ? normalizeAnchorText(desc.text) : '';
-    const wantAria = desc.ariaLabel ? normalizeAnchorText(desc.ariaLabel) : '';
     if (wantText) {
       let t = '';
       try { t = el.textContent || ''; } catch (_) { t = ''; }
-      if (wantText && normalizeAnchorText(t).indexOf(wantText) !== -1) return true;
+      if (normalizeAnchorText(t).indexOf(wantText) !== -1) return true;
     }
+    const wantAria = desc.ariaLabel ? normalizeAnchorText(desc.ariaLabel) : '';
     if (wantAria) {
       try {
         const selfAria = el.getAttribute('aria-label') || '';
@@ -3540,6 +3538,15 @@
           if (normalizeAnchorText(a) === wantAria) return true;
         }
       } catch (_) { /* ignore */ }
+    }
+    let liveCls = '';
+    try { liveCls = el.className || ''; } catch (_) { liveCls = ''; }
+    if (desc.className && anchorClassOverlap(desc.className, liveCls) >= ANCHOR_ATTRS_MIN_OVERLAP) return true;
+    const wantId = desc.id ? String(desc.id) : '';
+    if (wantId) {
+      let liveId = '';
+      try { liveId = el.id || ''; } catch (_) { liveId = ''; }
+      if (liveId === wantId) return true;
     }
     return false;
   }
