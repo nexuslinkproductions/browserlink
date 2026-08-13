@@ -3605,13 +3605,49 @@
 
   // Cross-document containment: an entry anchored inside a frame lives in
   // the FRAME's document, so node.contains(en.el) is always false when
-  // `node` is the iframe/frame element in a parent document. Walk the live
-  // frameElement chain (and contentDocument identity as a fallback).
-  // descriptor.frame.path's first index names the frame element in the top
-  // document; later hops name nested frames in that chain.
+  // `node` is the iframe/frame element in a parent document. Chrome nulls
+  // removedIframe.contentDocument and the orphaned document's
+  // defaultView.frameElement before the MutationObserver callback, so the
+  // live chain is empty at callback time. Consult the cached frameEntries
+  // registry first (frameEl -> {doc, frameEls, path}); keep live
+  // chainFrameElsOf / contentDocument checks as pre-removal fast paths.
+  // descriptor.frame.path must match the cached path (or take it as a
+  // prefix) so a stale registry record cannot claim a different frame.
   function entryAnchoredThroughFrame(en, frameEl) {
     if (!en || !en.el || !frameEl) return false;
     if (en.el === frameEl) return false;
+    try {
+      const owner = en.el.ownerDocument;
+      const descPath = en.descriptor && en.descriptor.frame && Array.isArray(en.descriptor.frame.path)
+        ? en.descriptor.frame.path
+        : null;
+      if (owner && descPath && descPath.length) {
+        const direct = frameEntries.get(frameEl);
+        const records = direct ? [direct] : [];
+        for (const rec of frameEntries.values()) {
+          if (rec && rec !== direct) records.push(rec);
+        }
+        for (let ri = 0; ri < records.length; ri++) {
+          const rec = records[ri];
+          if (!rec || rec.crossOrigin || rec.doc !== owner) continue;
+          let frameHit = rec.frameEl === frameEl;
+          if (!frameHit && rec.frameEls) {
+            for (let i = 0; i < rec.frameEls.length; i++) {
+              if (rec.frameEls[i] === frameEl) { frameHit = true; break; }
+            }
+          }
+          if (!frameHit) continue;
+          const cachedPath = rec.path;
+          if (!Array.isArray(cachedPath) || !cachedPath.length) continue;
+          if (descPath.length < cachedPath.length) continue;
+          let pathHit = true;
+          for (let i = 0; i < cachedPath.length; i++) {
+            if (descPath[i] !== cachedPath[i]) { pathHit = false; break; }
+          }
+          if (pathHit) return true;
+        }
+      }
+    } catch (_) { /* ok */ }
     try {
       const chain = chainFrameElsOf(en.el.ownerDocument);
       for (let i = 0; i < chain.length; i++) {
@@ -4294,6 +4330,20 @@
     attachFrameListeners(entry);
   }
 
+  // True while an in-memory (non-quote) entry still lives in this cached
+  // frame document. Used as a prune hold so onAnchorMutations can still
+  // match the removed iframe after Chrome severs live frame links.
+  function frameRegistryHeldByAnchor(rec) {
+    if (!rec || rec.crossOrigin || !rec.doc) return false;
+    for (const en of state.elements) {
+      if (!en || !en.el || (en.descriptor && en.descriptor.quoteMarker)) continue;
+      try {
+        if (en.el.ownerDocument === rec.doc) return true;
+      } catch (_) { /* ok */ }
+    }
+    return false;
+  }
+
   // Register every same-origin frame reachable from the top document
   // (bounded depth). Called at init, on element-mode entry, and on a
   // periodic timer; idempotent. Prunes entries whose frame left the tree
@@ -4320,9 +4370,13 @@
     try { visit(document, []); } catch (_) { /* never break the host page */ }
     // Prune entries for frames that left the document tree (removed or
     // replaced): their listeners died with the window, so drop the bookkeeping.
+    // Skip prune while an in-memory entry still lives in that cached
+    // document: Chrome severs live frame links before the mutation
+    // callback, and onAnchorMutations needs the record at callback time.
     for (const fe of Array.from(frameEntries.keys())) {
       if (seen.has(fe)) continue;
       const entry = frameEntries.get(fe);
+      if (frameRegistryHeldByAnchor(entry)) continue;
       if (entry && entry.crossOrigin && frameCounters.crossOrigin > 0) {
         frameCounters.crossOrigin -= 1;
       }
