@@ -86,10 +86,11 @@
  * elements[] entries carry "edits": {property: desiredValue} when edited.
  * status shows "bridge offline" on failure; success clears the status (the
  * markers are cleared only after a successful send.
- * Drafts (F3) persist across refresh in chrome.storage.local, keyed by the
- * canonical URL (origin + pathname + search, hash excluded): normalized
- * strokes, queued notes, and element descriptors (instruction + optional
- * intent/severity) restore on reinject. Anchor resilience (F2/F11/F12/F13,
+ * Drafts (F3) persist across refresh in chrome.storage.local, keyed per tab
+ * plus the canonical URL (origin + pathname + search, hash excluded):
+ * normalized strokes, queued notes, and element descriptors (instruction
+ * + optional intent/severity) restore on reinject. Same-page tabs never
+ * share a draft. Anchor resilience (F2/F11/F12/F13,
  * schema v1.10) makes restore deterministic: exact cssPath replay first,
  * then stable attributes, normalized text/aria label, then prior-rect
  * proximity, each tier gated by a documented confidence floor. Restored
@@ -1176,20 +1177,22 @@
 
   /* ---------------- Persistent Drafts (F3) ----------------
    * Draft persistence across page refresh, stored in chrome.storage.local
-   * under a key derived from the canonical URL (origin + pathname + search,
-   * hash excluded). The stored draft is compact: normalized strokes, queued
-   * notes, and element descriptors (instruction + optional intent/severity).
-   * NO screenshots, NO page HTML, NO CSS/text edits. The draft is cleared
-   * only after a confirmed successful Send or Clear All; failed sends keep
-   * it. This is separate from the per-tab chrome.storage.session state
-   * (key "browserlink:<tabId>") and never collides with it.
+   * under a per-tab key: 'draft:' + tabId + ':' + canonical URL (origin +
+   * pathname + search, hash excluded). Same-page tabs therefore never share
+   * a draft. The stored draft is compact: normalized strokes, queued notes,
+   * and element descriptors (instruction + optional intent/severity). NO
+   * screenshots, NO page HTML, NO CSS/text edits. The draft is cleared only
+   * after a confirmed successful Send or Clear All; failed sends keep it.
+   * This is separate from the per-tab chrome.storage.session state (key
+   * "browserlink:<tabId>") and never collides with it. Session storage
+   * semantics are unchanged; only the draft key includes the tab id.
    */
   const DRAFT_PERSIST_MS = 300; // debounce window for writeDraft
   const DRAFT_SAVE_VERSION = 1;
   // Bounded draft retention: chrome.storage.local has a 10MB quota and
-  // 'draft:<url>' keys would otherwise accumulate forever, eventually
-  // killing draft persistence AND popup config writes. Cap the draft set,
-  // evicting oldest-first by savedAt.
+  // 'draft:<tabId>:<url>' keys would otherwise accumulate forever,
+  // eventually killing draft persistence AND popup config writes. Cap the
+  // draft set, evicting oldest-first by savedAt.
   const DRAFT_MAX_COUNT = 25;
   const DRAFT_SWEEP_MIN_MS = 15000; // throttle: at most one sweep per window
   let lastDraftSweepAt = 0;
@@ -1214,9 +1217,21 @@
     return hashAt === -1 ? href : href.slice(0, hashAt);
   }
 
-  function draftKey() {
-    return 'draft:' + canonicalDraftUrl();
+  // Per-tab draft key. Init awaits pingTabId() before restore, so the real
+  // tab id is known then. If draftKey() runs before the id resolves (e.g.
+  // a persist during early mutation), use a per-context nonce instead of
+  // falling back to a URL-only key, which would collide across same-page
+  // tabs (C6). The nonce is unique to this content-script instance.
+  let draftTabFallbackId = null;
+  function resolvedDraftTabId() {
+    if (knownTabId) return String(knownTabId);
+    if (!draftTabFallbackId) {
+      draftTabFallbackId = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+    }
+    return draftTabFallbackId;
   }
+
+  function draftKey() { return 'draft:' + resolvedDraftTabId() + ':' + canonicalDraftUrl(); }
 
   // Compact serialization of the current in-memory draft. Only strokes,
   // notes, and element descriptors ship; edits/screenshots/html never do.
@@ -1323,7 +1338,7 @@
     };
   }
 
-  // Bounded eviction for the draft set (H7): read every 'draft:<url>' key,
+  // Bounded eviction for the draft set (H7): read every 'draft:' key,
   // and when more than DRAFT_MAX_COUNT exist, evict the oldest ones by
   // savedAt so storage.local can never fill its quota with drafts. Throttled
   // to at most one sweep per DRAFT_SWEEP_MIN_MS window (persistDraft fires
@@ -1418,14 +1433,14 @@
     flushDraft();
   }
 
-  // Clear the persisted URL draft (confirmed Send success / Clear All).
+  // Clear the persisted per-tab draft (confirmed Send success / Clear All).
   function clearDraft() {
     if (draftTimer) { clearTimeout(draftTimer); draftTimer = 0; }
     draftStats = null;
     try { chrome.storage.local.remove(draftKey()).catch(() => {}); } catch (_) { /* storage unavailable */ }
   }
 
-  // Restore the URL-scoped draft after UI construction. Strokes replay via
+  // Restore the per-tab URL-scoped draft after UI construction. Strokes replay via
   // redraw; element markers re-anchor through the deterministic F2 signal
   // chain (exact cssPath replay first, then stable attrs, normalized
   // text/aria, prior rect proximity) inside a guarded try/catch (never
@@ -1438,6 +1453,10 @@
     if (draftRestoredForLoad) return;
     draftRestoredForLoad = true;
     if (state.strokes.length || state.elements.length || state.annotNotes.length) return;
+    // Restore is the first draftKey() consumer on a fresh load. Init already
+    // awaited pingTabId(); reinject may not have. Resolve the tab id before
+    // reading so we never restore from a URL-only or nonce key.
+    await pingTabId();
     const key = draftKey();
     let got = null;
     try {
@@ -9116,7 +9135,7 @@
       const d = defaultPosition();
       applyPosition(d.x, d.y);
     }
-    // F3: restore the URL-scoped draft after the UI is constructed (strokes
+    // F3: restore the per-tab draft after the UI is constructed (strokes
     // replayed via redraw, element markers re-anchored best-effort). Fire
     // and forget: a storage failure must never block toolbar restore.
     restoreDraftIfAny();
