@@ -14,7 +14,7 @@ import { z } from "zod";
 
 import { INTENT_VALUES, SEVERITY_VALUES } from "./schema.ts";
 
-export const VERSION = "2.7.0";
+export const VERSION = "2.8.0";
 export const DEFAULT_HUB = "http://127.0.0.1:8787";
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
 
