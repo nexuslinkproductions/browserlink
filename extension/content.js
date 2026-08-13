@@ -3846,6 +3846,23 @@
     return true;
   }
 
+  // Text identity guard for the attrs fallback tier only. When stored
+  // descriptor text is non-trivial (whitespace-collapsed length >= 4), a
+  // candidate whose normalized live text differs, or is empty, is not
+  // accepted at attrs and falls through to later tiers. Descriptors with
+  // no stored text, or only trivial stored text, keep current attrs
+  // behavior. Does not apply to exact / text / aria / rect / ancestor.
+  function attrsTextMatchesStored(desc, el) {
+    const stored = desc && desc.text ? normalizeAnchorText(desc.text) : '';
+    if (stored.length < 4) return true;
+    if (!el || el.nodeType !== 1) return false;
+    let t = '';
+    try { t = el.textContent || ''; } catch (_) { t = ''; }
+    const live = normalizeAnchorText(t);
+    if (!live) return false;
+    return live === stored;
+  }
+
   // Deterministic fallback re-anchoring for one stored descriptor. Returns
   // { el, resolution, confidence, fallback, reason }; el is null exactly
   // when the result is unresolved. reason is diagnostics-only (never
@@ -3898,6 +3915,8 @@
     // Tier 2: stable attributes. The stored id (when present) must match
     // exactly AND the stored class tokens (when present) must overlap >= 0.8.
     // Fields absent from the stored descriptor impose no constraint.
+    // Text identity: non-trivial stored text must also match, so attrs
+    // cannot silently re-anchor onto a same-class node with changed content.
     const attrsHits = [];
     for (const el of candidates) {
       if (desc.id && el.id !== desc.id) continue;
@@ -3906,6 +3925,7 @@
         try { live = el.getAttribute('class') || ''; } catch (_) { live = ''; }
         if (anchorClassOverlap(desc.className, live) < ANCHOR_ATTRS_MIN_OVERLAP) continue;
       }
+      if (!attrsTextMatchesStored(desc, el)) continue;
       attrsHits.push(el);
     }
     if (attrsHits.length > 1) ambiguousSeen = true;
