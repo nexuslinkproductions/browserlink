@@ -3603,10 +3603,73 @@
     else disconnectAnchorRemovalObserver();
   }
 
+  // Cross-document containment: an entry anchored inside a frame lives in
+  // the FRAME's document, so node.contains(en.el) is always false when
+  // `node` is the iframe/frame element in a parent document. Walk the live
+  // frameElement chain (and contentDocument identity as a fallback).
+  // descriptor.frame.path's first index names the frame element in the top
+  // document; later hops name nested frames in that chain.
+  function entryAnchoredThroughFrame(en, frameEl) {
+    if (!en || !en.el || !frameEl) return false;
+    if (en.el === frameEl) return false;
+    try {
+      const chain = chainFrameElsOf(en.el.ownerDocument);
+      for (let i = 0; i < chain.length; i++) {
+        if (chain[i] === frameEl) return true;
+      }
+    } catch (_) { /* ok */ }
+    let inner = null;
+    try { inner = frameEl.contentDocument; } catch (_) { inner = null; }
+    if (inner) {
+      try {
+        if (en.el.ownerDocument === inner) return true;
+        let d = en.el.ownerDocument;
+        let guard = 0;
+        while (d && d !== document && guard++ < MAX_FRAME_DEPTH) {
+          if (d === inner) return true;
+          const fe = d.defaultView && d.defaultView.frameElement;
+          if (!fe) break;
+          d = fe.ownerDocument;
+        }
+      } catch (_) { /* ok */ }
+    }
+    return false;
+  }
+
+  // After a frame is inserted, walk descriptor.frame.path against the live
+  // tree and report whether any hop is this frame element.
+  function descriptorFramePathHits(desc, frameEl) {
+    if (!desc || !frameEl) return false;
+    const fp = desc.frame && Array.isArray(desc.frame.path) ? desc.frame.path : [];
+    if (!fp.length) return false;
+    let doc = document;
+    for (let i = 0; i < fp.length; i++) {
+      let frames = null;
+      try { frames = doc.querySelectorAll('iframe, frame'); } catch (_) { frames = null; }
+      if (!frames || !frames[fp[i]]) return false;
+      const fe = frames[fp[i]];
+      if (fe === frameEl) return true;
+      const probe = probeFrameDoc(fe);
+      if (!probe || !probe.doc) return false;
+      doc = probe.doc;
+    }
+    return false;
+  }
+
+  function hasDetachedAnchorThroughFrame(frameEl) {
+    for (const en of state.elements) {
+      const a = en && en.descriptor && en.descriptor.anchor;
+      if (!a || a.resolution !== 'detached') continue;
+      if (descriptorFramePathHits(en.descriptor, frameEl)) return true;
+    }
+    return false;
+  }
+
   function onAnchorMutations(mutations) {
     if (!state.elements.length || !mutations || !mutations.length) return;
     let sawRemoval = false;
     let sawAdd = false;
+    let sawFrameAdd = false;
     for (let mi = 0; mi < mutations.length; mi++) {
       const m = mutations[mi];
       const removed = m.removedNodes;
@@ -3614,25 +3677,57 @@
         for (let ri = 0; ri < removed.length; ri++) {
           const node = removed[ri];
           if (!node || node.nodeType !== 1) continue;
+          const nodeIsFrame = node.tagName === 'IFRAME' || node.tagName === 'FRAME';
+          let nestedFrames = null;
+          if (!nodeIsFrame) {
+            try { nestedFrames = node.querySelectorAll('iframe, frame'); } catch (_) { nestedFrames = null; }
+          }
           for (const en of state.elements) {
             if (!en || !en.el || (en.descriptor && en.descriptor.quoteMarker)) continue;
             let hit = false;
             try { hit = node === en.el || node.contains(en.el); } catch (_) { hit = false; }
+            let viaFrame = false;
+            if (!hit && nodeIsFrame) {
+              viaFrame = entryAnchoredThroughFrame(en, node);
+            }
+            if (!hit && !viaFrame && nestedFrames && nestedFrames.length) {
+              for (let fi = 0; fi < nestedFrames.length; fi++) {
+                if (entryAnchoredThroughFrame(en, nestedFrames[fi])) {
+                  viaFrame = true;
+                  break;
+                }
+              }
+            }
+            if (viaFrame) hit = true;
             if (!hit) continue;
-            pendingRemovalParents.set(en, m.target || null);
+            // Frame-contained entries live in a different document; the
+            // surviving parent of the iframe is not a plausible ancestor.
+            pendingRemovalParents.set(en, viaFrame ? null : (m.target || null));
             sawRemoval = true;
           }
         }
       }
-      if (!sawAdd && m.addedNodes && m.addedNodes.length) {
+      if (m.addedNodes && m.addedNodes.length) {
         for (let ai = 0; ai < m.addedNodes.length; ai++) {
           const added = m.addedNodes[ai];
-          if (added && added.nodeType === 1) { sawAdd = true; break; }
+          if (!added || added.nodeType !== 1) continue;
+          sawAdd = true;
+          if (added.tagName === 'IFRAME' || added.tagName === 'FRAME') {
+            if (hasDetachedAnchorThroughFrame(added)) sawFrameAdd = true;
+          } else if (!sawFrameAdd) {
+            let nested = null;
+            try { nested = added.querySelectorAll('iframe, frame'); } catch (_) { nested = null; }
+            if (nested) {
+              for (let fi = 0; fi < nested.length; fi++) {
+                if (hasDetachedAnchorThroughFrame(nested[fi])) { sawFrameAdd = true; break; }
+              }
+            }
+          }
         }
       }
     }
     if (sawRemoval) scheduleReanchor('removal');
-    else if (sawAdd && hasDetachedAnchor()) scheduleReanchor('remount');
+    else if (sawFrameAdd || (sawAdd && hasDetachedAnchor())) scheduleReanchor('remount');
   }
 
   // The root (document or shadow root) named by the descriptor's frame path
