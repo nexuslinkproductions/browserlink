@@ -6,6 +6,27 @@ All notable changes to browserlink are documented here. Format follows
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-08-13
+
+### Added
+
+- **Removal-aware anchoring (F11)** - feedback from aurascriptworks on reddit:
+  anchors now survive outright element removal. A bounded document
+  MutationObserver detects anchored-node removal, falls back to the nearest
+  surviving ancestor (html/body excluded), else marks the entry detached.
+- **Detached drafts and remount recovery (F12)** - removed entries persist as
+  detached ghost markers with instruction intact and auto re-anchor when
+  matching content remounts.
+- **Anchor honesty and diagnostics (F13)** - schema v1.10 adds the 'detached'
+  resolution and 'ancestor' fallback signal, markdown exports render the state
+  honestly, and lifecycle counters land in diagnostics.
+
+### Changed
+
+- **Content-ready mutation batching** - mutation-driven re-anchoring is
+  debounced and coalesced with requestAnimationFrame, with a timeout fallback
+  for hidden tabs.
+
 ### Hardened
 
 - **Unique annotation file names (H1)** - concurrent stores in the same

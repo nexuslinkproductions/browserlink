@@ -104,7 +104,7 @@ HTTP 400.
 | `viewport` | object | required; `w`, `h` positive integers |
 | `label` | string | optional; user context label, ≤ 200 chars |
 | `strokes` | array | required; each: `color` string, `width` number > 0, `points` array of ≥ 2 `[x, y]` pairs, each coordinate in `[0, 1]` (normalized to the annotation viewport) |
-| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below), `frame`/`shadow` optional deep-picker objects (schema v1.7, see below), `anchor` optional object (schema v1.8, see below), `textQuote` optional object (schema v1.9, see below) |
+| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below), `frame`/`shadow` optional deep-picker objects (schema v1.7, see below), `anchor` optional object (schema v1.10, see below), `textQuote` optional object (schema v1.9, see below) |
 | `screenshot` | string | optional (schema v1.4); PNG data URL `data:image/png;base64,<data>`; max 10MB decoded; non-PNG or invalid base64 → HTTP 400 |
 | `captureState` | object | optional (schema v1.6); Freeze State Capture metadata, exactly four typed fields (see below); unknown keys → HTTP 400 |
 | `env` | object | optional (schema v1.9); browser environment snapshot captured once at send start, exactly seven typed fields (see below); unknown keys, invalid timestamps, invalid bounds, or oversized strings → HTTP 400 |
@@ -539,17 +539,19 @@ Consumers map them back by multiplying with their own viewport dimensions.
 
 ## Versioning
 
-This is **schema v1.9**: backward compatible with v1.0 through v1.8. The
-v1.9 additions are additive and optional: the top-level `env` snapshot, the
-`textQuote` descriptor (top level and per element), and the `threadId` /
-`parentId` thread fields; older payloads validate and store unchanged.
-Schema v1.8 added optional per-element `anchor` metadata recording the
-deterministic re-anchoring resolution state. Schema v1.7 added optional
-per-element `frame` / `shadow` deep-picker metadata for shadow-root and
-iframe targets. Schema v1.6 added the per-element `intent` / `severity`
-enums and the top-level `captureState` object. Schema v1.5 extended
-`elements[].edits` with text-formatting keys. Schema v1.4 added optional
-`screenshot` / `screenshotFile`. Schema v1.1 added optional `elements[].edits`.
+This is **schema v1.10**: backward compatible with v1.0 through v1.9. The
+v1.10 additions are additive and optional: schema v1.10 extends per-element
+`anchor` metadata with the `detached` resolution state and `ancestor` fallback
+signal; older payloads validate and store unchanged.
+Schema v1.9 added an optional top-level `env` snapshot, `textQuote` descriptor,
+and `threadId` / `parentId` thread fields. Schema v1.8 added optional
+per-element `anchor` metadata recording the deterministic re-anchoring
+resolution state. Schema v1.7 added optional per-element `frame` / `shadow`
+deep-picker metadata for shadow-root and iframe targets. Schema v1.6 added the
+per-element `intent` / `severity` enums and the top-level `captureState` object.
+Schema v1.5 extended `elements[].edits` with text-formatting keys. Schema v1.4
+added optional `screenshot` / `screenshotFile`. Schema v1.1 added optional
+`elements[].edits`.
 Breaking changes (new required fields, coordinate semantics, endpoint removal)
 bump to v2 with a deprecation window: the hub accepts both versions for one
 minor release.

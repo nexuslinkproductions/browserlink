@@ -3,7 +3,7 @@
 **Annotate in your browser. Deliver to any AI harness.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v2.7.0-4a9eff.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v2.8.0-4a9eff.svg)](CHANGELOG.md)
 [![CI](https://github.com/nexuslinkproductions/browserlink/actions/workflows/ci.yml/badge.svg)](https://github.com/nexuslinkproductions/browserlink/actions)
 [![MCP](https://img.shields.io/badge/MCP-server-ffd166.svg)](docs/mcp.md)
 [![Chromium](https://img.shields.io/badge/Chromium-MV3-ff5252.svg)](extension/manifest.json)
@@ -174,6 +174,9 @@ Override the hub URL with `BROWSERLINK_HUB_URL` (default
   exact path, then stable attributes, then text/aria label, then prior
   rectangle proximity. Ambiguous targets stay unresolved - never attached
   to the wrong element, never dropped.
+- **Removal-aware anchoring** - anchors survive element removal via a bounded
+  MutationObserver, falling back to the nearest surviving ancestor or
+  persisting as detached draft ghost markers until remount.
 - **Agent-ready context** - every annotation carries a schema v1.9
   environment snapshot (capturedAt, url, viewport, userAgent, language,
   devicePixelRatio, timezoneOffset) plus optional `textQuote` and thread
