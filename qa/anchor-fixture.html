@@ -19,126 +19,30 @@ button:hover{background:#3a659b}
 </head>
 <body>
 <main>
-<section class="box">
-<h2>1. Modal (remove / recreate)</h2>
-<p class="hint">Open mounts #modal-root with #modal-target and #modal-close. Close removes it from the DOM; reopening recreates it identically.</p>
-<button id="modal-trigger">Open modal</button>
-</section>
-<section class="box">
-<h2>2. Conditional section (remove / recreate)</h2>
-<p class="hint">Check mounts #cond-section with #cond-target. Uncheck removes it from the DOM; rechecking recreates it.</p>
-<label><input type="checkbox" id="cond-toggle"> Show section</label>
-</section>
-<section class="box">
-<h2>3. SPA views (pushState swap)</h2>
-<p class="hint">Buttons push history state and swap the subtree in #spa-view. View B mounts #spa-target; view A removes it from the DOM.</p>
-<button id="view-a-btn">View A</button>
-<button id="view-b-btn">View B</button>
-<div id="spa-view"></div>
-</section>
-<section class="box">
-<h2>4. Same-origin iframe (remove / re-add)</h2>
-<p class="hint">srcdoc iframe (same origin as parent) contains #frame-target. Remove deletes the iframe; Re-add recreates it identically.</p>
-<div id="frame-holder"></div>
-<button id="frame-remove">Remove iframe</button>
-<button id="frame-add">Re-add iframe</button>
-</section>
+<section class="box"><h2>1. Modal (remove / recreate)</h2><p class="hint">Open mounts #modal-root with #modal-target and #modal-close. Close removes it from the DOM; reopening recreates it identically.</p><button id="modal-trigger">Open modal</button></section>
+<section class="box"><h2>2. Conditional section (remove / recreate)</h2><p class="hint">Check mounts #cond-section with #cond-target. Uncheck removes it from the DOM; rechecking recreates it.</p><label><input type="checkbox" id="cond-toggle"> Show section</label></section>
+<section class="box"><h2>3. SPA views (pushState swap)</h2><p class="hint">Buttons push history state and swap the subtree in #spa-view. View B mounts #spa-target; view A removes it from the DOM.</p><button id="view-a-btn">View A</button> <button id="view-b-btn">View B</button><div id="spa-view"></div></section>
+<section class="box"><h2>4. Same-origin iframe (remove / re-add)</h2><p class="hint">srcdoc iframe (same origin as parent) contains #frame-target. Remove deletes the iframe; Re-add recreates it identically.</p><div id="frame-holder"></div><button id="frame-remove">Remove iframe</button> <button id="frame-add">Re-add iframe</button></section>
+<section class="box"><h2>5. Nested holder (remove / recreate)</h2><p class="hint">Remove drops the holder; add recreates it identically.</p><div id="nested-holder" class="box"><h3>Nested holder</h3><span id="nested-target">Nested target (anchored here)</span></div><button id="nested-remove">Remove nested holder</button> <button id="nested-add">Re-add nested holder</button></section>
+<section class="box"><h2>6. Modal variant (changed content)</h2><p class="hint">Opens a modal with the same structure but different #modal-target text.</p><button id="modal-variant-trigger">Open modal variant</button></section>
+<section class="box"><h2>7. Rapid remove / add (3 cycles)</h2><p class="hint">Three remove-recreate cycles on #modal-root in one tight loop.</p><button id="rapid-remove-add">Run rapid cycles</button></section>
+<section class="box"><h2>8. Storm burst (fake vs real target)</h2><p class="hint">One synchronous burst: remove modal, mount fake #modal-target, remove it, mount the real modal.</p><button id="storm">Run storm burst</button></section>
+<section class="box"><h2>9. Multi targets (independent removal)</h2><p class="hint">Two side-by-side cards; removing A leaves B untouched.</p><div style="display:flex;gap:8px"><div id="multi-a" class="card" style="flex:1">Multi A target</div><div id="multi-b" class="card" style="flex:1">Multi B target</div></div><button id="remove-multi-a">Remove A</button> <button id="restore-multi-a">Restore A</button></section>
+<section class="box"><h2>10. Ancestor positive (same text in parent)</h2><p class="hint">Parent text includes the anchored phrase; the child span repeats it.</p><div id="anc-pos-parent" class="box">Ancestor positive text <span id="anc-pos-child">Ancestor positive text</span></div><button id="remove-anc-pos-child">Remove child span</button></section>
+<section class="box"><h2>11. SPA mutations (move / mutate)</h2><p class="hint">Shuffle moves #spa-target before the heading; mutate rewrites its text.</p><button id="spa-shuffle">Shuffle spa target</button> <button id="text-mutate">Mutate spa target text</button></section>
+<section class="box"><h2>12. Frame variant (changed content)</h2><p class="hint">Re-adds the iframe with different #frame-target text.</p><button id="frame-variant-add">Add variant iframe</button></section>
 </main>
 <script>
-// 1. Modal: create on open, remove on close, recreate identically.
-document.getElementById('modal-trigger').addEventListener('click', function () {
-  var old = document.getElementById('modal-root');
-  if (old) old.remove();
-  var root = document.createElement('div');
-  root.id = 'modal-root';
-  var dialog = document.createElement('div');
-  dialog.className = 'dialog';
-  var head = document.createElement('h3');
-  head.textContent = 'Modal dialog';
-  var card = document.createElement('div');
-  card.id = 'modal-target';
-  card.className = 'card';
-  card.textContent = 'Modal target card (anchored here)';
-  var close = document.createElement('button');
-  close.id = 'modal-close';
-  close.textContent = 'Close';
-  close.addEventListener('click', function () {
-    var r = document.getElementById('modal-root');
-    if (r) r.remove();
-  });
-  dialog.appendChild(head);
-  dialog.appendChild(card);
-  dialog.appendChild(close);
-  root.appendChild(dialog);
-  document.body.appendChild(root);
-});
-
-// 2. Conditional section: present when checked, removed when unchecked.
-var toggle = document.getElementById('cond-toggle');
-function renderCond() {
-  var existing = document.getElementById('cond-section');
-  if (toggle.checked) {
-    if (existing) return;
-    var s = document.createElement('section');
-    s.id = 'cond-section';
-    s.className = 'box';
-    var head = document.createElement('h3');
-    head.textContent = 'Conditional section';
-    var target = document.createElement('div');
-    target.id = 'cond-target';
-    target.className = 'card';
-    target.textContent = 'Cond target (anchored here)';
-    s.appendChild(head);
-    s.appendChild(target);
-    var ref = toggle.closest('section');
-    ref.parentNode.insertBefore(s, ref.nextSibling);
-  } else if (existing) {
-    existing.remove();
-  }
-}
-toggle.addEventListener('change', renderCond);
-renderCond();
-
-// 3. SPA views: pushState swaps the subtree; view B only mounts spa-target.
-var spa = document.getElementById('spa-view');
-function renderView(view) {
-  spa.textContent = '';
-  var head = document.createElement('h3');
-  head.textContent = view === 'b' ? 'View B' : 'View A';
-  spa.appendChild(head);
-  if (view === 'b') {
-    var card = document.createElement('div');
-    card.id = 'spa-target';
-    card.className = 'card';
-    card.textContent = 'SPA target card (only in view B)';
-    spa.appendChild(card);
-  }
-}
-document.getElementById('view-a-btn').addEventListener('click', function () {
-  history.pushState({ view: 'a' }, '', '?view=a');
-  renderView('a');
-});
-document.getElementById('view-b-btn').addEventListener('click', function () {
-  history.pushState({ view: 'b' }, '', '?view=b');
-  renderView('b');
-});
-renderView('a');
-
-// 4. Same-origin iframe via srcdoc; remove deletes, add recreates identically.
-var holder = document.getElementById('frame-holder');
-var SRCDOC = '<div id="frame-target" style="padding:8px;border:1px solid #6a9a9a;background:#eef7f7;border-radius:4px;font-family:system-ui,sans-serif">Frame target (anchored here)</div>';
-function addFrame() {
-  if (holder.querySelector('iframe')) return;
-  var f = document.createElement('iframe');
-  f.setAttribute('srcdoc', SRCDOC);
-  holder.appendChild(f);
-}
-document.getElementById('frame-remove').addEventListener('click', function () {
-  var f = holder.querySelector('iframe');
-  if (f) f.remove();
-});
-document.getElementById('frame-add').addEventListener('click', addFrame);
-addFrame();
+function mountModal(text){var old=document.getElementById('modal-root');if(old)old.remove();var root=document.createElement('div');root.id='modal-root';root.innerHTML='<div class="dialog"><h3>Modal dialog</h3><div id="modal-target" class="card">'+text+'</div><button id="modal-close">Close</button></div>';root.querySelector('#modal-close').onclick=function(){var r=document.getElementById('modal-root');if(r)r.remove()};document.body.appendChild(root)}
+document.getElementById('modal-trigger').onclick=function(){mountModal('Modal target card (anchored here)')};
+var toggle=document.getElementById('cond-toggle');function renderCond(){var e=document.getElementById('cond-section');if(toggle.checked){if(e)return;var s=document.createElement('section');s.id='cond-section';s.className='box';s.innerHTML='<h3>Conditional section</h3><div id="cond-target" class="card">Cond target (anchored here)</div>';toggle.closest('section').parentNode.insertBefore(s,toggle.closest('section').nextSibling)}else if(e)e.remove()}toggle.onchange=renderCond;renderCond();
+var spa=document.getElementById('spa-view');function renderView(v){spa.textContent='';var h=document.createElement('h3');h.textContent=v==='b'?'View B':'View A';spa.appendChild(h);if(v==='b'){var c=document.createElement('div');c.id='spa-target';c.className='card';c.textContent='SPA target card (only in view B)';spa.appendChild(c)}}document.getElementById('view-a-btn').onclick=function(){history.pushState({view:'a'},'','?view=a');renderView('a')};document.getElementById('view-b-btn').onclick=function(){history.pushState({view:'b'},'','?view=b');renderView('b')};renderView('a');
+var frameHolder=document.getElementById('frame-holder'),SRCDOC='<div id="frame-target" style="padding:8px;border:1px solid #6a9a9a;background:#eef7f7;border-radius:4px;font-family:system-ui,sans-serif">Frame target (anchored here)</div>';function addFrame(){if(frameHolder.querySelector('iframe'))return;var f=document.createElement('iframe');f.setAttribute('srcdoc',SRCDOC);frameHolder.appendChild(f)}document.getElementById('frame-remove').onclick=function(){var f=frameHolder.querySelector('iframe');if(f)f.remove()};document.getElementById('frame-add').onclick=addFrame;addFrame();
+var nestedBtn=document.getElementById('nested-remove');function buildNested(){if(document.getElementById('nested-holder'))return;var h=document.createElement('div');h.id='nested-holder';h.className='box';h.innerHTML='<h3>Nested holder</h3><span id="nested-target">Nested target (anchored here)</span>';nestedBtn.parentNode.insertBefore(h,nestedBtn)}nestedBtn.onclick=function(){var h=document.getElementById('nested-holder');if(h)h.remove()};document.getElementById('nested-add').onclick=buildNested;
+document.getElementById('modal-variant-trigger').onclick=function(){mountModal('Variant target (changed content)')};document.getElementById('rapid-remove-add').onclick=function(){for(var i=0;i<3;i++){var r=document.getElementById('modal-root');if(r)r.remove();mountModal('Modal target card (anchored here)')}};document.getElementById('storm').onclick=function(){var r=document.getElementById('modal-root');if(r)r.remove();var f=document.createElement('div');f.id='modal-target';f.textContent='Fake target';document.body.appendChild(f);f.remove();mountModal('Modal target card (anchored here)')};
+document.getElementById('remove-multi-a').onclick=function(){var a=document.getElementById('multi-a');if(a)a.remove()};document.getElementById('restore-multi-a').onclick=function(){if(document.getElementById('multi-a'))return;var b=document.getElementById('multi-b');if(!b)return;var a=document.createElement('div');a.id='multi-a';a.className='card';a.textContent='Multi A target';a.style.flex='1';b.parentNode.insertBefore(a,b)};
+document.getElementById('remove-anc-pos-child').onclick=function(){var c=document.getElementById('anc-pos-child');if(c)c.remove()};document.getElementById('spa-shuffle').onclick=function(){var t=document.getElementById('spa-target'),v=document.getElementById('spa-view');if(t&&v)v.insertBefore(t,v.firstChild)};document.getElementById('text-mutate').onclick=function(){var t=document.getElementById('spa-target');if(t)t.textContent='SPA target mutated text'};
+var VARIANT_SRCDOC='<div id="frame-target" style="padding:8px;border:1px solid #6a9a9a;background:#eef7f7;border-radius:4px;font-family:system-ui,sans-serif">Frame variant (changed content)</div>';document.getElementById('frame-variant-add').onclick=function(){var f=frameHolder.querySelector('iframe');if(f)f.remove();var n=document.createElement('iframe');n.setAttribute('srcdoc',VARIANT_SRCDOC);frameHolder.appendChild(n)};
 </script>
 </body>
 </html>
