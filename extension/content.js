@@ -4024,9 +4024,26 @@
       reanchorTimer = 0;
       // DOM stabilization: two frames after the debounce so SPA render
       // batches (framework updates, image loads) settle before replay.
-      requestAnimationFrame(() => requestAnimationFrame(() => {
+      // Hidden tabs can suspend rAF indefinitely (document.hidden); a
+      // 200ms timeout fallback runs the same pass if double-rAF has not.
+      let ran = false;
+      requestAnimationFrame(() => {
+        if (ran) return;
+        ran = true;
+        requestAnimationFrame(() => {
+          ran = true;
+          reanchorAllElements(reason);
+        });
+      });
+      setTimeout(() => {
+        if (ran) return;
+        ran = true;
+        if (document.hidden) {
+          reanchorAllElements(reason);
+          return;
+        }
         reanchorAllElements(reason);
-      }));
+      }, 200);
     }, REANCHOR_DEBOUNCE_MS);
   }
 
