@@ -89,18 +89,22 @@
  * Drafts (F3) persist across refresh in chrome.storage.local, keyed by the
  * canonical URL (origin + pathname + search, hash excluded): normalized
  * strokes, queued notes, and element descriptors (instruction + optional
- * intent/severity) restore on reinject. Anchor resilience (F2, schema v1.8)
- * makes restore deterministic: exact cssPath replay first, then stable
- * attributes, normalized text/aria label, then prior-rect proximity, each
- * tier gated by a documented confidence floor. Restored targets are stamped
- * with anchor metadata (resolution exact/fallback/unresolved + confidence +
- * fallback signals); entries that cannot be re-anchored stay in the draft as
- * unresolved items with their instruction intact (ghost marker at the prior
- * rect) - never attached to a wrong element, never silently dropped. SPA
- * history events (pushState/replaceState/popstate/hashchange) trigger one
- * bounded, debounced re-anchor pass after DOM stabilization. The draft
- * clears only after a confirmed successful Send or Clear All; live CSS/text
- * edits are never stored or replayed.
+ * intent/severity) restore on reinject. Anchor resilience (F2/F11/F12/F13,
+ * schema v1.10) makes restore deterministic: exact cssPath replay first,
+ * then stable attributes, normalized text/aria label, then prior-rect
+ * proximity, each tier gated by a documented confidence floor. Restored
+ * targets are stamped with anchor metadata (resolution exact/fallback/
+ * unresolved/detached + confidence + fallback signals); entries that cannot
+ * be re-anchored stay in the draft as unresolved items with their
+ * instruction intact (ghost marker at the prior rect) - never attached to a
+ * wrong element, never silently dropped. SPA history events
+ * (pushState/replaceState/popstate/hashchange) trigger one bounded,
+ * debounced re-anchor pass after DOM stabilization. A document-level
+ * MutationObserver (connected only while elements exist) detects outright
+ * node removal: nearest surviving ancestor fallback (signal ancestor) or a
+ * detached ghost that re-anchors on remount. The draft clears only after a
+ * confirmed successful Send or Clear All; live CSS/text edits are never
+ * stored or replayed.
  *
  * Onboarding (F6): the first activation shows exactly three coach marks in
  * order - pick an element (Element picker button), add an instruction (the
@@ -739,7 +743,7 @@
 
   /* ---------------- diagnostics (window.__browserlinkDiag) ----------------
    * Agnostic live diagnostics: a ring buffer of events, a lazy JSON snapshot,
-   * console helpers, init health checks (D-1..D-6), and a Ctrl+Shift+D overlay
+   * console helpers, init health checks (D-1..D-7), and a Ctrl+Shift+D overlay
    * panel inside the shadow root. Nothing here depends on Hermes specifics and
    * nothing runs on the hot path; the dump builds lazily on demand. */
   const DIAG_RING_MAX = 50;
@@ -772,6 +776,8 @@
       { code: 'D-4', name: 'refs (toolbar/chat/inspector)', ok: !!(toolbar && chatCard && inspPanel && selLayer && inspRows && inspInput) },
       { code: 'D-5', name: 'gsap loaded', ok: gsapReady === true },
       { code: 'D-6', name: 'runtime listener bound', ok: messagesBound === true },
+      // D-7: removal observer is connected exactly while elements exist.
+      { code: 'D-7', name: 'anchor removal observer', ok: !state.elements.length === !anchorRemovalObserving },
     ];
   }
 
@@ -895,12 +901,14 @@
         ambiguous: draftStats.ambiguous || 0,
         unresolved: draftStats.unresolved,
       } : { key: null, ageMs: 0, restored: 0, moved: 0, restoredStrokes: 0, restoredNotes: 0, ambiguous: 0, unresolved: 0 },
-      // Anchor resilience (F2): per-resolution counts over in-memory
-      // elements plus bounded-pass bookkeeping. Every entry carries a
-      // resolution once a restore or re-anchor pass has run; fresh picks
-      // have no anchor field yet (picked at their current location).
-      // ambiguous is a strict subset of unresolved: duplicate signals tied,
-      // so no candidate was trusted.
+      // Anchor resilience (F2/F11/F12/F13): per-resolution counts over
+      // in-memory elements plus bounded-pass bookkeeping. Every entry
+      // carries a resolution once a restore or re-anchor pass has run;
+      // fresh picks have no anchor field yet (picked at their current
+      // location). ambiguous is a strict subset of unresolved: duplicate
+      // signals tied, so no candidate was trusted. Lifecycle counters
+      // (removed/ancestorFallback/detached/remounted) accumulate across
+      // this page context until Clear All or a confirmed Send.
       anchor: {
         exact: state.elements.filter((en) => en.descriptor && en.descriptor.anchor
           && en.descriptor.anchor.resolution === 'exact').length,
@@ -908,7 +916,13 @@
           && en.descriptor.anchor.resolution === 'fallback').length,
         unresolved: state.elements.filter((en) => en.descriptor && en.descriptor.anchor
           && en.descriptor.anchor.resolution === 'unresolved').length,
+        detached: state.elements.filter((en) => en.descriptor && en.descriptor.anchor
+          && en.descriptor.anchor.resolution === 'detached').length,
         ambiguous: lastAnchorPass ? lastAnchorPass.ambiguous : 0,
+        removed: anchorLifecycle.removed,
+        ancestorFallback: anchorLifecycle.ancestorFallback,
+        remounted: anchorLifecycle.remounted,
+        observer: { connected: !!anchorRemovalObserving },
         passes: reanchorPassCount,
         lastPass: lastAnchorPass ? {
           at: lastAnchorPass.at,
@@ -917,6 +931,10 @@
           fallback: lastAnchorPass.fallback,
           ambiguous: lastAnchorPass.ambiguous,
           unresolved: lastAnchorPass.unresolved,
+          detached: lastAnchorPass.detached || 0,
+          removed: lastAnchorPass.removed || 0,
+          ancestorFallback: lastAnchorPass.ancestorFallback || 0,
+          remounted: lastAnchorPass.remounted || 0,
         } : null,
         perElement: state.elements.map((en) => {
           const a = en.descriptor && en.descriptor.anchor ? en.descriptor.anchor : null;
@@ -1243,21 +1261,24 @@
             hosts: d.shadow.hosts.slice(0, MAX_SHADOW_DEPTH),
           };
         }
-        // Schema v1.8 (F2): optional anchor metadata survives the draft so
-        // stored resolution state stays introspectable; restore recomputes
-        // the live resolution from the DOM regardless.
+        // Schema v1.10 (F2/F11/F12/F13): optional anchor metadata survives
+        // the draft so stored resolution state stays introspectable; restore
+        // recomputes the live resolution from the DOM regardless.
         if (d.anchor && typeof d.anchor === 'object' && !Array.isArray(d.anchor)) {
           const a = d.anchor;
           if (a.version === ANCHOR_VERSION
-            && (a.resolution === 'exact' || a.resolution === 'fallback' || a.resolution === 'unresolved')) {
+            && (a.resolution === 'exact' || a.resolution === 'fallback'
+              || a.resolution === 'unresolved' || a.resolution === 'detached')) {
             const anchorOut = { version: ANCHOR_VERSION, resolution: a.resolution };
             if (typeof a.confidence === 'number' && Number.isFinite(a.confidence)) {
               anchorOut.confidence = Math.max(0, Math.min(1, a.confidence));
             }
             if (Array.isArray(a.fallback) && a.fallback.length) {
-              anchorOut.fallback = a.fallback
-                .filter((s) => s === 'attrs' || s === 'text' || s === 'aria' || s === 'rect')
+              const signals = a.fallback
+                .filter((s) => s === 'attrs' || s === 'text' || s === 'aria'
+                  || s === 'rect' || s === 'ancestor')
                 .slice(0, 4);
+              if (signals.length) anchorOut.fallback = signals;
             }
             out.anchor = anchorOut;
           }
@@ -1496,6 +1517,10 @@
           // resolve through the same fallback signals.
           res = reanchorElement(desc);
           if (res.el) el = res.el;
+          else if (desc.anchor && desc.anchor.resolution === 'detached') {
+            // Still gone after refresh: keep detached so remount can recover.
+            res = detachedResult();
+          }
         }
       } catch (_) { el = null; res = null; }
       const d2 = {
@@ -1557,12 +1582,15 @@
       markOutlineAnchor(outlineEl, res.resolution);
       if (res.resolution === 'exact') restored += 1;
       else if (res.resolution === 'fallback') { restored += 1; moved += 1; }
-      else {
+      else if (res.resolution === 'detached') {
+        unresolved += 1;
+      } else {
         unresolved += 1;
         if (res.reason === 'ambiguous') ambiguous += 1;
       }
       if (d2.index > maxIndex) maxIndex = d2.index;
     }
+    syncAnchorRemovalObserver();
     if (maxIndex >= state.nextIndex) state.nextIndex = maxIndex + 1;
     // F8: restore the thread identity + ordered item history. The block is
     // optional (pre-F8 drafts have none) and sanitized: ids and text are
@@ -3406,8 +3434,8 @@
     return fp + ';' + cs + ';' + hosts + ';' + (d.cssPath || '');
   }
 
-  /* ---------------- Anchor resilience (F2) ----------------
-   * Mutation-resistant fallback re-anchoring (schema v1.8). When an
+  /* ---------------- Anchor resilience (F2/F11/F12/F13) ----------------
+   * Mutation-resistant fallback re-anchoring (schema v1.10). When an
    * element's exact cssPath no longer resolves (DOM drift, SPA route
    * change, refresh after mutation), replay re-anchors deterministically
    * through a fixed signal chain:
@@ -3422,21 +3450,27 @@
    * visible) candidate; empty tiers, duplicate candidates, and hidden or
    * detached elements all fall through to the next tier. When no tier wins,
    * the element stays UNRESOLVED: its instruction is never attached to a
-   * wrong element and never dropped. Every outcome is stamped as anchor
-   * metadata on the descriptor (version 1, strict resolution enum,
-   * confidence, fallback signal list) and surfaces in diagnostics.
+   * wrong element and never dropped. Outright removal (modal close,
+   * conditional unmount) is a different failure than drift: a document
+   * MutationObserver records the surviving former parent and the next
+   * removal pass tries ancestor fallback, else marks the entry DETACHED
+   * (ghost at the prior rect). Added nodes schedule a remount pass over
+   * detached entries only. Every outcome is stamped as anchor metadata
+   * (version 1, strict resolution enum, confidence, fallback signal list)
+   * and surfaces in diagnostics.
    */
   const ANCHOR_VERSION = 1;
   const ANCHOR_ATTRS_MIN_OVERLAP = 0.8;   // class-token overlap floor (tier 2)
   const ANCHOR_RECT_MAX_DIST = 0.18;      // normalized center distance cap (tier 4)
-  // Confidence per winning path (schema v1.8: 0..1).
-  const ANCHOR_CONFIDENCE = { exact: 1, attrs: 0.95, text: 0.85, aria: 0.85, rect: 0.7 };
+  // Confidence per winning path (schema v1.10: 0..1). Ancestor sits above
+  // the 0.7 floor and below the attrs tier.
+  const ANCHOR_CONFIDENCE = { exact: 1, attrs: 0.95, text: 0.85, aria: 0.85, ancestor: 0.75, rect: 0.7 };
   // Documented confidence floor: a winning path below this is never
   // attached to - the entry stays unresolved instead of risking a wrong
   // element. All fixed tier confidences sit at or above the floor.
   const ANCHOR_CONFIDENCE_MIN = 0.7;
-  const ANCHOR_RESOLUTIONS = ['exact', 'fallback', 'unresolved'];
-  const ANCHOR_FALLBACK_SIGNALS = ['attrs', 'text', 'aria', 'rect'];
+  const ANCHOR_RESOLUTIONS = ['exact', 'fallback', 'unresolved', 'detached'];
+  const ANCHOR_FALLBACK_SIGNALS = ['attrs', 'text', 'aria', 'rect', 'ancestor'];
   const REANCHOR_DEBOUNCE_MS = 350; // DOM stabilization wait after SPA events
   const REANCHOR_CANDIDATE_CAP = 256; // bounded candidate scan per element
   let reanchorTimer = 0;
@@ -3445,6 +3479,13 @@
   // pass; after Clear All or a confirmed Send the in-memory list empties
   // and the next trigger recomputes from scratch.
   let lastAnchorPass = null;
+  // Lifecycle counters (F13): accumulate across this page context until
+  // Clear All or a confirmed Send. removed = anchors whose node left the
+  // tree this run; ancestorFallback / detached / remounted are outcomes.
+  const anchorLifecycle = { removed: 0, ancestorFallback: 0, detached: 0, remounted: 0 };
+  let pendingRemovalParents = new WeakMap();
+  let anchorRemovalObserver = null;
+  let anchorRemovalObserving = false;
 
   function normalizeAnchorText(s) {
     return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -3458,6 +3499,132 @@
     let r = null;
     try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
     return !!(r && r.width >= 1 && r.height >= 1);
+  }
+
+  function isExcludedAncestor(el) {
+    if (!el || el.nodeType !== 1) return true;
+    let tag = '';
+    try { tag = String(el.tagName || '').toLowerCase(); } catch (_) { tag = ''; }
+    if (tag === 'html' || tag === 'body') return true;
+    try {
+      if (el.id === 'hermes-annotate-host') return true;
+      if (host && (el === host || host.contains(el))) return true;
+    } catch (_) { /* keep checking */ }
+    return false;
+  }
+
+  // Reduced-strictness identity gate for nearest surviving ancestor: the
+  // former parent must be a plausible container (tag match OR subtree
+  // contains the stored text/aria signals). Never claims html/body/host.
+  function ancestorIsPlausible(el, desc) {
+    if (!el || !desc || !isUsableAnchorTarget(el) || isExcludedAncestor(el)) return false;
+    const tag = String(desc.tag || '').toLowerCase();
+    let liveTag = '';
+    try { liveTag = String(el.tagName || '').toLowerCase(); } catch (_) { liveTag = ''; }
+    if (tag && liveTag === tag) return true;
+    const wantText = desc.text ? normalizeAnchorText(desc.text) : '';
+    const wantAria = desc.ariaLabel ? normalizeAnchorText(desc.ariaLabel) : '';
+    if (wantText) {
+      let t = '';
+      try { t = el.textContent || ''; } catch (_) { t = ''; }
+      if (wantText && normalizeAnchorText(t).indexOf(wantText) !== -1) return true;
+    }
+    if (wantAria) {
+      try {
+        const selfAria = el.getAttribute('aria-label') || '';
+        if (normalizeAnchorText(selfAria) === wantAria) return true;
+        const labeled = el.querySelectorAll ? el.querySelectorAll('[aria-label]') : [];
+        for (let i = 0; i < labeled.length; i++) {
+          const a = labeled[i].getAttribute('aria-label') || '';
+          if (normalizeAnchorText(a) === wantAria) return true;
+        }
+      } catch (_) { /* ignore */ }
+    }
+    return false;
+  }
+
+  function detachedResult() {
+    return { el: null, resolution: 'detached', confidence: 0, fallback: [], reason: 'removed' };
+  }
+
+  function resetAnchorLifecycle() {
+    anchorLifecycle.removed = 0;
+    anchorLifecycle.ancestorFallback = 0;
+    anchorLifecycle.detached = 0;
+    anchorLifecycle.remounted = 0;
+    pendingRemovalParents = new WeakMap();
+  }
+
+  function hasDetachedAnchor() {
+    for (const en of state.elements) {
+      const a = en && en.descriptor && en.descriptor.anchor;
+      if (a && a.resolution === 'detached') return true;
+    }
+    return false;
+  }
+
+  function disconnectAnchorRemovalObserver() {
+    if (!anchorRemovalObserver || !anchorRemovalObserving) {
+      anchorRemovalObserving = false;
+      return;
+    }
+    try { anchorRemovalObserver.disconnect(); } catch (_) { /* ok */ }
+    anchorRemovalObserving = false;
+  }
+
+  function connectAnchorRemovalObserver() {
+    if (anchorRemovalObserving) return;
+    if (typeof MutationObserver !== 'function') return;
+    if (!anchorRemovalObserver) {
+      try { anchorRemovalObserver = new MutationObserver(onAnchorMutations); }
+      catch (_) { return; }
+    }
+    try {
+      const root = document.documentElement || document;
+      anchorRemovalObserver.observe(root, { childList: true, subtree: true });
+      anchorRemovalObserving = true;
+    } catch (_) {
+      anchorRemovalObserving = false;
+    }
+  }
+
+  // Lazy: observe only while in-memory elements exist. Disconnecting when
+  // the list is empty is what keeps the observer off the idle hot path.
+  function syncAnchorRemovalObserver() {
+    if (state.elements.length) connectAnchorRemovalObserver();
+    else disconnectAnchorRemovalObserver();
+  }
+
+  function onAnchorMutations(mutations) {
+    if (!state.elements.length || !mutations || !mutations.length) return;
+    let sawRemoval = false;
+    let sawAdd = false;
+    for (let mi = 0; mi < mutations.length; mi++) {
+      const m = mutations[mi];
+      const removed = m.removedNodes;
+      if (removed && removed.length) {
+        for (let ri = 0; ri < removed.length; ri++) {
+          const node = removed[ri];
+          if (!node || node.nodeType !== 1) continue;
+          for (const en of state.elements) {
+            if (!en || !en.el || (en.descriptor && en.descriptor.quoteMarker)) continue;
+            let hit = false;
+            try { hit = node === en.el || node.contains(en.el); } catch (_) { hit = false; }
+            if (!hit) continue;
+            pendingRemovalParents.set(en, m.target || null);
+            sawRemoval = true;
+          }
+        }
+      }
+      if (!sawAdd && m.addedNodes && m.addedNodes.length) {
+        for (let ai = 0; ai < m.addedNodes.length; ai++) {
+          const added = m.addedNodes[ai];
+          if (added && added.nodeType === 1) { sawAdd = true; break; }
+        }
+      }
+    }
+    if (sawRemoval) scheduleReanchor('removal');
+    else if (sawAdd && hasDetachedAnchor()) scheduleReanchor('remount');
   }
 
   // The root (document or shadow root) named by the descriptor's frame path
@@ -3673,7 +3840,7 @@
     };
   }
 
-  // Stamp schema v1.8 anchor metadata onto a descriptor (truthful, bounded).
+  // Stamp schema v1.10 anchor metadata onto a descriptor (truthful, bounded).
   function stampAnchor(d, res) {
     if (!d || !res) return;
     d.anchor = {
@@ -3688,18 +3855,22 @@
     if (!outlineEl) return;
     outlineEl.classList.toggle('is-moved', resolution === 'fallback');
     outlineEl.classList.toggle('is-unresolved', resolution === 'unresolved');
-    // Small state chip (moved/unresolved) keeps the marker self-explanatory
-    // without opening diagnostics; exact entries carry no chip.
+    outlineEl.classList.toggle('is-detached', resolution === 'detached');
+    // Small state chip (moved/unresolved/detached) keeps the marker
+    // self-explanatory without opening diagnostics; exact entries carry no
+    // chip.
     let chip = outlineEl.querySelector('.comet-el-state');
-    if (resolution === 'fallback' || resolution === 'unresolved') {
+    if (resolution === 'fallback' || resolution === 'unresolved' || resolution === 'detached') {
       if (!chip) {
         chip = document.createElement('span');
         chip.className = 'comet-el-state';
         outlineEl.appendChild(chip);
       }
-      chip.textContent = resolution === 'fallback' ? 'moved' : 'unresolved';
+      chip.textContent = resolution === 'fallback' ? 'moved'
+        : (resolution === 'detached' ? 'detached' : 'unresolved');
       chip.classList.toggle('is-moved', resolution === 'fallback');
       chip.classList.toggle('is-unresolved', resolution === 'unresolved');
+      chip.classList.toggle('is-detached', resolution === 'detached');
     } else if (chip) {
       chip.remove();
     }
@@ -3724,28 +3895,85 @@
     markOutlineAnchor(en.outlineEl, res.resolution);
   }
 
-  // One bounded re-anchor pass over every in-memory element. Triggered by
-  // SPA history events (debounced + double-rAF DOM stabilization) and by
-  // harness assertions. Each pass runs at most once per trigger; it never
-  // loops, never duplicates markers or listeners, and never drops an
-  // instruction: entries that stay unresolved keep their descriptor and
-  // render as an unresolved ghost at the prior rect.
+  // One bounded re-anchor pass. Triggered by SPA history events, removal
+  // and remount observer ticks (debounced + double-rAF), and harness
+  // assertions. Each trigger produces at most one pass; it never loops,
+  // never mutates the page, and never drops an instruction. Removal-aware
+  // entries try the normal ladder first, then nearest surviving ancestor,
+  // else DETACHED. Remount passes walk DETACHED entries only.
   function reanchorAllElements(reason) {
-    const counts = { exact: 0, fallback: 0, ambiguous: 0, unresolved: 0, reason: reason || 'manual' };
-    if (!state.elements.length) return counts;
-    // SPA navigation can swap iframes; refresh the registry once per pass
-    // (idempotent, bounded by the existing WeakSet/Map guards).
+    const why = reason || 'manual';
+    const remountOnly = why === 'remount';
+    const counts = {
+      exact: 0,
+      fallback: 0,
+      ambiguous: 0,
+      unresolved: 0,
+      detached: 0,
+      removed: 0,
+      ancestorFallback: 0,
+      remounted: 0,
+      reason: why,
+    };
+    if (!state.elements.length) {
+      syncAnchorRemovalObserver();
+      return counts;
+    }
     try { refreshFrameRegistry(); } catch (_) { /* ok */ }
     for (const en of state.elements) {
       if (!en || !en.descriptor) continue;
-      const res = reanchorElement(en.descriptor);
-      counts[res.resolution] += 1;
-      // Ambiguous outcomes are a strict subset of unresolved: duplicate
-      // signals tied, so no candidate was trusted. Reported separately in
-      // diagnostics so replay behavior is fully inspectable.
-      if (res.resolution === 'unresolved' && res.reason === 'ambiguous') counts.ambiguous += 1;
+      if (en.descriptor.quoteMarker) continue;
+      const storedDetached = !!(en.descriptor.anchor && en.descriptor.anchor.resolution === 'detached');
+      const wasRemoved = pendingRemovalParents.has(en);
+      if (remountOnly && !storedDetached) continue;
+      if (wasRemoved) {
+        counts.removed += 1;
+        anchorLifecycle.removed += 1;
+      }
+      let res = reanchorElement(en.descriptor);
+      if (res.el && (res.resolution === 'exact' || res.resolution === 'fallback')) {
+        if (storedDetached) {
+          counts.remounted += 1;
+          anchorLifecycle.remounted += 1;
+        }
+        counts[res.resolution] += 1;
+        applyAnchorResolution(en, res);
+        if (wasRemoved) pendingRemovalParents.delete(en);
+        continue;
+      }
+      if (wasRemoved) {
+        const parent = pendingRemovalParents.get(en);
+        pendingRemovalParents.delete(en);
+        if (parent && ancestorIsPlausible(parent, en.descriptor)) {
+          res = {
+            el: parent,
+            resolution: 'fallback',
+            confidence: ANCHOR_CONFIDENCE.ancestor,
+            fallback: ['ancestor'],
+            reason: 'ancestor',
+          };
+          counts.ancestorFallback += 1;
+          anchorLifecycle.ancestorFallback += 1;
+          counts.fallback += 1;
+          applyAnchorResolution(en, res);
+          continue;
+        }
+        res = detachedResult();
+        counts.detached += 1;
+        anchorLifecycle.detached += 1;
+        applyAnchorResolution(en, res);
+        continue;
+      }
+      if (storedDetached || remountOnly) {
+        counts.detached += 1;
+        applyAnchorResolution(en, detachedResult());
+        continue;
+      }
+      counts.unresolved += 1;
+      if (res.reason === 'ambiguous') counts.ambiguous += 1;
       applyAnchorResolution(en, res);
     }
+    pendingRemovalParents = new WeakMap();
     reanchorPassCount += 1;
     lastAnchorPass = {
       at: new Date().toISOString(),
@@ -3754,20 +3982,28 @@
       fallback: counts.fallback,
       ambiguous: counts.ambiguous,
       unresolved: counts.unresolved,
+      detached: counts.detached,
+      removed: counts.removed,
+      ancestorFallback: counts.ancestorFallback,
+      remounted: counts.remounted,
     };
     positionSelections();
     updateSelectionUI();
-    if (counts.unresolved) {
+    if (counts.detached) {
+      setStatus(counts.detached + ' element' + (counts.detached === 1 ? '' : 's')
+        + ' detached - watching for remount', 'warn');
+    } else if (counts.unresolved) {
       setStatus(counts.unresolved + ' element' + (counts.unresolved === 1 ? '' : 's') + ' unresolved', 'warn');
     } else if (counts.fallback) {
       setStatus(counts.fallback + ' element' + (counts.fallback === 1 ? '' : 's') + ' re-anchored (moved)', 'ok');
     }
     diagLog('anchor:pass', 'reason=' + counts.reason + ' exact=' + counts.exact
       + ' fallback=' + counts.fallback + ' ambiguous=' + counts.ambiguous
-      + ' unresolved=' + counts.unresolved);
-    // The refreshed descriptors (live rects, anchor state) persist under the
-    // CURRENT canonical key; re-anchoring never deletes stored drafts.
+      + ' unresolved=' + counts.unresolved + ' detached=' + counts.detached
+      + ' removed=' + counts.removed + ' ancestor=' + counts.ancestorFallback
+      + ' remounted=' + counts.remounted);
     persistDraft();
+    syncAnchorRemovalObserver();
     return counts;
   }
 
@@ -4687,6 +4923,7 @@
     updateCount();
     updateSelectionPulse();
     persistDraft(); // F3: selection removed from the persisted draft
+    syncAnchorRemovalObserver();
   }
 
   function clearCommittedSelections() {
@@ -7893,12 +8130,13 @@
       if (!hosts.length) delete d.shadow;
       else d.shadow = { depth: hosts.length, hosts };
     }
-    // Schema v1.8 (F2): ship optional anchor metadata in a canonical shape;
-    // malformed or empty values are dropped so payloads stay valid under the
-    // hub's strict nested-key validation.
+    // Schema v1.10 (F2/F11/F12/F13): ship optional anchor metadata in a
+    // canonical shape; malformed or empty values are dropped so payloads
+    // stay valid under the hub's strict nested-key validation.
     if (d.anchor && typeof d.anchor === 'object' && !Array.isArray(d.anchor)) {
       const a = d.anchor;
-      const okRes = a.resolution === 'exact' || a.resolution === 'fallback' || a.resolution === 'unresolved';
+      const okRes = a.resolution === 'exact' || a.resolution === 'fallback'
+        || a.resolution === 'unresolved' || a.resolution === 'detached';
       if (a.version === ANCHOR_VERSION && okRes) {
         const anchorOut = { version: ANCHOR_VERSION, resolution: a.resolution };
         if (typeof a.confidence === 'number' && Number.isFinite(a.confidence)) {
@@ -7906,7 +8144,8 @@
         }
         if (Array.isArray(a.fallback) && a.fallback.length) {
           const signals = a.fallback
-            .filter((s) => s === 'attrs' || s === 'text' || s === 'aria' || s === 'rect')
+            .filter((s) => s === 'attrs' || s === 'text' || s === 'aria'
+              || s === 'rect' || s === 'ancestor')
             .slice(0, 4);
           if (signals.length) anchorOut.fallback = signals;
         }

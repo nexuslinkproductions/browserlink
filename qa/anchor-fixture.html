@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Anchor Fixture</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#f4f6f8;color:#222;margin:0;padding:16px}
+main{max-width:760px;margin:0 auto}
+.box{border:1px solid #b8c2cc;border-radius:6px;padding:12px;margin:16px 0;background:#fff}
+h2{margin:0 0 4px;font-size:15px;color:#334}
+.hint{font-size:12px;color:#667;margin:2px 0 8px}
+button{border:1px solid #4a7ab5;background:#4a7ab5;color:#fff;border-radius:4px;padding:6px 14px;font-size:14px;cursor:pointer}
+button:hover{background:#3a659b}
+.card{border:1px solid #6a9a9a;background:#eef7f7;border-radius:4px;padding:8px;margin:8px 0}
+#modal-root{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:10}
+#modal-root .dialog{background:#fff;border:2px solid #4a7ab5;border-radius:8px;padding:16px;width:320px}
+#frame-holder iframe{width:100%;height:90px;border:1px solid #b8c2cc;border-radius:4px;background:#fff}
+</style>
+</head>
+<body>
+<main>
+<section class="box">
+<h2>1. Modal (remove / recreate)</h2>
+<p class="hint">Open mounts #modal-root with #modal-target and #modal-close. Close removes it from the DOM; reopening recreates it identically.</p>
+<button id="modal-trigger">Open modal</button>
+</section>
+<section class="box">
+<h2>2. Conditional section (remove / recreate)</h2>
+<p class="hint">Check mounts #cond-section with #cond-target. Uncheck removes it from the DOM; rechecking recreates it.</p>
+<label><input type="checkbox" id="cond-toggle"> Show section</label>
+</section>
+<section class="box">
+<h2>3. SPA views (pushState swap)</h2>
+<p class="hint">Buttons push history state and swap the subtree in #spa-view. View B mounts #spa-target; view A removes it from the DOM.</p>
+<button id="view-a-btn">View A</button>
+<button id="view-b-btn">View B</button>
+<div id="spa-view"></div>
+</section>
+<section class="box">
+<h2>4. Same-origin iframe (remove / re-add)</h2>
+<p class="hint">srcdoc iframe (same origin as parent) contains #frame-target. Remove deletes the iframe; Re-add recreates it identically.</p>
+<div id="frame-holder"></div>
+<button id="frame-remove">Remove iframe</button>
+<button id="frame-add">Re-add iframe</button>
+</section>
+</main>
+<script>
+// 1. Modal: create on open, remove on close, recreate identically.
+document.getElementById('modal-trigger').addEventListener('click', function () {
+  var old = document.getElementById('modal-root');
+  if (old) old.remove();
+  var root = document.createElement('div');
+  root.id = 'modal-root';
+  var dialog = document.createElement('div');
+  dialog.className = 'dialog';
+  var head = document.createElement('h3');
+  head.textContent = 'Modal dialog';
+  var card = document.createElement('div');
+  card.id = 'modal-target';
+  card.className = 'card';
+  card.textContent = 'Modal target card (anchored here)';
+  var close = document.createElement('button');
+  close.id = 'modal-close';
+  close.textContent = 'Close';
+  close.addEventListener('click', function () {
+    var r = document.getElementById('modal-root');
+    if (r) r.remove();
+  });
+  dialog.appendChild(head);
+  dialog.appendChild(card);
+  dialog.appendChild(close);
+  root.appendChild(dialog);
+  document.body.appendChild(root);
+});
+
+// 2. Conditional section: present when checked, removed when unchecked.
+var toggle = document.getElementById('cond-toggle');
+function renderCond() {
+  var existing = document.getElementById('cond-section');
+  if (toggle.checked) {
+    if (existing) return;
+    var s = document.createElement('section');
+    s.id = 'cond-section';
+    s.className = 'box';
+    var head = document.createElement('h3');
+    head.textContent = 'Conditional section';
+    var target = document.createElement('div');
+    target.id = 'cond-target';
+    target.className = 'card';
+    target.textContent = 'Cond target (anchored here)';
+    s.appendChild(head);
+    s.appendChild(target);
+    var ref = toggle.closest('section');
+    ref.parentNode.insertBefore(s, ref.nextSibling);
+  } else if (existing) {
+    existing.remove();
+  }
+}
+toggle.addEventListener('change', renderCond);
+renderCond();
+
+// 3. SPA views: pushState swaps the subtree; view B only mounts spa-target.
+var spa = document.getElementById('spa-view');
+function renderView(view) {
+  spa.textContent = '';
+  var head = document.createElement('h3');
+  head.textContent = view === 'b' ? 'View B' : 'View A';
+  spa.appendChild(head);
+  if (view === 'b') {
+    var card = document.createElement('div');
+    card.id = 'spa-target';
+    card.className = 'card';
+    card.textContent = 'SPA target card (only in view B)';
+    spa.appendChild(card);
+  }
+}
+document.getElementById('view-a-btn').addEventListener('click', function () {
+  history.pushState({ view: 'a' }, '', '?view=a');
+  renderView('a');
+});
+document.getElementById('view-b-btn').addEventListener('click', function () {
+  history.pushState({ view: 'b' }, '', '?view=b');
+  renderView('b');
+});
+renderView('a');
+
+// 4. Same-origin iframe via srcdoc; remove deletes, add recreates identically.
+var holder = document.getElementById('frame-holder');
+var SRCDOC = '<div id="frame-target" style="padding:8px;border:1px solid #6a9a9a;background:#eef7f7;border-radius:4px;font-family:system-ui,sans-serif">Frame target (anchored here)</div>';
+function addFrame() {
+  if (holder.querySelector('iframe')) return;
+  var f = document.createElement('iframe');
+  f.setAttribute('srcdoc', SRCDOC);
+  holder.appendChild(f);
+}
+document.getElementById('frame-remove').addEventListener('click', function () {
+  var f = holder.querySelector('iframe');
+  if (f) f.remove();
+});
+document.getElementById('frame-add').addEventListener('click', addFrame);
+addFrame();
+</script>
+</body>
+</html>
