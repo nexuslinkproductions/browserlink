@@ -4029,8 +4029,8 @@
       let ran = false;
       requestAnimationFrame(() => {
         if (ran) return;
-        ran = true;
         requestAnimationFrame(() => {
+          if (ran) return;
           ran = true;
           reanchorAllElements(reason);
         });
