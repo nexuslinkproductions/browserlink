@@ -349,6 +349,11 @@
   color: #ffffff;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
 }
+.comet-el-state.is-detached {
+  background: rgba(90, 98, 118, 0.95);
+  color: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
 
 /* Anchor resilience (F2): truthful marker states after draft replay. A
    re-anchored (moved) marker turns amber to signal the target moved; an
@@ -372,6 +377,18 @@
 }
 .comet-el.is-unresolved .comet-el-badge {
   background: linear-gradient(180deg, #b6bcc8, #8b919e);
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.30), 0 2px 6px rgba(0, 0, 0, 0.35);
+}
+/* Removal-aware anchoring (F11/F12): a detached marker stays as a ghost at
+   the prior rect with a cooler gray badge, distinct from unresolved drift. */
+.comet-el.is-detached {
+  border-color: rgba(120, 128, 148, 0.90);
+  border-style: dotted;
+  opacity: 0.50;
+  box-shadow: none;
+}
+.comet-el.is-detached .comet-el-badge {
+  background: linear-gradient(180deg, #9aa3b4, #6f7788);
   box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.30), 0 2px 6px rgba(0, 0, 0, 0.35);
 }
 

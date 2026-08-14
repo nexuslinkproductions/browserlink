@@ -144,12 +144,12 @@ describe("HTTP routes", () => {
       try {
         let res = await request(hub.base, "GET", "/health");
         assert.equal(res.status, 200);
-        assert.deepEqual(res.json, { ok: true, version: "2.7.0" });
+        assert.deepEqual(res.json, { ok: true, version: "2.8.0" });
 
         res = await request(hub.base, "GET", "/status");
         assert.equal(res.status, 200);
         assert.equal(res.json.ok, true);
-        assert.equal(res.json.version, "2.7.0");
+        assert.equal(res.json.version, "2.8.0");
         assert.equal(res.json.dataDir, dir);
         assert.equal(res.json.target, null);
         assert.ok(Array.isArray(res.json.adapters));
