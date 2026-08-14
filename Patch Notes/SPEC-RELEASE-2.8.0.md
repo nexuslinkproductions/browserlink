@@ -23,7 +23,10 @@ Aura Scriptworks, a peer extension studio, left a Reddit comment challenging Bro
 
 ## Fixed
 
-- (none in this release)
+- iframe removal detection now resolves through the cached frame registry because Chrome nulls the live cross-document bridge before the observer callback (F11 follow-up);
+- the attrs fallback tier requires matching text when stored text exists, ending silent fuzzy re-anchoring to changed content (F11 follow-up);
+- the hidden-tab re-anchor fallback marks the pass only at execution, closing a first-frame/second-frame race (F11 follow-up);
+- persistent drafts are keyed per tab so same-page tabs no longer share or overwrite each other's drafts (C6 isolation).
 
 ## Roadmap
 

@@ -1,4 +1,4 @@
-/** Shared annotation schema (v1.9), single source of truth for hub + MCP. */
+/** Shared annotation schema (v1.10), single source of truth for hub + MCP. */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
