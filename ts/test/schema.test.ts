@@ -340,9 +340,9 @@ describe("validatePayload", () => {
     );
   });
 
-  // ---- Schema v1.8 (F2 anchor resilience): optional anchor metadata ----
+  // ---- Schema v1.10 (F2/F11/F12/F13 anchor resilience) ----
 
-  it("accepts elements with valid anchor metadata (schema v1.8)", () => {
+  it("accepts elements with valid anchor metadata (schema v1.10)", () => {
     const p = payload();
     p.elements = [
       { index: 1, tag: "button", anchor: { version: 1, resolution: "exact", confidence: 1 } },
@@ -372,6 +372,12 @@ describe("validatePayload", () => {
         },
       },
       { index: 6, tag: "div", anchor: { version: 1, resolution: "unresolved", confidence: 0 } },
+      { index: 7, tag: "div", anchor: { version: 1, resolution: "detached", confidence: 0 } },
+      {
+        index: 8,
+        tag: "section",
+        anchor: { version: 1, resolution: "fallback", confidence: 0.75, fallback: ["ancestor"] },
+      },
     ];
     assert.equal(validatePayload(p), null);
   });
@@ -429,17 +435,17 @@ describe("validatePayload", () => {
     ];
     assert.equal(
       validatePayload(p),
-      "elements[0].anchor.resolution must be one of exact, fallback, unresolved",
+      "elements[0].anchor.resolution must be one of exact, fallback, unresolved, detached",
     );
     p.elements = [{ index: 1, tag: "button", anchor: { version: 1, resolution: 1 } }];
     assert.equal(
       validatePayload(p),
-      "elements[0].anchor.resolution must be one of exact, fallback, unresolved",
+      "elements[0].anchor.resolution must be one of exact, fallback, unresolved, detached",
     );
     p.elements = [{ index: 1, tag: "button", anchor: { version: 1 } }];
     assert.equal(
       validatePayload(p),
-      "elements[0].anchor.resolution must be one of exact, fallback, unresolved",
+      "elements[0].anchor.resolution must be one of exact, fallback, unresolved, detached",
     );
   });
 
@@ -491,7 +497,7 @@ describe("validatePayload", () => {
     ];
     assert.equal(
       validatePayload(p),
-      "elements[0].anchor.fallback[0] must be one of attrs, text, aria, rect",
+      "elements[0].anchor.fallback[0] must be one of attrs, text, aria, rect, ancestor",
     );
     p.elements = [
       {

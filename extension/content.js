@@ -86,21 +86,26 @@
  * elements[] entries carry "edits": {property: desiredValue} when edited.
  * status shows "bridge offline" on failure; success clears the status (the
  * markers are cleared only after a successful send.
- * Drafts (F3) persist across refresh in chrome.storage.local, keyed by the
- * canonical URL (origin + pathname + search, hash excluded): normalized
- * strokes, queued notes, and element descriptors (instruction + optional
- * intent/severity) restore on reinject. Anchor resilience (F2, schema v1.8)
- * makes restore deterministic: exact cssPath replay first, then stable
- * attributes, normalized text/aria label, then prior-rect proximity, each
- * tier gated by a documented confidence floor. Restored targets are stamped
- * with anchor metadata (resolution exact/fallback/unresolved + confidence +
- * fallback signals); entries that cannot be re-anchored stay in the draft as
- * unresolved items with their instruction intact (ghost marker at the prior
- * rect) - never attached to a wrong element, never silently dropped. SPA
- * history events (pushState/replaceState/popstate/hashchange) trigger one
- * bounded, debounced re-anchor pass after DOM stabilization. The draft
- * clears only after a confirmed successful Send or Clear All; live CSS/text
- * edits are never stored or replayed.
+ * Drafts (F3) persist across refresh in chrome.storage.local, keyed per tab
+ * plus the canonical URL (origin + pathname + search, hash excluded):
+ * normalized strokes, queued notes, and element descriptors (instruction
+ * + optional intent/severity) restore on reinject. Same-page tabs never
+ * share a draft. Anchor resilience (F2/F11/F12/F13,
+ * schema v1.10) makes restore deterministic: exact cssPath replay first,
+ * then stable attributes, normalized text/aria label, then prior-rect
+ * proximity, each tier gated by a documented confidence floor. Restored
+ * targets are stamped with anchor metadata (resolution exact/fallback/
+ * unresolved/detached + confidence + fallback signals); entries that cannot
+ * be re-anchored stay in the draft as unresolved items with their
+ * instruction intact (ghost marker at the prior rect) - never attached to a
+ * wrong element, never silently dropped. SPA history events
+ * (pushState/replaceState/popstate/hashchange) trigger one bounded,
+ * debounced re-anchor pass after DOM stabilization. A document-level
+ * MutationObserver (connected only while elements exist) detects outright
+ * node removal: nearest surviving ancestor fallback (signal ancestor) or a
+ * detached ghost that re-anchors on remount. The draft clears only after a
+ * confirmed successful Send or Clear All; live CSS/text edits are never
+ * stored or replayed.
  *
  * Onboarding (F6): the first activation shows exactly three coach marks in
  * order - pick an element (Element picker button), add an instruction (the
@@ -739,7 +744,7 @@
 
   /* ---------------- diagnostics (window.__browserlinkDiag) ----------------
    * Agnostic live diagnostics: a ring buffer of events, a lazy JSON snapshot,
-   * console helpers, init health checks (D-1..D-6), and a Ctrl+Shift+D overlay
+   * console helpers, init health checks (D-1..D-7), and a Ctrl+Shift+D overlay
    * panel inside the shadow root. Nothing here depends on Hermes specifics and
    * nothing runs on the hot path; the dump builds lazily on demand. */
   const DIAG_RING_MAX = 50;
@@ -772,6 +777,8 @@
       { code: 'D-4', name: 'refs (toolbar/chat/inspector)', ok: !!(toolbar && chatCard && inspPanel && selLayer && inspRows && inspInput) },
       { code: 'D-5', name: 'gsap loaded', ok: gsapReady === true },
       { code: 'D-6', name: 'runtime listener bound', ok: messagesBound === true },
+      // D-7: removal observer is connected exactly while elements exist.
+      { code: 'D-7', name: 'anchor removal observer', ok: !state.elements.length === !anchorRemovalObserving },
     ];
   }
 
@@ -895,12 +902,14 @@
         ambiguous: draftStats.ambiguous || 0,
         unresolved: draftStats.unresolved,
       } : { key: null, ageMs: 0, restored: 0, moved: 0, restoredStrokes: 0, restoredNotes: 0, ambiguous: 0, unresolved: 0 },
-      // Anchor resilience (F2): per-resolution counts over in-memory
-      // elements plus bounded-pass bookkeeping. Every entry carries a
-      // resolution once a restore or re-anchor pass has run; fresh picks
-      // have no anchor field yet (picked at their current location).
-      // ambiguous is a strict subset of unresolved: duplicate signals tied,
-      // so no candidate was trusted.
+      // Anchor resilience (F2/F11/F12/F13): per-resolution counts over
+      // in-memory elements plus bounded-pass bookkeeping. Every entry
+      // carries a resolution once a restore or re-anchor pass has run;
+      // fresh picks have no anchor field yet (picked at their current
+      // location). ambiguous is a strict subset of unresolved: duplicate
+      // signals tied, so no candidate was trusted. Lifecycle counters
+      // (removed/ancestorFallback/detached/remounted) accumulate across
+      // this page context until Clear All or a confirmed Send.
       anchor: {
         exact: state.elements.filter((en) => en.descriptor && en.descriptor.anchor
           && en.descriptor.anchor.resolution === 'exact').length,
@@ -908,7 +917,13 @@
           && en.descriptor.anchor.resolution === 'fallback').length,
         unresolved: state.elements.filter((en) => en.descriptor && en.descriptor.anchor
           && en.descriptor.anchor.resolution === 'unresolved').length,
+        detached: state.elements.filter((en) => en.descriptor && en.descriptor.anchor
+          && en.descriptor.anchor.resolution === 'detached').length,
         ambiguous: lastAnchorPass ? lastAnchorPass.ambiguous : 0,
+        removed: anchorLifecycle.removed,
+        ancestorFallback: anchorLifecycle.ancestorFallback,
+        remounted: anchorLifecycle.remounted,
+        observer: { connected: !!anchorRemovalObserving },
         passes: reanchorPassCount,
         lastPass: lastAnchorPass ? {
           at: lastAnchorPass.at,
@@ -917,6 +932,10 @@
           fallback: lastAnchorPass.fallback,
           ambiguous: lastAnchorPass.ambiguous,
           unresolved: lastAnchorPass.unresolved,
+          detached: lastAnchorPass.detached || 0,
+          removed: lastAnchorPass.removed || 0,
+          ancestorFallback: lastAnchorPass.ancestorFallback || 0,
+          remounted: lastAnchorPass.remounted || 0,
         } : null,
         perElement: state.elements.map((en) => {
           const a = en.descriptor && en.descriptor.anchor ? en.descriptor.anchor : null;
@@ -1158,20 +1177,22 @@
 
   /* ---------------- Persistent Drafts (F3) ----------------
    * Draft persistence across page refresh, stored in chrome.storage.local
-   * under a key derived from the canonical URL (origin + pathname + search,
-   * hash excluded). The stored draft is compact: normalized strokes, queued
-   * notes, and element descriptors (instruction + optional intent/severity).
-   * NO screenshots, NO page HTML, NO CSS/text edits. The draft is cleared
-   * only after a confirmed successful Send or Clear All; failed sends keep
-   * it. This is separate from the per-tab chrome.storage.session state
-   * (key "browserlink:<tabId>") and never collides with it.
+   * under a per-tab key: 'draft:' + tabId + ':' + canonical URL (origin +
+   * pathname + search, hash excluded). Same-page tabs therefore never share
+   * a draft. The stored draft is compact: normalized strokes, queued notes,
+   * and element descriptors (instruction + optional intent/severity). NO
+   * screenshots, NO page HTML, NO CSS/text edits. The draft is cleared only
+   * after a confirmed successful Send or Clear All; failed sends keep it.
+   * This is separate from the per-tab chrome.storage.session state (key
+   * "browserlink:<tabId>") and never collides with it. Session storage
+   * semantics are unchanged; only the draft key includes the tab id.
    */
   const DRAFT_PERSIST_MS = 300; // debounce window for writeDraft
   const DRAFT_SAVE_VERSION = 1;
   // Bounded draft retention: chrome.storage.local has a 10MB quota and
-  // 'draft:<url>' keys would otherwise accumulate forever, eventually
-  // killing draft persistence AND popup config writes. Cap the draft set,
-  // evicting oldest-first by savedAt.
+  // 'draft:<tabId>:<url>' keys would otherwise accumulate forever,
+  // eventually killing draft persistence AND popup config writes. Cap the
+  // draft set, evicting oldest-first by savedAt.
   const DRAFT_MAX_COUNT = 25;
   const DRAFT_SWEEP_MIN_MS = 15000; // throttle: at most one sweep per window
   let lastDraftSweepAt = 0;
@@ -1196,9 +1217,21 @@
     return hashAt === -1 ? href : href.slice(0, hashAt);
   }
 
-  function draftKey() {
-    return 'draft:' + canonicalDraftUrl();
+  // Per-tab draft key. Init awaits pingTabId() before restore, so the real
+  // tab id is known then. If draftKey() runs before the id resolves (e.g.
+  // a persist during early mutation), use a per-context nonce instead of
+  // falling back to a URL-only key, which would collide across same-page
+  // tabs (C6). The nonce is unique to this content-script instance.
+  let draftTabFallbackId = null;
+  function resolvedDraftTabId() {
+    if (knownTabId) return String(knownTabId);
+    if (!draftTabFallbackId) {
+      draftTabFallbackId = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+    }
+    return draftTabFallbackId;
   }
+
+  function draftKey() { return 'draft:' + resolvedDraftTabId() + ':' + canonicalDraftUrl(); }
 
   // Compact serialization of the current in-memory draft. Only strokes,
   // notes, and element descriptors ship; edits/screenshots/html never do.
@@ -1243,21 +1276,24 @@
             hosts: d.shadow.hosts.slice(0, MAX_SHADOW_DEPTH),
           };
         }
-        // Schema v1.8 (F2): optional anchor metadata survives the draft so
-        // stored resolution state stays introspectable; restore recomputes
-        // the live resolution from the DOM regardless.
+        // Schema v1.10 (F2/F11/F12/F13): optional anchor metadata survives
+        // the draft so stored resolution state stays introspectable; restore
+        // recomputes the live resolution from the DOM regardless.
         if (d.anchor && typeof d.anchor === 'object' && !Array.isArray(d.anchor)) {
           const a = d.anchor;
           if (a.version === ANCHOR_VERSION
-            && (a.resolution === 'exact' || a.resolution === 'fallback' || a.resolution === 'unresolved')) {
+            && (a.resolution === 'exact' || a.resolution === 'fallback'
+              || a.resolution === 'unresolved' || a.resolution === 'detached')) {
             const anchorOut = { version: ANCHOR_VERSION, resolution: a.resolution };
             if (typeof a.confidence === 'number' && Number.isFinite(a.confidence)) {
               anchorOut.confidence = Math.max(0, Math.min(1, a.confidence));
             }
             if (Array.isArray(a.fallback) && a.fallback.length) {
-              anchorOut.fallback = a.fallback
-                .filter((s) => s === 'attrs' || s === 'text' || s === 'aria' || s === 'rect')
+              const signals = a.fallback
+                .filter((s) => s === 'attrs' || s === 'text' || s === 'aria'
+                  || s === 'rect' || s === 'ancestor')
                 .slice(0, 4);
+              if (signals.length) anchorOut.fallback = signals;
             }
             out.anchor = anchorOut;
           }
@@ -1302,7 +1338,7 @@
     };
   }
 
-  // Bounded eviction for the draft set (H7): read every 'draft:<url>' key,
+  // Bounded eviction for the draft set (H7): read every 'draft:' key,
   // and when more than DRAFT_MAX_COUNT exist, evict the oldest ones by
   // savedAt so storage.local can never fill its quota with drafts. Throttled
   // to at most one sweep per DRAFT_SWEEP_MIN_MS window (persistDraft fires
@@ -1397,14 +1433,14 @@
     flushDraft();
   }
 
-  // Clear the persisted URL draft (confirmed Send success / Clear All).
+  // Clear the persisted per-tab draft (confirmed Send success / Clear All).
   function clearDraft() {
     if (draftTimer) { clearTimeout(draftTimer); draftTimer = 0; }
     draftStats = null;
     try { chrome.storage.local.remove(draftKey()).catch(() => {}); } catch (_) { /* storage unavailable */ }
   }
 
-  // Restore the URL-scoped draft after UI construction. Strokes replay via
+  // Restore the per-tab URL-scoped draft after UI construction. Strokes replay via
   // redraw; element markers re-anchor through the deterministic F2 signal
   // chain (exact cssPath replay first, then stable attrs, normalized
   // text/aria, prior rect proximity) inside a guarded try/catch (never
@@ -1417,6 +1453,10 @@
     if (draftRestoredForLoad) return;
     draftRestoredForLoad = true;
     if (state.strokes.length || state.elements.length || state.annotNotes.length) return;
+    // Restore is the first draftKey() consumer on a fresh load. Init already
+    // awaited pingTabId(); reinject may not have. Resolve the tab id before
+    // reading so we never restore from a URL-only or nonce key.
+    await pingTabId();
     const key = draftKey();
     let got = null;
     try {
@@ -1496,6 +1536,10 @@
           // resolve through the same fallback signals.
           res = reanchorElement(desc);
           if (res.el) el = res.el;
+          else if (desc.anchor && desc.anchor.resolution === 'detached') {
+            // Still gone after refresh: keep detached so remount can recover.
+            res = detachedResult();
+          }
         }
       } catch (_) { el = null; res = null; }
       const d2 = {
@@ -1538,6 +1582,7 @@
       }
       const outlineEl = createOutline(d2.index);
       state.elements.push({ descriptor: d2, el, outlineEl });
+      syncAnchorRemovalObserver();
       // Anchor resilience (F2): stamp the truthful resolution state, mark
       // the marker (moved/unresolved), and count. A missing result is an
       // unresolved entry; its instruction is never attached and never
@@ -1557,12 +1602,15 @@
       markOutlineAnchor(outlineEl, res.resolution);
       if (res.resolution === 'exact') restored += 1;
       else if (res.resolution === 'fallback') { restored += 1; moved += 1; }
-      else {
+      else if (res.resolution === 'detached') {
+        unresolved += 1;
+      } else {
         unresolved += 1;
         if (res.reason === 'ambiguous') ambiguous += 1;
       }
       if (d2.index > maxIndex) maxIndex = d2.index;
     }
+    syncAnchorRemovalObserver();
     if (maxIndex >= state.nextIndex) state.nextIndex = maxIndex + 1;
     // F8: restore the thread identity + ordered item history. The block is
     // optional (pre-F8 drafts have none) and sanitized: ids and text are
@@ -3406,8 +3454,8 @@
     return fp + ';' + cs + ';' + hosts + ';' + (d.cssPath || '');
   }
 
-  /* ---------------- Anchor resilience (F2) ----------------
-   * Mutation-resistant fallback re-anchoring (schema v1.8). When an
+  /* ---------------- Anchor resilience (F2/F11/F12/F13) ----------------
+   * Mutation-resistant fallback re-anchoring (schema v1.10). When an
    * element's exact cssPath no longer resolves (DOM drift, SPA route
    * change, refresh after mutation), replay re-anchors deterministically
    * through a fixed signal chain:
@@ -3422,21 +3470,27 @@
    * visible) candidate; empty tiers, duplicate candidates, and hidden or
    * detached elements all fall through to the next tier. When no tier wins,
    * the element stays UNRESOLVED: its instruction is never attached to a
-   * wrong element and never dropped. Every outcome is stamped as anchor
-   * metadata on the descriptor (version 1, strict resolution enum,
-   * confidence, fallback signal list) and surfaces in diagnostics.
+   * wrong element and never dropped. Outright removal (modal close,
+   * conditional unmount) is a different failure than drift: a document
+   * MutationObserver records the surviving former parent and the next
+   * removal pass tries ancestor fallback, else marks the entry DETACHED
+   * (ghost at the prior rect). Added nodes schedule a remount pass over
+   * detached entries only. Every outcome is stamped as anchor metadata
+   * (version 1, strict resolution enum, confidence, fallback signal list)
+   * and surfaces in diagnostics.
    */
   const ANCHOR_VERSION = 1;
   const ANCHOR_ATTRS_MIN_OVERLAP = 0.8;   // class-token overlap floor (tier 2)
   const ANCHOR_RECT_MAX_DIST = 0.18;      // normalized center distance cap (tier 4)
-  // Confidence per winning path (schema v1.8: 0..1).
-  const ANCHOR_CONFIDENCE = { exact: 1, attrs: 0.95, text: 0.85, aria: 0.85, rect: 0.7 };
+  // Confidence per winning path (schema v1.10: 0..1). Ancestor sits above
+  // the 0.7 floor and below the attrs tier.
+  const ANCHOR_CONFIDENCE = { exact: 1, attrs: 0.95, text: 0.85, aria: 0.85, ancestor: 0.75, rect: 0.7 };
   // Documented confidence floor: a winning path below this is never
   // attached to - the entry stays unresolved instead of risking a wrong
   // element. All fixed tier confidences sit at or above the floor.
   const ANCHOR_CONFIDENCE_MIN = 0.7;
-  const ANCHOR_RESOLUTIONS = ['exact', 'fallback', 'unresolved'];
-  const ANCHOR_FALLBACK_SIGNALS = ['attrs', 'text', 'aria', 'rect'];
+  const ANCHOR_RESOLUTIONS = ['exact', 'fallback', 'unresolved', 'detached'];
+  const ANCHOR_FALLBACK_SIGNALS = ['attrs', 'text', 'aria', 'rect', 'ancestor'];
   const REANCHOR_DEBOUNCE_MS = 350; // DOM stabilization wait after SPA events
   const REANCHOR_CANDIDATE_CAP = 256; // bounded candidate scan per element
   let reanchorTimer = 0;
@@ -3445,6 +3499,13 @@
   // pass; after Clear All or a confirmed Send the in-memory list empties
   // and the next trigger recomputes from scratch.
   let lastAnchorPass = null;
+  // Lifecycle counters (F13): accumulate across this page context until
+  // Clear All or a confirmed Send. removed = anchors whose node left the
+  // tree this run; ancestorFallback / detached / remounted are outcomes.
+  const anchorLifecycle = { removed: 0, ancestorFallback: 0, detached: 0, remounted: 0 };
+  let pendingRemovalParents = new WeakMap();
+  let anchorRemovalObserver = null;
+  let anchorRemovalObserving = false;
 
   function normalizeAnchorText(s) {
     return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -3458,6 +3519,270 @@
     let r = null;
     try { r = el.getBoundingClientRect(); } catch (_) { r = null; }
     return !!(r && r.width >= 1 && r.height >= 1);
+  }
+
+  function isExcludedAncestor(el) {
+    if (!el || el.nodeType !== 1) return true;
+    let tag = '';
+    try { tag = String(el.tagName || '').toLowerCase(); } catch (_) { tag = ''; }
+    if (tag === 'html' || tag === 'body') return true;
+    try {
+      if (el.id === 'hermes-annotate-host') return true;
+      if (host && (el === host || host.contains(el))) return true;
+    } catch (_) { /* keep checking */ }
+    return false;
+  }
+
+  // Reduced-strictness identity gate for nearest surviving ancestor: the
+  // former parent is accepted only when its subtree still carries a stored
+  // content signal (normalized text, aria-label), class-token overlap
+  // >= 0.8, or id equality. A bare tag match is not enough. Never claims
+  // html/body/host.
+  function ancestorIsPlausible(el, desc) {
+    if (!el || !desc || !isUsableAnchorTarget(el) || isExcludedAncestor(el)) return false;
+    const wantText = desc.text ? normalizeAnchorText(desc.text) : '';
+    if (wantText) {
+      let t = '';
+      try { t = el.textContent || ''; } catch (_) { t = ''; }
+      if (normalizeAnchorText(t).indexOf(wantText) !== -1) return true;
+    }
+    const wantAria = desc.ariaLabel ? normalizeAnchorText(desc.ariaLabel) : '';
+    if (wantAria) {
+      try {
+        const selfAria = el.getAttribute('aria-label') || '';
+        if (normalizeAnchorText(selfAria) === wantAria) return true;
+        const labeled = el.querySelectorAll ? el.querySelectorAll('[aria-label]') : [];
+        for (let i = 0; i < labeled.length; i++) {
+          const a = labeled[i].getAttribute('aria-label') || '';
+          if (normalizeAnchorText(a) === wantAria) return true;
+        }
+      } catch (_) { /* ignore */ }
+    }
+    let liveCls = '';
+    try { liveCls = el.className || ''; } catch (_) { liveCls = ''; }
+    if (desc.className && anchorClassOverlap(desc.className, liveCls) >= ANCHOR_ATTRS_MIN_OVERLAP) return true;
+    const wantId = desc.id ? String(desc.id) : '';
+    if (wantId) {
+      let liveId = '';
+      try { liveId = el.id || ''; } catch (_) { liveId = ''; }
+      if (liveId === wantId) return true;
+    }
+    return false;
+  }
+
+  function detachedResult() {
+    return { el: null, resolution: 'detached', confidence: 0, fallback: [], reason: 'removed' };
+  }
+
+  function resetAnchorLifecycle() {
+    anchorLifecycle.removed = 0;
+    anchorLifecycle.ancestorFallback = 0;
+    anchorLifecycle.detached = 0;
+    anchorLifecycle.remounted = 0;
+    pendingRemovalParents = new WeakMap();
+  }
+
+  function hasDetachedAnchor() {
+    for (const en of state.elements) {
+      const a = en && en.descriptor && en.descriptor.anchor;
+      if (a && a.resolution === 'detached') return true;
+    }
+    return false;
+  }
+
+  function disconnectAnchorRemovalObserver() {
+    if (!anchorRemovalObserver || !anchorRemovalObserving) {
+      anchorRemovalObserving = false;
+      return;
+    }
+    try { anchorRemovalObserver.disconnect(); } catch (_) { /* ok */ }
+    anchorRemovalObserving = false;
+  }
+
+  function connectAnchorRemovalObserver() {
+    if (anchorRemovalObserving) return;
+    if (typeof MutationObserver !== 'function') return;
+    if (!anchorRemovalObserver) {
+      try { anchorRemovalObserver = new MutationObserver(onAnchorMutations); }
+      catch (_) { return; }
+    }
+    try {
+      const root = document.documentElement || document;
+      anchorRemovalObserver.observe(root, { childList: true, subtree: true });
+      anchorRemovalObserving = true;
+    } catch (_) {
+      anchorRemovalObserving = false;
+    }
+  }
+
+  // Lazy: observe only while in-memory elements exist. Disconnecting when
+  // the list is empty is what keeps the observer off the idle hot path.
+  function syncAnchorRemovalObserver() {
+    if (state.elements.length) connectAnchorRemovalObserver();
+    else disconnectAnchorRemovalObserver();
+  }
+
+  // Cross-document containment: an entry anchored inside a frame lives in
+  // the FRAME's document, so node.contains(en.el) is always false when
+  // `node` is the iframe/frame element in a parent document. Chrome nulls
+  // removedIframe.contentDocument and the orphaned document's
+  // defaultView.frameElement before the MutationObserver callback, so the
+  // live chain is empty at callback time. Consult the cached frameEntries
+  // registry first (frameEl -> {doc, frameEls, path}); keep live
+  // chainFrameElsOf / contentDocument checks as pre-removal fast paths.
+  // descriptor.frame.path must match the cached path (or take it as a
+  // prefix) so a stale registry record cannot claim a different frame.
+  function entryAnchoredThroughFrame(en, frameEl) {
+    if (!en || !en.el || !frameEl) return false;
+    if (en.el === frameEl) return false;
+    try {
+      const owner = en.el.ownerDocument;
+      const descPath = en.descriptor && en.descriptor.frame && Array.isArray(en.descriptor.frame.path)
+        ? en.descriptor.frame.path
+        : null;
+      if (owner && descPath && descPath.length) {
+        const direct = frameEntries.get(frameEl);
+        const records = direct ? [direct] : [];
+        for (const rec of frameEntries.values()) {
+          if (rec && rec !== direct) records.push(rec);
+        }
+        for (let ri = 0; ri < records.length; ri++) {
+          const rec = records[ri];
+          if (!rec || rec.crossOrigin || rec.doc !== owner) continue;
+          let frameHit = rec.frameEl === frameEl;
+          if (!frameHit && rec.frameEls) {
+            for (let i = 0; i < rec.frameEls.length; i++) {
+              if (rec.frameEls[i] === frameEl) { frameHit = true; break; }
+            }
+          }
+          if (!frameHit) continue;
+          const cachedPath = rec.path;
+          if (!Array.isArray(cachedPath) || !cachedPath.length) continue;
+          if (descPath.length < cachedPath.length) continue;
+          let pathHit = true;
+          for (let i = 0; i < cachedPath.length; i++) {
+            if (descPath[i] !== cachedPath[i]) { pathHit = false; break; }
+          }
+          if (pathHit) return true;
+        }
+      }
+    } catch (_) { /* ok */ }
+    try {
+      const chain = chainFrameElsOf(en.el.ownerDocument);
+      for (let i = 0; i < chain.length; i++) {
+        if (chain[i] === frameEl) return true;
+      }
+    } catch (_) { /* ok */ }
+    let inner = null;
+    try { inner = frameEl.contentDocument; } catch (_) { inner = null; }
+    if (inner) {
+      try {
+        if (en.el.ownerDocument === inner) return true;
+        let d = en.el.ownerDocument;
+        let guard = 0;
+        while (d && d !== document && guard++ < MAX_FRAME_DEPTH) {
+          if (d === inner) return true;
+          const fe = d.defaultView && d.defaultView.frameElement;
+          if (!fe) break;
+          d = fe.ownerDocument;
+        }
+      } catch (_) { /* ok */ }
+    }
+    return false;
+  }
+
+  // After a frame is inserted, walk descriptor.frame.path against the live
+  // tree and report whether any hop is this frame element.
+  function descriptorFramePathHits(desc, frameEl) {
+    if (!desc || !frameEl) return false;
+    const fp = desc.frame && Array.isArray(desc.frame.path) ? desc.frame.path : [];
+    if (!fp.length) return false;
+    let doc = document;
+    for (let i = 0; i < fp.length; i++) {
+      let frames = null;
+      try { frames = doc.querySelectorAll('iframe, frame'); } catch (_) { frames = null; }
+      if (!frames || !frames[fp[i]]) return false;
+      const fe = frames[fp[i]];
+      if (fe === frameEl) return true;
+      const probe = probeFrameDoc(fe);
+      if (!probe || !probe.doc) return false;
+      doc = probe.doc;
+    }
+    return false;
+  }
+
+  function hasDetachedAnchorThroughFrame(frameEl) {
+    for (const en of state.elements) {
+      const a = en && en.descriptor && en.descriptor.anchor;
+      if (!a || a.resolution !== 'detached') continue;
+      if (descriptorFramePathHits(en.descriptor, frameEl)) return true;
+    }
+    return false;
+  }
+
+  function onAnchorMutations(mutations) {
+    if (!state.elements.length || !mutations || !mutations.length) return;
+    let sawRemoval = false;
+    let sawAdd = false;
+    let sawFrameAdd = false;
+    for (let mi = 0; mi < mutations.length; mi++) {
+      const m = mutations[mi];
+      const removed = m.removedNodes;
+      if (removed && removed.length) {
+        for (let ri = 0; ri < removed.length; ri++) {
+          const node = removed[ri];
+          if (!node || node.nodeType !== 1) continue;
+          const nodeIsFrame = node.tagName === 'IFRAME' || node.tagName === 'FRAME';
+          let nestedFrames = null;
+          if (!nodeIsFrame) {
+            try { nestedFrames = node.querySelectorAll('iframe, frame'); } catch (_) { nestedFrames = null; }
+          }
+          for (const en of state.elements) {
+            if (!en || !en.el || (en.descriptor && en.descriptor.quoteMarker)) continue;
+            let hit = false;
+            try { hit = node === en.el || node.contains(en.el); } catch (_) { hit = false; }
+            let viaFrame = false;
+            if (!hit && nodeIsFrame) {
+              viaFrame = entryAnchoredThroughFrame(en, node);
+            }
+            if (!hit && !viaFrame && nestedFrames && nestedFrames.length) {
+              for (let fi = 0; fi < nestedFrames.length; fi++) {
+                if (entryAnchoredThroughFrame(en, nestedFrames[fi])) {
+                  viaFrame = true;
+                  break;
+                }
+              }
+            }
+            if (viaFrame) hit = true;
+            if (!hit) continue;
+            // Frame-contained entries live in a different document; the
+            // surviving parent of the iframe is not a plausible ancestor.
+            pendingRemovalParents.set(en, viaFrame ? null : (m.target || null));
+            sawRemoval = true;
+          }
+        }
+      }
+      if (m.addedNodes && m.addedNodes.length) {
+        for (let ai = 0; ai < m.addedNodes.length; ai++) {
+          const added = m.addedNodes[ai];
+          if (!added || added.nodeType !== 1) continue;
+          sawAdd = true;
+          if (added.tagName === 'IFRAME' || added.tagName === 'FRAME') {
+            if (hasDetachedAnchorThroughFrame(added)) sawFrameAdd = true;
+          } else if (!sawFrameAdd) {
+            let nested = null;
+            try { nested = added.querySelectorAll('iframe, frame'); } catch (_) { nested = null; }
+            if (nested) {
+              for (let fi = 0; fi < nested.length; fi++) {
+                if (hasDetachedAnchorThroughFrame(nested[fi])) { sawFrameAdd = true; break; }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (sawRemoval) scheduleReanchor('removal');
+    else if (sawFrameAdd || (sawAdd && hasDetachedAnchor())) scheduleReanchor('remount');
   }
 
   // The root (document or shadow root) named by the descriptor's frame path
@@ -3540,6 +3865,23 @@
     return true;
   }
 
+  // Text identity guard for the attrs fallback tier only. When stored
+  // descriptor text is non-trivial (whitespace-collapsed length >= 4), a
+  // candidate whose normalized live text differs, or is empty, is not
+  // accepted at attrs and falls through to later tiers. Descriptors with
+  // no stored text, or only trivial stored text, keep current attrs
+  // behavior. Does not apply to exact / text / aria / rect / ancestor.
+  function attrsTextMatchesStored(desc, el) {
+    const stored = desc && desc.text ? normalizeAnchorText(desc.text) : '';
+    if (stored.length < 4) return true;
+    if (!el || el.nodeType !== 1) return false;
+    let t = '';
+    try { t = el.textContent || ''; } catch (_) { t = ''; }
+    const live = normalizeAnchorText(t);
+    if (!live) return false;
+    return live === stored;
+  }
+
   // Deterministic fallback re-anchoring for one stored descriptor. Returns
   // { el, resolution, confidence, fallback, reason }; el is null exactly
   // when the result is unresolved. reason is diagnostics-only (never
@@ -3592,6 +3934,8 @@
     // Tier 2: stable attributes. The stored id (when present) must match
     // exactly AND the stored class tokens (when present) must overlap >= 0.8.
     // Fields absent from the stored descriptor impose no constraint.
+    // Text identity: non-trivial stored text must also match, so attrs
+    // cannot silently re-anchor onto a same-class node with changed content.
     const attrsHits = [];
     for (const el of candidates) {
       if (desc.id && el.id !== desc.id) continue;
@@ -3600,6 +3944,7 @@
         try { live = el.getAttribute('class') || ''; } catch (_) { live = ''; }
         if (anchorClassOverlap(desc.className, live) < ANCHOR_ATTRS_MIN_OVERLAP) continue;
       }
+      if (!attrsTextMatchesStored(desc, el)) continue;
       attrsHits.push(el);
     }
     if (attrsHits.length > 1) ambiguousSeen = true;
@@ -3673,7 +4018,7 @@
     };
   }
 
-  // Stamp schema v1.8 anchor metadata onto a descriptor (truthful, bounded).
+  // Stamp schema v1.10 anchor metadata onto a descriptor (truthful, bounded).
   function stampAnchor(d, res) {
     if (!d || !res) return;
     d.anchor = {
@@ -3688,18 +4033,22 @@
     if (!outlineEl) return;
     outlineEl.classList.toggle('is-moved', resolution === 'fallback');
     outlineEl.classList.toggle('is-unresolved', resolution === 'unresolved');
-    // Small state chip (moved/unresolved) keeps the marker self-explanatory
-    // without opening diagnostics; exact entries carry no chip.
+    outlineEl.classList.toggle('is-detached', resolution === 'detached');
+    // Small state chip (moved/unresolved/detached) keeps the marker
+    // self-explanatory without opening diagnostics; exact entries carry no
+    // chip.
     let chip = outlineEl.querySelector('.comet-el-state');
-    if (resolution === 'fallback' || resolution === 'unresolved') {
+    if (resolution === 'fallback' || resolution === 'unresolved' || resolution === 'detached') {
       if (!chip) {
         chip = document.createElement('span');
         chip.className = 'comet-el-state';
         outlineEl.appendChild(chip);
       }
-      chip.textContent = resolution === 'fallback' ? 'moved' : 'unresolved';
+      chip.textContent = resolution === 'fallback' ? 'moved'
+        : (resolution === 'detached' ? 'detached' : 'unresolved');
       chip.classList.toggle('is-moved', resolution === 'fallback');
       chip.classList.toggle('is-unresolved', resolution === 'unresolved');
+      chip.classList.toggle('is-detached', resolution === 'detached');
     } else if (chip) {
       chip.remove();
     }
@@ -3724,28 +4073,85 @@
     markOutlineAnchor(en.outlineEl, res.resolution);
   }
 
-  // One bounded re-anchor pass over every in-memory element. Triggered by
-  // SPA history events (debounced + double-rAF DOM stabilization) and by
-  // harness assertions. Each pass runs at most once per trigger; it never
-  // loops, never duplicates markers or listeners, and never drops an
-  // instruction: entries that stay unresolved keep their descriptor and
-  // render as an unresolved ghost at the prior rect.
+  // One bounded re-anchor pass. Triggered by SPA history events, removal
+  // and remount observer ticks (debounced + double-rAF), and harness
+  // assertions. Each trigger produces at most one pass; it never loops,
+  // never mutates the page, and never drops an instruction. Removal-aware
+  // entries try the normal ladder first, then nearest surviving ancestor,
+  // else DETACHED. Remount passes walk DETACHED entries only.
   function reanchorAllElements(reason) {
-    const counts = { exact: 0, fallback: 0, ambiguous: 0, unresolved: 0, reason: reason || 'manual' };
-    if (!state.elements.length) return counts;
-    // SPA navigation can swap iframes; refresh the registry once per pass
-    // (idempotent, bounded by the existing WeakSet/Map guards).
+    const why = reason || 'manual';
+    const remountOnly = why === 'remount';
+    const counts = {
+      exact: 0,
+      fallback: 0,
+      ambiguous: 0,
+      unresolved: 0,
+      detached: 0,
+      removed: 0,
+      ancestorFallback: 0,
+      remounted: 0,
+      reason: why,
+    };
+    if (!state.elements.length) {
+      syncAnchorRemovalObserver();
+      return counts;
+    }
     try { refreshFrameRegistry(); } catch (_) { /* ok */ }
     for (const en of state.elements) {
       if (!en || !en.descriptor) continue;
-      const res = reanchorElement(en.descriptor);
-      counts[res.resolution] += 1;
-      // Ambiguous outcomes are a strict subset of unresolved: duplicate
-      // signals tied, so no candidate was trusted. Reported separately in
-      // diagnostics so replay behavior is fully inspectable.
-      if (res.resolution === 'unresolved' && res.reason === 'ambiguous') counts.ambiguous += 1;
+      if (en.descriptor.quoteMarker) continue;
+      const storedDetached = !!(en.descriptor.anchor && en.descriptor.anchor.resolution === 'detached');
+      const wasRemoved = pendingRemovalParents.has(en);
+      if (remountOnly && !storedDetached) continue;
+      if (wasRemoved) {
+        counts.removed += 1;
+        anchorLifecycle.removed += 1;
+      }
+      let res = reanchorElement(en.descriptor);
+      if (res.el && (res.resolution === 'exact' || res.resolution === 'fallback')) {
+        if (storedDetached) {
+          counts.remounted += 1;
+          anchorLifecycle.remounted += 1;
+        }
+        counts[res.resolution] += 1;
+        applyAnchorResolution(en, res);
+        if (wasRemoved) pendingRemovalParents.delete(en);
+        continue;
+      }
+      if (wasRemoved) {
+        const parent = pendingRemovalParents.get(en);
+        pendingRemovalParents.delete(en);
+        if (parent && ancestorIsPlausible(parent, en.descriptor)) {
+          res = {
+            el: parent,
+            resolution: 'fallback',
+            confidence: ANCHOR_CONFIDENCE.ancestor,
+            fallback: ['ancestor'],
+            reason: 'ancestor',
+          };
+          counts.ancestorFallback += 1;
+          anchorLifecycle.ancestorFallback += 1;
+          counts.fallback += 1;
+          applyAnchorResolution(en, res);
+          continue;
+        }
+        res = detachedResult();
+        counts.detached += 1;
+        anchorLifecycle.detached += 1;
+        applyAnchorResolution(en, res);
+        continue;
+      }
+      if (storedDetached || remountOnly) {
+        counts.detached += 1;
+        applyAnchorResolution(en, detachedResult());
+        continue;
+      }
+      counts.unresolved += 1;
+      if (res.reason === 'ambiguous') counts.ambiguous += 1;
       applyAnchorResolution(en, res);
     }
+    pendingRemovalParents = new WeakMap();
     reanchorPassCount += 1;
     lastAnchorPass = {
       at: new Date().toISOString(),
@@ -3754,20 +4160,28 @@
       fallback: counts.fallback,
       ambiguous: counts.ambiguous,
       unresolved: counts.unresolved,
+      detached: counts.detached,
+      removed: counts.removed,
+      ancestorFallback: counts.ancestorFallback,
+      remounted: counts.remounted,
     };
     positionSelections();
     updateSelectionUI();
-    if (counts.unresolved) {
+    if (counts.detached) {
+      setStatus(counts.detached + ' element' + (counts.detached === 1 ? '' : 's')
+        + ' detached - watching for remount', 'warn');
+    } else if (counts.unresolved) {
       setStatus(counts.unresolved + ' element' + (counts.unresolved === 1 ? '' : 's') + ' unresolved', 'warn');
     } else if (counts.fallback) {
       setStatus(counts.fallback + ' element' + (counts.fallback === 1 ? '' : 's') + ' re-anchored (moved)', 'ok');
     }
     diagLog('anchor:pass', 'reason=' + counts.reason + ' exact=' + counts.exact
       + ' fallback=' + counts.fallback + ' ambiguous=' + counts.ambiguous
-      + ' unresolved=' + counts.unresolved);
-    // The refreshed descriptors (live rects, anchor state) persist under the
-    // CURRENT canonical key; re-anchoring never deletes stored drafts.
+      + ' unresolved=' + counts.unresolved + ' detached=' + counts.detached
+      + ' removed=' + counts.removed + ' ancestor=' + counts.ancestorFallback
+      + ' remounted=' + counts.remounted);
     persistDraft();
+    syncAnchorRemovalObserver();
     return counts;
   }
 
@@ -3780,9 +4194,26 @@
       reanchorTimer = 0;
       // DOM stabilization: two frames after the debounce so SPA render
       // batches (framework updates, image loads) settle before replay.
-      requestAnimationFrame(() => requestAnimationFrame(() => {
+      // Hidden tabs can suspend rAF indefinitely (document.hidden); a
+      // 200ms timeout fallback runs the same pass if double-rAF has not.
+      let ran = false;
+      requestAnimationFrame(() => {
+        if (ran) return;
+        requestAnimationFrame(() => {
+          if (ran) return;
+          ran = true;
+          reanchorAllElements(reason);
+        });
+      });
+      setTimeout(() => {
+        if (ran) return;
+        ran = true;
+        if (document.hidden) {
+          reanchorAllElements(reason);
+          return;
+        }
         reanchorAllElements(reason);
-      }));
+      }, 200);
     }, REANCHOR_DEBOUNCE_MS);
   }
 
@@ -3938,6 +4369,20 @@
     attachFrameListeners(entry);
   }
 
+  // True while an in-memory (non-quote) entry still lives in this cached
+  // frame document. Used as a prune hold so onAnchorMutations can still
+  // match the removed iframe after Chrome severs live frame links.
+  function frameRegistryHeldByAnchor(rec) {
+    if (!rec || rec.crossOrigin || !rec.doc) return false;
+    for (const en of state.elements) {
+      if (!en || !en.el || (en.descriptor && en.descriptor.quoteMarker)) continue;
+      try {
+        if (en.el.ownerDocument === rec.doc) return true;
+      } catch (_) { /* ok */ }
+    }
+    return false;
+  }
+
   // Register every same-origin frame reachable from the top document
   // (bounded depth). Called at init, on element-mode entry, and on a
   // periodic timer; idempotent. Prunes entries whose frame left the tree
@@ -3964,9 +4409,13 @@
     try { visit(document, []); } catch (_) { /* never break the host page */ }
     // Prune entries for frames that left the document tree (removed or
     // replaced): their listeners died with the window, so drop the bookkeeping.
+    // Skip prune while an in-memory entry still lives in that cached
+    // document: Chrome severs live frame links before the mutation
+    // callback, and onAnchorMutations needs the record at callback time.
     for (const fe of Array.from(frameEntries.keys())) {
       if (seen.has(fe)) continue;
       const entry = frameEntries.get(fe);
+      if (frameRegistryHeldByAnchor(entry)) continue;
       if (entry && entry.crossOrigin && frameCounters.crossOrigin > 0) {
         frameCounters.crossOrigin -= 1;
       }
@@ -4687,6 +5136,7 @@
     updateCount();
     updateSelectionPulse();
     persistDraft(); // F3: selection removed from the persisted draft
+    syncAnchorRemovalObserver();
   }
 
   function clearCommittedSelections() {
@@ -4830,6 +5280,7 @@
         el: pending.el,
         outlineEl: pending.outlineEl,
       });
+      syncAnchorRemovalObserver();
       committedIndex = state.elements.length - 1;
       state.activeIndex = committedIndex;
     }
@@ -4988,6 +5439,7 @@
       d.index = state.nextIndex++;
       const outlineEl = createOutline(d.index);
       state.elements.push({ descriptor: d, el, outlineEl, crossOrigin: r.crossOrigin === true });
+      syncAnchorRemovalObserver();
       state.activeIndex = state.elements.length - 1;
       updateCount();
       updateSelectionPulse();
@@ -5357,6 +5809,7 @@
     const desc = quoteDescriptor(q);
     const outlineEl = createOutline(desc.index);
     state.elements.push({ descriptor: desc, el: quoteAnchorElement(), outlineEl });
+    syncAnchorRemovalObserver();
     state.activeIndex = state.elements.length - 1;
     updateCount();
     updateSelectionPulse();
@@ -7893,12 +8346,13 @@
       if (!hosts.length) delete d.shadow;
       else d.shadow = { depth: hosts.length, hosts };
     }
-    // Schema v1.8 (F2): ship optional anchor metadata in a canonical shape;
-    // malformed or empty values are dropped so payloads stay valid under the
-    // hub's strict nested-key validation.
+    // Schema v1.10 (F2/F11/F12/F13): ship optional anchor metadata in a
+    // canonical shape; malformed or empty values are dropped so payloads
+    // stay valid under the hub's strict nested-key validation.
     if (d.anchor && typeof d.anchor === 'object' && !Array.isArray(d.anchor)) {
       const a = d.anchor;
-      const okRes = a.resolution === 'exact' || a.resolution === 'fallback' || a.resolution === 'unresolved';
+      const okRes = a.resolution === 'exact' || a.resolution === 'fallback'
+        || a.resolution === 'unresolved' || a.resolution === 'detached';
       if (a.version === ANCHOR_VERSION && okRes) {
         const anchorOut = { version: ANCHOR_VERSION, resolution: a.resolution };
         if (typeof a.confidence === 'number' && Number.isFinite(a.confidence)) {
@@ -7906,7 +8360,8 @@
         }
         if (Array.isArray(a.fallback) && a.fallback.length) {
           const signals = a.fallback
-            .filter((s) => s === 'attrs' || s === 'text' || s === 'aria' || s === 'rect')
+            .filter((s) => s === 'attrs' || s === 'text' || s === 'aria'
+              || s === 'rect' || s === 'ancestor')
             .slice(0, 4);
           if (signals.length) anchorOut.fallback = signals;
         }
@@ -8680,7 +9135,7 @@
       const d = defaultPosition();
       applyPosition(d.x, d.y);
     }
-    // F3: restore the URL-scoped draft after the UI is constructed (strokes
+    // F3: restore the per-tab draft after the UI is constructed (strokes
     // replayed via redraw, element markers re-anchored best-effort). Fire
     // and forget: a storage failure must never block toolbar restore.
     restoreDraftIfAny();

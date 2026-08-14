@@ -204,6 +204,22 @@ export function formatAnnotationMarkdown(
       if (record.severity !== undefined && record.severity !== null) {
         out.push(`- Priority: ${stringOf(record.severity)}`);
       }
+      // Schema v1.10: honest anchor-state line only when metadata is present.
+      const anchor = record.anchor;
+      if (anchor !== null && typeof anchor === "object" && !Array.isArray(anchor)) {
+        const ao = anchor as JsonObject;
+        const resolution = stringOf(ao.resolution);
+        if (resolution) {
+          const fallback = Array.isArray(ao.fallback)
+            ? ao.fallback.filter((s) => typeof s === "string").join(", ")
+            : "";
+          out.push(
+            fallback
+              ? `- Anchor: ${resolution} (${fallback})`
+              : `- Anchor: ${resolution}`,
+          );
+        }
+      }
     }
   } else {
     out.push("None.");

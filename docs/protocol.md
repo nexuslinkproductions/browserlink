@@ -1,7 +1,12 @@
-# browserlink protocol - annotation schema v1.9
+# browserlink protocol - annotation schema v1.10
 
 The public contract between the extension, the hub, and any harness. Versioned;
 changes require a new minor or major version and a compatibility shim.
+
+**Schema v1.10** (backward compatible with v1.0 through v1.9): extends per-element
+`elements[].anchor` metadata with the `detached` resolution state and `ancestor`
+fallback signal. Wrong types, unknown nested keys, unknown enum values, and
+out-of-range numbers return HTTP 400; v1.9 payloads without the field remain valid.
 
 **Schema v1.9** (backward compatible with v1.0 through v1.8): adds an optional
 top-level `env` snapshot (browser and viewport state captured once at send
@@ -104,7 +109,7 @@ HTTP 400.
 | `viewport` | object | required; `w`, `h` positive integers |
 | `label` | string | optional; user context label, ≤ 200 chars |
 | `strokes` | array | required; each: `color` string, `width` number > 0, `points` array of ≥ 2 `[x, y]` pairs, each coordinate in `[0, 1]` (normalized to the annotation viewport) |
-| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below), `frame`/`shadow` optional deep-picker objects (schema v1.7, see below), `anchor` optional object (schema v1.8, see below), `textQuote` optional object (schema v1.9, see below) |
+| `elements` | array | optional; each: `index` int, `tag` string, `id`/`className`/`text` (≤ 200)/`href`/`ariaLabel` optional strings, `cssPath` optional, `rect` optional normalized box, `instruction` optional string ≤ 500, `edits` optional object (see below), `intent`/`severity` optional enums (schema v1.6, see below), `frame`/`shadow` optional deep-picker objects (schema v1.7, see below), `anchor` optional object (schema v1.10, see below), `textQuote` optional object (schema v1.9, see below) |
 | `screenshot` | string | optional (schema v1.4); PNG data URL `data:image/png;base64,<data>`; max 10MB decoded; non-PNG or invalid base64 → HTTP 400 |
 | `captureState` | object | optional (schema v1.6); Freeze State Capture metadata, exactly four typed fields (see below); unknown keys → HTTP 400 |
 | `env` | object | optional (schema v1.9); browser environment snapshot captured once at send start, exactly seven typed fields (see below); unknown keys, invalid timestamps, invalid bounds, or oversized strings → HTTP 400 |
@@ -236,21 +241,21 @@ Rules:
   elements inside same-origin iframes (the extension translates child-frame
   rectangles into top-level viewport coordinates).
 
-### elements[].anchor (schema v1.8)
+### elements[].anchor (schema v1.10)
 
 Optional per-element anchor metadata emitted by the F2 anchor-resilience
 replay when a stored element is restored on a page whose DOM has drifted.
 The field records the truthful resolution state so consumers know whether
-the element was found exactly, re-anchored by fallback signals, or left
+the element was found exactly, re-anchored by fallback signals, marked detached, or left
 unresolved. Legacy elements without it are stored unchanged (backward
 compatible with every earlier schema).
 
 | Field | Type | Rules |
 |---|---|---|
 | `version` | int | required; the anchor format version, currently `1` |
-| `resolution` | string enum | required; one of `exact` (original cssPath replay), `fallback` (deterministic signal chain below), `unresolved` (no candidate reached the confidence threshold) |
+| `resolution` | string enum | required; one of `exact` (original cssPath replay), `fallback` (deterministic signal chain below), `unresolved` (no candidate reached the confidence threshold), `detached` (element removed or unanchored) |
 | `confidence` | number | optional; the 0..1 score of the winning path (`exact` 1, `attrs` 0.95, `text`/`aria` 0.85, `rect` 0.7); must be 0..1 when present |
-| `fallback` | array of string enums | optional; the deterministic signals used, in order, each from `attrs`, `text`, `aria`, `rect`; non-empty and at most 4 entries; present only when `resolution` is `fallback` |
+| `fallback` | array of string enums | optional; the deterministic signals used, in order, each from `attrs`, `text`, `aria`, `rect`, `ancestor`; non-empty and at most 4 entries; present only when `resolution` is `fallback` |
 
 Example:
 
@@ -539,17 +544,19 @@ Consumers map them back by multiplying with their own viewport dimensions.
 
 ## Versioning
 
-This is **schema v1.9**: backward compatible with v1.0 through v1.8. The
-v1.9 additions are additive and optional: the top-level `env` snapshot, the
-`textQuote` descriptor (top level and per element), and the `threadId` /
-`parentId` thread fields; older payloads validate and store unchanged.
-Schema v1.8 added optional per-element `anchor` metadata recording the
-deterministic re-anchoring resolution state. Schema v1.7 added optional
-per-element `frame` / `shadow` deep-picker metadata for shadow-root and
-iframe targets. Schema v1.6 added the per-element `intent` / `severity`
-enums and the top-level `captureState` object. Schema v1.5 extended
-`elements[].edits` with text-formatting keys. Schema v1.4 added optional
-`screenshot` / `screenshotFile`. Schema v1.1 added optional `elements[].edits`.
+This is **schema v1.10**: backward compatible with v1.0 through v1.9. The
+v1.10 additions are additive and optional: schema v1.10 extends per-element
+`anchor` metadata with the `detached` resolution state and `ancestor` fallback
+signal; older payloads validate and store unchanged.
+Schema v1.9 added an optional top-level `env` snapshot, `textQuote` descriptor,
+and `threadId` / `parentId` thread fields. Schema v1.8 added optional
+per-element `anchor` metadata recording the deterministic re-anchoring
+resolution state. Schema v1.7 added optional per-element `frame` / `shadow`
+deep-picker metadata for shadow-root and iframe targets. Schema v1.6 added the
+per-element `intent` / `severity` enums and the top-level `captureState` object.
+Schema v1.5 extended `elements[].edits` with text-formatting keys. Schema v1.4
+added optional `screenshot` / `screenshotFile`. Schema v1.1 added optional
+`elements[].edits`.
 Breaking changes (new required fields, coordinate semantics, endpoint removal)
 bump to v2 with a deprecation window: the hub accepts both versions for one
 minor release.

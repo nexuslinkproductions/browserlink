@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-export const VERSION = "2.7.0";
+export const VERSION = "2.8.0";
 
 export const SCREENSHOT_PREFIX = "data:image/png;base64,";
 export const MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024;
@@ -65,19 +65,21 @@ export const MAX_HOST_SELECTOR = 500;
 export type FrameMetadata = { path?: number[]; crossOrigin?: boolean };
 export type ShadowMetadata = { depth?: number; hosts?: string[] };
 
-// Schema v1.8 (F2 anchor resilience): optional per-element anchor metadata
-// describing how a stored element was re-anchored on a changed live page.
-// version is the anchor format version (1); resolution is a strict enum
-// (exact = original cssPath replay, fallback = deterministic signal chain,
-// unresolved = no candidate reached the confidence threshold); confidence is
-// the 0..1 score of the winning path; fallback lists the deterministic
-// signals used, in order (attrs, text, aria, rect). All fields are strictly
+// Schema v1.10 (F2/F11/F12/F13 anchor resilience): optional per-element
+// anchor metadata describing how a stored element was re-anchored on a
+// changed live page. version is the anchor format version (1); resolution
+// is a strict enum (exact = original cssPath replay, fallback =
+// deterministic signal chain, unresolved = no candidate reached the
+// confidence threshold, detached = the anchored node was removed and no
+// surviving ancestor was a usable container); confidence is the 0..1 score
+// of the winning path; fallback lists the deterministic signals used, in
+// order (attrs, text, aria, rect, ancestor). All fields are strictly
 // validated: unknown nested keys, wrong types, unknown enum values, and
 // out-of-range numbers are rejected with HTTP 400, while legacy elements
 // without anchor stay valid.
 export const ANCHOR_VERSION = 1;
-export const ANCHOR_RESOLUTIONS = ["exact", "fallback", "unresolved"] as const;
-export const ANCHOR_FALLBACK_SIGNALS = ["attrs", "text", "aria", "rect"] as const;
+export const ANCHOR_RESOLUTIONS = ["exact", "fallback", "unresolved", "detached"] as const;
+export const ANCHOR_FALLBACK_SIGNALS = ["attrs", "text", "aria", "rect", "ancestor"] as const;
 export const MAX_ANCHOR_FALLBACK_SIGNALS = 4;
 export type AnchorResolution = (typeof ANCHOR_RESOLUTIONS)[number];
 export type AnchorFallbackSignal = (typeof ANCHOR_FALLBACK_SIGNALS)[number];
@@ -619,7 +621,7 @@ export function validatePayload(payload: unknown): string | null {
           }
         }
       }
-      // Schema v1.8: optional anchor metadata (F2 anchor resilience). Must be
+      // Schema v1.10: optional anchor metadata (F2/F11/F12/F13). Must be
       // an object with only the four known keys; version and resolution are
       // required whenever anchor is present, confidence must be 0..1, and
       // fallback must be a non-empty list of strict enum signals with at
@@ -649,7 +651,7 @@ export function validatePayload(payload: unknown): string | null {
           typeof ao.resolution !== "string" ||
           !(ANCHOR_RESOLUTIONS as readonly string[]).includes(ao.resolution)
         ) {
-          return `elements[${elementIndex}].anchor.resolution must be one of exact, fallback, unresolved`;
+          return `elements[${elementIndex}].anchor.resolution must be one of exact, fallback, unresolved, detached`;
         }
         if (ao.confidence !== undefined) {
           if (!isNumber(ao.confidence) || ao.confidence < 0 || ao.confidence > 1) {
@@ -669,7 +671,7 @@ export function validatePayload(payload: unknown): string | null {
               typeof ao.fallback[i] !== "string" ||
               !(ANCHOR_FALLBACK_SIGNALS as readonly string[]).includes(ao.fallback[i])
             ) {
-              return `elements[${elementIndex}].anchor.fallback[${i}] must be one of attrs, text, aria, rect`;
+              return `elements[${elementIndex}].anchor.fallback[${i}] must be one of attrs, text, aria, rect, ancestor`;
             }
           }
         }
