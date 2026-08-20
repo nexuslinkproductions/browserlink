@@ -4269,6 +4269,9 @@
       if (!state.elementMode) return;
       e.preventDefault();
       e.stopPropagation();
+      // Same synthetic pin-replay guard as onPageClick: a replay with no
+      // pointer position must not re-pick (0,0) inside a scroll-driven frame.
+      if (isSyntheticReplayClick(e)) return;
       let r = null;
       try { r = resolveAtPoint(e.clientX, e.clientY, d, entry.path); } catch (_) { r = null; }
       handlePickResult(r, e);
@@ -5212,6 +5215,7 @@
     } catch (err) {
       diagLog('error', 'openInspector failed: ' + (err && err.message ? err.message : String(err)));
     }
+    if (inspInput) inspInput.placeholder = 'Your thoughts/instructions for this element…';
     if (inspInput) inspInput.value = inspDesc.instruction || '';
     if (inspInput) inspInput.focus();
     // Schema v1.6: prefill the inspector's intent/severity chip row from the
@@ -5294,9 +5298,15 @@
     threadCommit(committedIndex, instr, wasEdit);
     refreshThreadPanel();
     if (chatInput) chatInput.value = '';
-    if (inspInput) inspInput.value = state.elements[committedIndex].descriptor.instruction || '';
-    if (inspInput) inspInput.focus(); // inspector stays open for the next element
+    // Stay open for the next pick, but UNBIND from the committed element so
+    // further typing cannot mutate E1 and the next page click rebinds cleanly.
+    inspector.descriptor = null;
+    if (inspInput) {
+      inspInput.value = '';
+      inspInput.placeholder = 'Click another element, then type an instruction…';
+    }
     syncInspAdd();
+    updateSelectionUI();
     updateCount();
     updateSelectionPulse();
     persistDraft(); // F3: committed element (instruction + intent/severity)
@@ -5381,6 +5391,22 @@
     if (isReducedMotion()) hoverTick();
   }
 
+  // Synthetic re-dispatch guard: scroll-driven pages (GSAP ScrollTrigger pin
+  // replay and similar) re-fire a click that landed mid-pin by calling
+  // element.click() on the target. That programmatic replay is ALWAYS
+  // untrusted (isTrusted === false) and carries no pointer position
+  // (clientX/clientY == 0, detail == 0). The picker must never treat it as a
+  // fresh pick at (0,0): elementFromPoint(0,0) resolves the STICKY SITE
+  // HEADER at the viewport top-left corner, so an innocent page replay would
+  // overwrite the real pick with the header (observed: every click on the
+  // webshop committed div.shell.bar / the site-header). Real pointer clicks
+  // are trusted and always carry a real viewport position.
+  function isSyntheticReplayClick(e) {
+    if (!e) return true;
+    if (e.isTrusted === false) return true;
+    return e.clientX === 0 && e.clientY === 0 && e.detail === 0;
+  }
+
   // DevTools-style: suppress mousedown so SPA/custom buttons that navigate
   // on mousedown (not click) cannot react while the picker is active.
   // preventDefault on mousedown does NOT suppress the subsequent click event.
@@ -5399,6 +5425,11 @@
     // Picker semantics: the page must not react to selection clicks.
     e.preventDefault();
     e.stopPropagation();
+    // Synthetic pin-replay clicks carry no pointer position (see
+    // isSyntheticReplayClick); resolveAtPoint(0,0) would resolve the sticky
+    // site header and overwrite the real pick. Skip the reply: the real
+    // click already committed the correct element.
+    if (isSyntheticReplayClick(e)) return;
     let r = null;
     try { r = resolveAtPoint(e.clientX, e.clientY, document, []); } catch (_) { r = null; }
     handlePickResult(r, e);
@@ -7996,9 +8027,14 @@
 
   // Footer instruction textarea: same instruction field as the chat card.
   function onInspectorInstr(e) {
-    if (!inspector.descriptor) return;
+    // Only write while a pick is pending. After Add, inspector.descriptor is
+    // cleared so typing cannot mutate a committed element; the next page pick
+    // rebinds via openChat → openInspector.
+    const targetDesc = pending ? pending.descriptor : null;
+    if (!targetDesc) return;
     const value = String(e.target.value || '').slice(0, MAX_INSTR);
-    inspector.descriptor.instruction = value;
+    targetDesc.instruction = value;
+    if (inspector.descriptor === targetDesc) inspector.descriptor.instruction = value;
     e.target.value = value;
     if (chatInput) chatInput.value = value;
     updateSelectionUI();
