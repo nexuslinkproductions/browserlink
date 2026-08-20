@@ -5212,6 +5212,7 @@
     } catch (err) {
       diagLog('error', 'openInspector failed: ' + (err && err.message ? err.message : String(err)));
     }
+    if (inspInput) inspInput.placeholder = 'Your thoughts/instructions for this element…';
     if (inspInput) inspInput.value = inspDesc.instruction || '';
     if (inspInput) inspInput.focus();
     // Schema v1.6: prefill the inspector's intent/severity chip row from the
@@ -5294,9 +5295,15 @@
     threadCommit(committedIndex, instr, wasEdit);
     refreshThreadPanel();
     if (chatInput) chatInput.value = '';
-    if (inspInput) inspInput.value = state.elements[committedIndex].descriptor.instruction || '';
-    if (inspInput) inspInput.focus(); // inspector stays open for the next element
+    // Stay open for the next pick, but UNBIND from the committed element so
+    // further typing cannot mutate E1 and the next page click rebinds cleanly.
+    inspector.descriptor = null;
+    if (inspInput) {
+      inspInput.value = '';
+      inspInput.placeholder = 'Click another element, then type an instruction…';
+    }
     syncInspAdd();
+    updateSelectionUI();
     updateCount();
     updateSelectionPulse();
     persistDraft(); // F3: committed element (instruction + intent/severity)
@@ -7996,9 +8003,14 @@
 
   // Footer instruction textarea: same instruction field as the chat card.
   function onInspectorInstr(e) {
-    if (!inspector.descriptor) return;
+    // Only write while a pick is pending. After Add, inspector.descriptor is
+    // cleared so typing cannot mutate a committed element; the next page pick
+    // rebinds via openChat → openInspector.
+    const targetDesc = pending ? pending.descriptor : null;
+    if (!targetDesc) return;
     const value = String(e.target.value || '').slice(0, MAX_INSTR);
-    inspector.descriptor.instruction = value;
+    targetDesc.instruction = value;
+    if (inspector.descriptor === targetDesc) inspector.descriptor.instruction = value;
     e.target.value = value;
     if (chatInput) chatInput.value = value;
     updateSelectionUI();
