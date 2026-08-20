@@ -4269,6 +4269,9 @@
       if (!state.elementMode) return;
       e.preventDefault();
       e.stopPropagation();
+      // Same synthetic pin-replay guard as onPageClick: a replay with no
+      // pointer position must not re-pick (0,0) inside a scroll-driven frame.
+      if (isSyntheticReplayClick(e)) return;
       let r = null;
       try { r = resolveAtPoint(e.clientX, e.clientY, d, entry.path); } catch (_) { r = null; }
       handlePickResult(r, e);
@@ -5388,6 +5391,22 @@
     if (isReducedMotion()) hoverTick();
   }
 
+  // Synthetic re-dispatch guard: scroll-driven pages (GSAP ScrollTrigger pin
+  // replay and similar) re-fire a click that landed mid-pin by calling
+  // element.click() on the target. That programmatic replay is ALWAYS
+  // untrusted (isTrusted === false) and carries no pointer position
+  // (clientX/clientY == 0, detail == 0). The picker must never treat it as a
+  // fresh pick at (0,0): elementFromPoint(0,0) resolves the STICKY SITE
+  // HEADER at the viewport top-left corner, so an innocent page replay would
+  // overwrite the real pick with the header (observed: every click on the
+  // webshop committed div.shell.bar / the site-header). Real pointer clicks
+  // are trusted and always carry a real viewport position.
+  function isSyntheticReplayClick(e) {
+    if (!e) return true;
+    if (e.isTrusted === false) return true;
+    return e.clientX === 0 && e.clientY === 0 && e.detail === 0;
+  }
+
   // DevTools-style: suppress mousedown so SPA/custom buttons that navigate
   // on mousedown (not click) cannot react while the picker is active.
   // preventDefault on mousedown does NOT suppress the subsequent click event.
@@ -5406,6 +5425,11 @@
     // Picker semantics: the page must not react to selection clicks.
     e.preventDefault();
     e.stopPropagation();
+    // Synthetic pin-replay clicks carry no pointer position (see
+    // isSyntheticReplayClick); resolveAtPoint(0,0) would resolve the sticky
+    // site header and overwrite the real pick. Skip the reply: the real
+    // click already committed the correct element.
+    if (isSyntheticReplayClick(e)) return;
     let r = null;
     try { r = resolveAtPoint(e.clientX, e.clientY, document, []); } catch (_) { r = null; }
     handlePickResult(r, e);
