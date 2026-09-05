@@ -6,6 +6,13 @@ All notable changes to browserlink are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stale inspector after Add** - the element inspector no longer stays bound
+  to the last committed element after Add. Typing after a commit can no longer
+  mutate E1, the instruction field clears with a hint to pick next, and the
+  next page pick rebinds the inspector cleanly to the new element.
+
 ## [2.8.0] - 2026-08-13
 
 ### Added
