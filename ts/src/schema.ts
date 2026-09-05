@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-export const VERSION = "2.8.0";
+export const VERSION = "2.9.0";
 
 export const SCREENSHOT_PREFIX = "data:image/png;base64,";
 export const MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024;
@@ -688,6 +688,78 @@ export function validatePayload(payload: unknown): string | null {
           `elements[${elementIndex}].textQuote`,
         );
         if (err !== null) return err;
+      }
+      // Schema v2.9: optional 3D scene picking metadata. Must be an object
+      // with only the four known keys; worldPos is required when _3d is
+      // present. Legacy elements without _3d stay valid.
+      const _3d = el._3d;
+      if (_3d !== undefined) {
+        if (_3d === null || typeof _3d !== "object" || Array.isArray(_3d)) {
+          return `elements[${elementIndex}]._3d must be an object`;
+        }
+        const to = _3d as Record<string, unknown>;
+        for (const key of Object.keys(to)) {
+          if (key !== "worldPos" && key !== "scenePath" && key !== "objectName" && key !== "objectType" && key !== "bbox") {
+            return `elements[${elementIndex}]._3d has unknown key '${key}'`;
+          }
+        }
+        if (to.worldPos !== undefined) {
+          if (to.worldPos === null || typeof to.worldPos !== "object" || Array.isArray(to.worldPos)) {
+            return `elements[${elementIndex}]._3d.worldPos must be an object`;
+          }
+          const wp = to.worldPos as Record<string, unknown>;
+          for (const k of Object.keys(wp)) {
+            if (k !== "x" && k !== "y" && k !== "z") {
+              return `elements[${elementIndex}]._3d.worldPos has unknown key '${k}'`;
+            }
+            if (typeof wp[k] !== "number") {
+              return `elements[${elementIndex}]._3d.worldPos.${k} must be a number`;
+            }
+          }
+        }
+        if (to.scenePath !== undefined) {
+          if (!Array.isArray(to.scenePath)) {
+            return `elements[${elementIndex}]._3d.scenePath must be a list`;
+          }
+          if (to.scenePath.length > 16) {
+            return `elements[${elementIndex}]._3d.scenePath must have at most 16 entries`;
+          }
+          for (let i = 0; i < to.scenePath.length; i++) {
+            if (typeof to.scenePath[i] !== "string" || to.scenePath[i].length === 0) {
+              return `elements[${elementIndex}]._3d.scenePath[${i}] must be a non-empty string`;
+            }
+          }
+        }
+        if (to.objectName !== undefined && typeof to.objectName !== "string") {
+          return `elements[${elementIndex}]._3d.objectName must be a string`;
+        }
+        if (to.objectType !== undefined && typeof to.objectType !== "string") {
+          return `elements[${elementIndex}]._3d.objectType must be a string`;
+        }
+        if (to.bbox !== undefined) {
+          if (to.bbox === null || typeof to.bbox !== "object" || Array.isArray(to.bbox)) {
+            return `elements[${elementIndex}]._3d.bbox must be an object`;
+          }
+          const bb = to.bbox as Record<string, unknown>;
+          for (const k of Object.keys(bb)) {
+            if (k !== "min" && k !== "max") {
+              return `elements[${elementIndex}]._3d.bbox has unknown key '${k}'`;
+            }
+            const p = bb[k];
+            if (p === null || typeof p !== "object" || Array.isArray(p)) {
+              return `elements[${elementIndex}]._3d.bbox.${k} must be an object`;
+            }
+            const pp = p as Record<string, unknown>;
+            for (const ax of Object.keys(pp)) {
+              if (ax !== "x" && ax !== "y" && ax !== "z") {
+                return `elements[${elementIndex}]._3d.bbox.${k} has unknown key '${ax}'`;
+              }
+              if (typeof pp[ax] !== "number") {
+                return `elements[${elementIndex}]._3d.bbox.${k}.${ax} must be a number`;
+              }
+            }
+          }
+        }
       }
     }
   }
