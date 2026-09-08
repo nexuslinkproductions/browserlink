@@ -4,14 +4,30 @@ All notable changes to browserlink are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), versioning follows
 [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [2.9.0] - 2026-09-05
+
+### Added
+
+- **3D / WebGL scene picking (v2.9 headline)** - clicking a WebGL canvas while
+  in element mode raycasts Three.js scenes through the MAIN-world bridge,
+  resolves the hit Object3D chain (name/type/parents/world position/bbox),
+  attaches the annotation to 3D object identity with violet markers, and
+  anchors the marker to the 3D world position with per-frame reprojection
+  through camera motion. Falls back gracefully to canvas coordinates when no
+  scene graph is accessible. Exposes `window.__browserlinkPick3D.register()`
+  as a generic protocol for other 3D engines.
+- **Synthetic pin-replay click guard** - `isSyntheticReplayClick` guards both
+  `onPageClick` and the same-origin frame click handler. GSAP ScrollTrigger
+  pin replay that calls `element.click()` with `clientX=0, clientY=0,
+  isTrusted=false` no longer overwrites the real pick with the sticky site
+  header. (PR #26)
 
 ### Fixed
 
 - **Stale inspector after Add** - the element inspector no longer stays bound
   to the last committed element after Add. Typing after a commit can no longer
   mutate E1, the instruction field clears with a hint to pick next, and the
-  next page pick rebinds the inspector cleanly to the new element.
+  next page pick rebinds the inspector cleanly to the new element. (PR #26)
 
 ## [2.8.0] - 2026-08-13
 

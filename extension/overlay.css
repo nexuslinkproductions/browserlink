@@ -392,6 +392,18 @@
   box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.30), 0 2px 6px rgba(0, 0, 0, 0.35);
 }
 
+/* 3D scene pick markers: violet border + glow to distinguish from DOM picks. */
+.comet-el.is-3d {
+  border-color: #b388ff;
+  border-style: solid;
+  background: rgba(179, 136, 255, 0.10);
+  box-shadow: 0 0 8px rgba(179, 136, 255, 0.25);
+}
+.comet-el.is-3d .comet-el-badge {
+  background: #b388ff;
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.30), 0 0 8px rgba(179, 136, 255, 0.40);
+}
+
 /* ---- instruction chat card (bottom-right of viewport) ---- */
 .comet-chat {
   position: fixed;

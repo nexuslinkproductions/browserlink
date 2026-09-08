@@ -171,6 +171,11 @@
   const SEL_CONTEXT_SAMPLE = 120;   // raw context chars captured per side
   const SEL_MAX_SCAN_NODES = 4000;  // restore walk cap (text nodes)
 
+  // 3D / WebGL scene picking constants
+  const _3D_BRIDGE_NS = 'browserlink-3d';       // postMessage namespace
+  const _3D_PICK_TIMEOUT = 200;                  // ms before 3D pick falls back to canvas
+  const MAX_3D_PATH = 16;                        // max scene-graph parent chain
+
   /* ---------------- state ---------------- */
   const state = {
     annotateOn: true,    // draw mode is the default selection on start
@@ -215,6 +220,15 @@
   let mouse = null;          // last clientX/clientY
   let mouseDirty = false;
   let hoverLoopRaf = 0;
+  // 3D / WebGL scene picking state
+  let _3dBridgeInjected = false;     // MAIN-world bridge <script> injected once
+  let _3dPickResult = null;          // {hit, worldPos, scenePath, name, bbox, camera} from MAIN world
+  let _3dPickPending = false;        // true while waiting for MAIN-world response
+  let _3dPickTimer = 0;              // setTimeout handle for fallback
+  let _3dTrackRaf = 0;               // rAF handle for 3D marker reprojection
+  // 3D entry per committed element: maps descriptor (by reference) to {worldPos, camera, scenePath, name, bbox}
+  let _3dEntries = new WeakMap();
+  let _3dEntryCount = 0;
 
   let host = null;
   let shadow = null;
@@ -4990,10 +5004,14 @@
   function selectionLabel(en) {
     const d = en && en.descriptor ? en.descriptor : {};
     let target = d.tag || 'element';
+    // 3D scene pick: show the object name instead of DOM tag
+    if (d._3d && d._3d.objectName) target = d._3d.objectName;
+    else if (d._3d && d._3d.objectType) target = d._3d.objectType;
     if (d.id) target += '#' + d.id;
     let text = String(d.text || '').replace(/\s+/g, ' ').trim();
-    if (text.length > 42) text = text.slice(0, 42) + '…';
-    return 'E' + String(d.index || '') + ': ' + target + (text ? " '" + text + "'" : '');
+    if (text.length > 42) text = text.slice(0, 42) + '...';
+    const prefix = d._3d ? '3D_3d ' : '';
+    return prefix + 'E' + String(d.index || '') + ': ' + target + (text ? " '" + text + "'" : '');
   }
 
   function updateSelectionUI() {
@@ -5107,6 +5125,11 @@
   function removeSelectionAt(index) {
     if (index < 0 || index >= state.elements.length) return;
     const removed = state.elements[index];
+    // 3D entry cleanup: decrement counter and remove tracking
+    if (removed.descriptor && _3dEntries.has(removed.descriptor)) {
+      _3dEntries.delete(removed.descriptor);
+      _3dEntryCount = Math.max(0, _3dEntryCount - 1);
+    }
     const wasActive = state.activeIndex === index || inspector.descriptor === removed.descriptor;
     if (pending && pending.el === removed.el) pending = null;
     state.elements.splice(index, 1);
@@ -5450,6 +5473,13 @@
     }
     if (!el) return;
     const d = describeElement(el);
+    // 3D scene pick: if the click hit a WebGL canvas, try to raycast
+    // into the scene. Result attaches async to the same descriptor.
+    if (el.tagName === 'CANVAS' && !r.crossOrigin) {
+      _3dPick(e.clientX, e.clientY).then(function(pickResult) {
+        if (pickResult) _3dApplyPick(d, pickResult);
+      });
+    }
     if (r.crossOrigin) {
       // frame.path is the inclusive index chain (parent frames + this
       // frame), so the stored descriptor identifies the bounded target on
@@ -8382,6 +8412,19 @@
       if (!hosts.length) delete d.shadow;
       else d.shadow = { depth: hosts.length, hosts };
     }
+    // Schema v2.9: 3D scene picking metadata - canonicalize and keep.
+    // Only ship if the pick found a 3D scene hit (worldPos is the signal).
+    if (d._3d && d._3d.worldPos) {
+      d._3d = {
+        worldPos: d._3d.worldPos,
+        scenePath: Array.isArray(d._3d.scenePath) ? d._3d.scenePath.slice(0, MAX_3D_PATH) : [],
+        objectName: String(d._3d.objectName || '').slice(0, 100),
+        objectType: String(d._3d.objectType || 'Mesh').slice(0, 50),
+        bbox: d._3d.bbox || null,
+      };
+    } else {
+      delete d._3d;
+    }
     // Schema v1.10 (F2/F11/F12/F13): ship optional anchor metadata in a
     // canonical shape; malformed or empty values are dropped so payloads
     // stay valid under the hub's strict nested-key validation.
@@ -8887,6 +8930,10 @@
 
   function teardownHost() {
     stopInspectorRingTween();
+    _3dStopTracking();
+    _3dPickResult = null;
+    _3dEntries = new WeakMap();
+    _3dEntryCount = 0;
     removeFreeze(); // Freeze State Capture: always remove the injected style
     // Onboarding (F6): drop the tour card and its listeners with the host.
     tourTeardown();
@@ -9134,6 +9181,7 @@
       updateMotionPreference();
       buildUI();
       bindEvents();
+      _3dInjectBridge(); // 3D scene picking: inject MAIN-world bridge once
       await injectShadowStyles();
       diagAttach();
       window.__hermesAnnotateInjected = true;
@@ -9553,6 +9601,284 @@
     resizeCanvas();
   }
 
+  /* ---------------- 3D / WebGL scene picking bridge ---------------- */
+
+  // Inject the MAIN-world bridge script. Runs once per extension lifetime.
+  // The bridge lives in the page's JS realm so it can access THREE.js etc.
+  function _3dInjectBridge() {
+    if (_3dBridgeInjected) return;
+    _3dBridgeInjected = true;
+    const code = [
+      '(' + function() {
+        // MAIN world: runs in the page's JS context.
+        // Bridges 3D library access to the extension's isolated world.
+        var _3D_NS = 'browserlink-3d';
+        // Registered picker functions: engineName -> fn(xRel, yRel, canvas, w, h)
+        var _3D_pickers = {};
+
+        // Register a 3D picker. engineName: string, pickerFn: (xRel, yRel, canvas, w, h) -> object|null
+        // Returns { type: '3d', objectName, objectType, scenePath[], worldPos:{x,y,z},
+        //          bbox:{min:{x,y,z},max:{x,y,z}}, camera: serializable, pickerName }
+        window.__browserlinkPick3D = {
+          register: function(name, pickerFn) {
+            _3D_pickers[name] = pickerFn;
+          },
+          unregister: function(name) {
+            delete _3D_pickers[name];
+          }
+        };
+
+        // Default Three.js picker
+        function threeJsPicker(xRel, yRel, canvas, w, h) {
+          if (typeof THREE === 'undefined' || !THREE.Raycaster) return null;
+          // Find a renderer that owns this canvas
+          var renderer = null;
+          // Check common renderer variable names
+          var candidates = ['renderer', 'engine', 'viewer'];
+          for (var i = 0; i < candidates.length; i++) {
+            var r = window[candidates[i]];
+            if (r && r.domElement === canvas && typeof r.render === 'function') {
+              renderer = r;
+              break;
+            }
+          }
+          // If not found, scan window for objects with domElement matching
+          if (!renderer) {
+            var keys = Object.keys(window);
+            for (var i = 0; i < keys.length && i < 200; i++) {
+              try {
+                var v = window[keys[i]];
+                if (v && v.domElement === canvas && typeof v.render === 'function') {
+                  renderer = v;
+                  break;
+                }
+              } catch(e) {}
+            }
+          }
+          if (!renderer) return null;
+
+          var scene = null;
+          var camera = null;
+          // Get scene and camera from renderer internals
+          if (renderer._lastScene && renderer._lastCamera) {
+            scene = renderer._lastScene;
+            camera = renderer._lastCamera;
+          } else if (renderer._scene && renderer._camera) {
+            scene = renderer._scene;
+            camera = renderer._camera;
+          }
+          // Try object3D collections
+          if (!scene && renderer._lastRenderState && renderer._lastRenderState.scene) {
+            scene = renderer._lastRenderState.scene;
+            camera = renderer._lastRenderState.camera;
+          }
+          if (!scene || !camera) return null;
+
+          // Convert pixel coords to NDC
+          var ndcX = (xRel / w) * 2 - 1;
+          var ndcY = -(yRel / h) * 2 + 1;
+
+          var raycaster = new THREE.Raycaster();
+          raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
+
+          // Gather all meshes/objects in the scene
+          var objects = [];
+          scene.traverse(function(child) {
+            if (child.isMesh || child.isLine || child.isPoints || child.isSprite) {
+              objects.push(child);
+            }
+          });
+          if (objects.length === 0) return null;
+
+          var intersects = raycaster.intersectObjects(objects, false);
+          if (intersects.length === 0) return null;
+
+          var hit = intersects[0];
+          var obj = hit.object;
+          var worldPos = hit.point;
+
+          // Build scene path
+          var path = [];
+          var cur = obj;
+          for (var g = 0; g < 16 && cur; g++) {
+            path.unshift(cur.name || cur.type || 'Object3D');
+            cur = cur.parent;
+          }
+
+          // Compute world bbox
+          var bbox = null;
+          if (obj.geometry && obj.geometry.boundingBox) {
+            var bb = obj.geometry.boundingBox.clone();
+            if (obj.matrixWorld) {
+              bb.applyMatrix4(obj.matrixWorld);
+            }
+            bbox = {
+              min: { x: bb.min.x, y: bb.min.y, z: bb.min.z },
+              max: { x: bb.max.x, y: bb.max.y, z: bb.max.z }
+            };
+          }
+
+          return {
+            type: '3d',
+            objectName: obj.name || '',
+            objectType: obj.type || 'Mesh',
+            scenePath: path,
+            worldPos: { x: worldPos.x, y: worldPos.y, z: worldPos.z },
+            bbox: bbox,
+            pickerName: 'three.js'
+          };
+        }
+
+        // Register the default Three.js picker on load
+        window.__browserlinkPick3D.register('three.js', threeJsPicker);
+
+        // Listen for pick requests from the isolated-world content script
+        window.addEventListener('message', function(event) {
+          if (!event.data || event.data._ns !== _3D_NS) return;
+          var msg = event.data;
+          if (msg.cmd === 'pick') {
+            var result = null;
+            // Try registered pickers in order
+            var pickerNames = Object.keys(_3D_pickers);
+            for (var i = 0; i < pickerNames.length; i++) {
+              try {
+                result = _3D_pickers[pickerNames[i]](msg.x, msg.y, null, msg.w, msg.h);
+                if (result) break;
+              } catch(e) {}
+            }
+            window.postMessage({
+              _ns: _3D_NS,
+              cmd: 'pick-result',
+              id: msg.id,
+              result: result
+            }, '*');
+          }
+        });
+      }.toString() + ')()'
+    ].join('\n');
+    var s = document.createElement('script');
+    s.textContent = code;
+    (document.head || document.documentElement).appendChild(s);
+    s.remove();
+  }
+
+  // Initiate a 3D pick at viewport coords (x, y). Returns a promise that
+  // resolves with the 3D pick result or null on timeout / no canvas.
+  function _3dPick(x, y) {
+    return new Promise(function(resolve) {
+      // Check if the click was on a canvas with WebGL context
+      var hit = null;
+      try { hit = document.elementFromPoint(x, y); } catch(e) { resolve(null); return; }
+      if (!hit || hit.nodeType !== 1 || hit.tagName !== 'CANVAS') {
+        resolve(null);
+        return;
+      }
+      var gl = null;
+      try {
+        gl = hit.getContext('webgl') || hit.getContext('webgl2') || hit.getContext('experimental-webgl');
+      } catch(e) {}
+      if (!gl) { resolve(null); return; }
+
+      var rect = null;
+      try { rect = hit.getBoundingClientRect(); } catch(e) { resolve(null); return; }
+      var relX = x - rect.left;
+      var relY = y - rect.top;
+      var w = rect.width;
+      var h = rect.height;
+      if (w < 1 || h < 1) { resolve(null); return; }
+
+      var pickId = Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+      var timedOut = false;
+
+      var onMessage = function(e) {
+        if (timedOut) return;
+        var d = e.data;
+        if (d && d._ns === _3D_BRIDGE_NS && d.cmd === 'pick-result' && d.id === pickId) {
+          window.removeEventListener('message', onMessage);
+          if (_3dPickTimer) { clearTimeout(_3dPickTimer); _3dPickTimer = 0; }
+          if (d.result && d.result.type === '3d') {
+            _3dPickResult = d.result;
+            resolve(d.result);
+          } else {
+            resolve(null);
+          }
+        }
+      };
+      window.addEventListener('message', onMessage);
+
+      _3dPickTimer = setTimeout(function() {
+        timedOut = true;
+        window.removeEventListener('message', onMessage);
+        _3dPickTimer = 0;
+        resolve(null);
+      }, _3D_PICK_TIMEOUT);
+
+      window.postMessage({
+        _ns: _3D_BRIDGE_NS,
+        cmd: 'pick',
+        id: pickId,
+        x: relX, y: relY,
+        w: w, h: h
+      }, '*');
+    });
+  }
+
+  // Called after a 3D pick resolves. Attaches 3D metadata to the descriptor
+  // and sets up the tracking entry.
+  function _3dApplyPick(descriptor, pickResult) {
+    if (!descriptor || !pickResult) return;
+    descriptor._3d = {
+      worldPos: pickResult.worldPos,
+      scenePath: pickResult.scenePath,
+      objectName: pickResult.objectName,
+      objectType: pickResult.objectType,
+      bbox: pickResult.bbox
+    };
+    // Store tracking data referenced by the descriptor
+    _3dEntries.set(descriptor, {
+      worldPos: pickResult.worldPos,
+      scenePath: pickResult.scenePath,
+      name: pickResult.objectName,
+      bbox: pickResult.bbox
+    });
+    _3dEntryCount++;
+    // Mark the outline element with 3D class for visual distinction
+    var found = false;
+    for (var i = 0; i < state.elements.length; i++) {
+      if (state.elements[i].descriptor === descriptor && state.elements[i].outlineEl) {
+        state.elements[i].outlineEl.classList.add('is-3d');
+        found = true;
+        break;
+      }
+    }
+    if (!found && pending && pending.descriptor === descriptor && pending.outlineEl) {
+      pending.outlineEl.classList.add('is-3d');
+    }
+    // Start tracking loop if not already running
+    _3dStartTracking();
+  }
+
+  // Rerun every animation frame while we have 3D entries: reprojects 3D
+  // world positions to viewport coordinates and positions the element markers.
+  function _3dTrackingLoop() {
+    _3dTrackRaf = 0;
+    if (!state.elementMode || _3dEntryCount < 1) return;
+    positionSelections();
+    _3dTrackRaf = requestAnimationFrame(_3dTrackingLoop);
+  }
+
+  function _3dStartTracking() {
+    if (_3dTrackRaf) return;
+    _3dTrackRaf = requestAnimationFrame(_3dTrackingLoop);
+  }
+
+  function _3dStopTracking() {
+    if (_3dTrackRaf) {
+      cancelAnimationFrame(_3dTrackRaf);
+      _3dTrackRaf = 0;
+    }
+  }
+
   /* Styles: single source of truth is overlay.css. Manifest also injects it
    * into the page (styles the host); we re-inject it inside the shadow root
    * so toolbar/canvas/status are styled despite the closed shadow boundary. */
@@ -9902,6 +10228,7 @@
       }
       buildUI();
       bindEvents();
+      _3dInjectBridge(); // 3D scene picking: inject MAIN-world bridge once
       await injectShadowStyles();
       restoreTabState(st);
       // Deep pick (F1): register same-origin frames up front so picking works
